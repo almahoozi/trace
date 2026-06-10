@@ -67,3 +67,13 @@ type Session struct {
 	GrafanaURL     string
 	BetterstackURL string
 }
+
+type TraceListItem struct {
+	TraceID        string
+	OperationName  string
+	Service        string
+	ErrorSpanCount int
+	SpanCount      int
+	Duration       time.Duration
+	StartTime      time.Time
+}

@@ -47,12 +47,14 @@ type Model struct {
 	cfg     config.Config
 	session *domain.Session
 	openURL func(string) error
+	loc     *time.Location
 
 	width  int
 	height int
 
 	activePanel panel
 	showHelp    bool
+	configView  *ConfigModel
 	jsonTree    *JSONTree
 	valueView   *valueView
 	fullscreen  bool
@@ -62,11 +64,20 @@ type Model struct {
 	traceCursor      int
 	expanded         map[string]bool
 	serviceMapCursor int
+	serviceColors    map[string]string
 
 	allLogs          []domain.LogEntry
+	levelFilteredLog []domain.LogEntry
 	filteredLogs     []domain.LogEntry
 	logCursor        int
 	levelThresholdIx int
+	logSearchRaw     string
+	logSearchMatcher *searchMatcher
+	lastSearchRaw    string
+	lastSearch       *searchMatcher
+	pendingGG        bool
+
+	searchPrompt *searchPrompt
 
 	status string
 }
@@ -82,12 +93,16 @@ func NewModel(cfg config.Config, session *domain.Session, openURL func(string) e
 		cfg:          cfg,
 		session:      session,
 		openURL:      openURL,
+		loc:          time.Local,
 		expanded:     map[string]bool{},
 		collapsed:    map[panel]bool{},
 		fullscreen:   cfg.UI.DefaultFullscreen,
 		allLogs:      session.Logs,
 		filteredLogs: session.Logs,
 		status:       fmt.Sprintf("env=%s spans=%d logs=%d", session.Environment, len(session.Trace.Spans), len(session.Logs)),
+	}
+	if loc, err := cfg.DisplayLocation(); err == nil {
+		m.loc = loc
 	}
 	m.activePanel = parseFocusPanel(cfg.UI.FocusSection)
 
@@ -106,6 +121,7 @@ func NewModel(cfg config.Config, session *domain.Session, openURL func(string) e
 		}
 	}
 	m.traceLines = flattenTrace(session.Trace, m.expanded)
+	m.initServiceColors()
 	m.levelThresholdIx = m.levelIndex(cfg.Logs.LevelThreshold)
 	m.applyLogThreshold()
 	return m
@@ -133,12 +149,41 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		if m.configView != nil {
+			updated, cmd := m.configView.Update(msg)
+			if next, ok := updated.(ConfigModel); ok {
+				m.configView = &next
+			}
+			return m, cmd
+		}
 		return m, nil
 	case tea.KeyMsg:
-		key := msg.String()
+		keyMsg := msg
+		key := keyMsg.String()
+
+		if m.searchPrompt != nil {
+			return m.updateSearchPrompt(keyMsg)
+		}
 
 		if m.isAction("global", "quit", key) {
 			return m, tea.Quit
+		}
+		if isConfigHotkey(key) {
+			m.openConfigMode()
+			return m, nil
+		}
+		if m.configView != nil {
+			if m.isAction("global", "back", key) && m.configView.AtRoot() {
+				m.configView = nil
+				m.reloadConfig()
+				m.status = "closed config mode"
+				return m, nil
+			}
+			updated, cmd := m.configView.Update(msg)
+			if next, ok := updated.(ConfigModel); ok {
+				m.configView = &next
+			}
+			return m, cmd
 		}
 
 		if m.showHelp {
@@ -148,8 +193,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		if key == "/" {
+			m.openSearchPrompt()
+			return m, nil
+		}
+
 		if m.isAction("global", "help", key) {
 			m.showHelp = true
+			return m, nil
+		}
+
+		if m.consumeGGPrefix(key) {
+			return m, nil
+		}
+		if m.handleTopBottomShortcut(key) {
+			return m, nil
+		}
+		if m.handleSearchRepeatShortcut(key) {
 			return m, nil
 		}
 
@@ -201,6 +261,26 @@ func (m Model) updateJSON(key string) (tea.Model, tea.Cmd) {
 	if m.isAction("json", "down", key) {
 		m.jsonTree.MoveDown()
 	}
+	if isPageDownKey(key) {
+		for i := 0; i < m.jsonPageRows(); i++ {
+			m.jsonTree.MoveDown()
+		}
+	}
+	if isPageUpKey(key) {
+		for i := 0; i < m.jsonPageRows(); i++ {
+			m.jsonTree.MoveUp()
+		}
+	}
+	if isHalfPageDownKey(key) {
+		for i := 0; i < m.jsonHalfPageRows(); i++ {
+			m.jsonTree.MoveDown()
+		}
+	}
+	if isHalfPageUpKey(key) {
+		for i := 0; i < m.jsonHalfPageRows(); i++ {
+			m.jsonTree.MoveUp()
+		}
+	}
 	if m.isAction("json", "expand", key) {
 		m.jsonTree.Expand()
 	}
@@ -232,7 +312,195 @@ func (m Model) updateValueView(key string) (tea.Model, tea.Cmd) {
 	if m.isAction("json", "down", key) && m.valueView.offset < len(m.valueView.lines)-1 {
 		m.valueView.offset++
 	}
+	if isPageDownKey(key) && len(m.valueView.lines) > 0 {
+		m.valueView.offset = min(len(m.valueView.lines)-1, m.valueView.offset+m.valuePageRows())
+	}
+	if isPageUpKey(key) && len(m.valueView.lines) > 0 {
+		m.valueView.offset = max(0, m.valueView.offset-m.valuePageRows())
+	}
+	if isHalfPageDownKey(key) && len(m.valueView.lines) > 0 {
+		m.valueView.offset = min(len(m.valueView.lines)-1, m.valueView.offset+m.valueHalfPageRows())
+	}
+	if isHalfPageUpKey(key) && len(m.valueView.lines) > 0 {
+		m.valueView.offset = max(0, m.valueView.offset-m.valueHalfPageRows())
+	}
 	return m, nil
+}
+
+func (m Model) updateSearchPrompt(keyMsg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.searchPrompt == nil {
+		return m, nil
+	}
+	switch keyMsg.String() {
+	case "esc":
+		m.searchPrompt = nil
+		m.status = "search cancelled"
+		return m, nil
+	case "enter":
+		raw := strings.TrimSpace(m.searchPrompt.value())
+		m.searchPrompt = nil
+		m.applySearch(raw)
+		return m, nil
+	}
+	if m.searchPrompt.applyKey(keyMsg) {
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m *Model) openSearchPrompt() {
+	initial := ""
+	if m.jsonTree == nil && m.valueView == nil {
+		initial = m.logSearchRaw
+	}
+	m.searchPrompt = newSearchPrompt(initial)
+	m.status = "search: type query and press enter"
+}
+
+func (m *Model) applySearch(raw string) {
+	matcher, err := compileSearchMatcher(raw)
+	if err != nil {
+		m.status = "search parse failed: " + err.Error()
+		return
+	}
+	m.lastSearchRaw = raw
+	m.lastSearch = matcher
+
+	if m.valueView != nil {
+		m.applyValueSearch(matcher, raw, 1)
+		return
+	}
+	if m.jsonTree != nil {
+		m.applyJSONSearch(matcher, raw, 1)
+		return
+	}
+
+	switch m.activePanel {
+	case panelTrace:
+		m.applyTraceSearch(matcher, raw, 1)
+	case panelServiceMap:
+		m.applyServiceMapSearch(matcher, raw, 1)
+	default:
+		m.applyLogSearch(matcher, raw)
+	}
+}
+
+func (m *Model) consumeGGPrefix(key string) bool {
+	if m.pendingGG {
+		m.pendingGG = false
+		if isTopPrefixKey(key) {
+			m.moveToTop()
+			return true
+		}
+	}
+	if isTopPrefixKey(key) {
+		m.pendingGG = true
+		return true
+	}
+	return false
+}
+
+func (m *Model) handleTopBottomShortcut(key string) bool {
+	if isBottomShortcutKey(key) {
+		m.moveToBottom()
+		return true
+	}
+	return false
+}
+
+func (m *Model) handleSearchRepeatShortcut(key string) bool {
+	direction := 0
+	if isSearchNextKey(key) {
+		direction = 1
+	}
+	if isSearchPrevKey(key) {
+		direction = -1
+	}
+	if direction == 0 {
+		return false
+	}
+	if m.lastSearch == nil {
+		m.status = "no active search"
+		return true
+	}
+	if m.valueView != nil {
+		m.applyValueSearch(m.lastSearch, m.lastSearchRaw, direction)
+		return true
+	}
+	if m.jsonTree != nil {
+		m.applyJSONSearch(m.lastSearch, m.lastSearchRaw, direction)
+		return true
+	}
+	switch m.activePanel {
+	case panelTrace:
+		m.applyTraceSearch(m.lastSearch, m.lastSearchRaw, direction)
+	case panelServiceMap:
+		m.applyServiceMapSearch(m.lastSearch, m.lastSearchRaw, direction)
+	default:
+		m.applyLogSearch(m.lastSearch, m.lastSearchRaw)
+		if len(m.filteredLogs) == 0 {
+			m.status = fmt.Sprintf("log search %q: no match", m.lastSearchRaw)
+			return true
+		}
+		if direction > 0 {
+			m.logCursor = (m.logCursor + 1) % len(m.filteredLogs)
+		} else {
+			m.logCursor = (m.logCursor - 1 + len(m.filteredLogs)) % len(m.filteredLogs)
+		}
+		m.status = fmt.Sprintf("log search %q -> row %d/%d", m.lastSearchRaw, m.logCursor+1, len(m.filteredLogs))
+	}
+	return true
+}
+
+func (m *Model) moveToTop() {
+	if m.valueView != nil {
+		m.valueView.offset = 0
+		return
+	}
+	if m.jsonTree != nil {
+		if len(m.jsonTree.lines) > 0 {
+			m.jsonTree.cursor = 0
+		}
+		return
+	}
+	switch m.activePanel {
+	case panelTrace:
+		m.traceCursor = 0
+	case panelServiceMap:
+		m.serviceMapCursor = 0
+	default:
+		m.logCursor = 0
+	}
+}
+
+func (m *Model) moveToBottom() {
+	if m.valueView != nil {
+		if len(m.valueView.lines) > 0 {
+			m.valueView.offset = len(m.valueView.lines) - 1
+		}
+		return
+	}
+	if m.jsonTree != nil {
+		if len(m.jsonTree.lines) > 0 {
+			m.jsonTree.cursor = len(m.jsonTree.lines) - 1
+		}
+		return
+	}
+	switch m.activePanel {
+	case panelTrace:
+		if len(m.traceLines) > 0 {
+			m.traceCursor = len(m.traceLines) - 1
+		}
+	case panelServiceMap:
+		lines := m.serviceMapLines()
+		if len(lines) > 0 {
+			m.serviceMapCursor = len(lines) - 1
+		}
+	default:
+		if len(m.filteredLogs) > 0 {
+			m.logCursor = len(m.filteredLogs) - 1
+		}
+	}
 }
 
 func (m Model) updateTrace(key string) (tea.Model, tea.Cmd) {
@@ -241,6 +509,18 @@ func (m Model) updateTrace(key string) (tea.Model, tea.Cmd) {
 	}
 	if m.isAction("trace", "down", key) && m.traceCursor < len(m.traceLines)-1 {
 		m.traceCursor++
+	}
+	if isPageDownKey(key) && len(m.traceLines) > 0 {
+		m.traceCursor = min(len(m.traceLines)-1, m.traceCursor+m.tracePageRows())
+	}
+	if isPageUpKey(key) && len(m.traceLines) > 0 {
+		m.traceCursor = max(0, m.traceCursor-m.tracePageRows())
+	}
+	if isHalfPageDownKey(key) && len(m.traceLines) > 0 {
+		m.traceCursor = min(len(m.traceLines)-1, m.traceCursor+m.traceHalfPageRows())
+	}
+	if isHalfPageUpKey(key) && len(m.traceLines) > 0 {
+		m.traceCursor = max(0, m.traceCursor-m.traceHalfPageRows())
 	}
 	if m.isAction("trace", "expand", key) {
 		m.toggleTraceNode(true)
@@ -271,7 +551,30 @@ func (m Model) updateTrace(key string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) updateServiceMap(_ string) (tea.Model, tea.Cmd) {
+func (m Model) updateServiceMap(key string) (tea.Model, tea.Cmd) {
+	lines := m.serviceMapLines()
+	if len(lines) == 0 {
+		m.serviceMapCursor = 0
+		return m, nil
+	}
+	if m.isAction("trace", "up", key) && m.serviceMapCursor > 0 {
+		m.serviceMapCursor--
+	}
+	if m.isAction("trace", "down", key) && m.serviceMapCursor < len(lines)-1 {
+		m.serviceMapCursor++
+	}
+	if isPageDownKey(key) {
+		m.serviceMapCursor = min(len(lines)-1, m.serviceMapCursor+m.serviceMapPageRows())
+	}
+	if isPageUpKey(key) {
+		m.serviceMapCursor = max(0, m.serviceMapCursor-m.serviceMapPageRows())
+	}
+	if isHalfPageDownKey(key) {
+		m.serviceMapCursor = min(len(lines)-1, m.serviceMapCursor+m.serviceMapHalfPageRows())
+	}
+	if isHalfPageUpKey(key) {
+		m.serviceMapCursor = max(0, m.serviceMapCursor-m.serviceMapHalfPageRows())
+	}
 	return m, nil
 }
 
@@ -281,6 +584,18 @@ func (m Model) updateLogs(key string) (tea.Model, tea.Cmd) {
 	}
 	if m.isAction("logs", "down", key) && m.logCursor < len(m.filteredLogs)-1 {
 		m.logCursor++
+	}
+	if isPageDownKey(key) && len(m.filteredLogs) > 0 {
+		m.logCursor = min(len(m.filteredLogs)-1, m.logCursor+m.logsPageRows())
+	}
+	if isPageUpKey(key) && len(m.filteredLogs) > 0 {
+		m.logCursor = max(0, m.logCursor-m.logsPageRows())
+	}
+	if isHalfPageDownKey(key) && len(m.filteredLogs) > 0 {
+		m.logCursor = min(len(m.filteredLogs)-1, m.logCursor+m.logsHalfPageRows())
+	}
+	if isHalfPageUpKey(key) && len(m.filteredLogs) > 0 {
+		m.logCursor = max(0, m.logCursor-m.logsHalfPageRows())
 	}
 	if m.isAction("logs", "level_up", key) && m.levelThresholdIx < len(m.cfg.Logs.LevelOrder)-1 {
 		m.levelThresholdIx++
@@ -365,7 +680,8 @@ func (m Model) nearestParentWithChildrenIndex(from int) int {
 
 func (m *Model) applyLogThreshold() {
 	if len(m.cfg.Logs.LevelOrder) == 0 {
-		m.filteredLogs = m.allLogs
+		m.levelFilteredLog = m.allLogs
+		m.applyLogSearchFilter()
 		return
 	}
 	threshold := strings.ToLower(m.cfg.Logs.LevelOrder[m.levelThresholdIx])
@@ -380,16 +696,295 @@ func (m *Model) applyLogThreshold() {
 			filtered = append(filtered, entry)
 		}
 	}
-	m.filteredLogs = filtered
+	m.levelFilteredLog = filtered
+	m.applyLogSearchFilter()
+	m.status = fmt.Sprintf("log filter level >= %s (%d lines)", threshold, len(m.filteredLogs))
+}
+
+func (m *Model) applyLogSearchFilter() {
+	if m.logSearchMatcher == nil {
+		m.filteredLogs = m.levelFilteredLog
+	} else {
+		filtered := make([]domain.LogEntry, 0, len(m.levelFilteredLog))
+		for _, entry := range m.levelFilteredLog {
+			if m.logSearchMatcher.MatchFields(logSearchFields(entry), logSearchBlob(entry)) {
+				filtered = append(filtered, entry)
+			}
+		}
+		m.filteredLogs = filtered
+	}
 	if m.logCursor >= len(m.filteredLogs) {
 		m.logCursor = max(0, len(m.filteredLogs)-1)
 	}
-	m.status = fmt.Sprintf("log filter level >= %s (%d lines)", threshold, len(filtered))
+}
+
+func (m *Model) applyLogSearch(matcher *searchMatcher, raw string) {
+	m.logSearchRaw = raw
+	m.logSearchMatcher = matcher
+	m.applyLogThreshold()
+	if matcher == nil {
+		m.status = fmt.Sprintf("log search cleared (%d lines)", len(m.filteredLogs))
+		return
+	}
+	m.status = fmt.Sprintf("log search %q matched %d lines", raw, len(m.filteredLogs))
+}
+
+func (m *Model) applyTraceSearch(matcher *searchMatcher, raw string, direction int) {
+	if matcher == nil {
+		m.status = "trace search cleared"
+		return
+	}
+	if len(m.traceLines) == 0 {
+		m.status = "trace search: no spans"
+		return
+	}
+	if direction == 0 {
+		direction = 1
+	}
+	start := m.traceCursor + direction
+	for i := 0; i < len(m.traceLines); i++ {
+		idx := (start + i*direction + len(m.traceLines)*2) % len(m.traceLines)
+		line := m.traceLines[idx]
+		span := m.session.Trace.SpansByID[line.SpanID]
+		fields := traceSearchFields(line, span)
+		blob := traceSearchBlob(line, span)
+		if matcher.MatchFields(fields, blob) {
+			m.traceCursor = idx
+			m.status = fmt.Sprintf("trace search %q -> row %d/%d", raw, idx+1, len(m.traceLines))
+			return
+		}
+	}
+	m.status = fmt.Sprintf("trace search %q: no match", raw)
+}
+
+func (m *Model) applyServiceMapSearch(matcher *searchMatcher, raw string, direction int) {
+	lines := m.serviceMapLines()
+	if matcher == nil {
+		m.status = "service map search cleared"
+		return
+	}
+	if len(lines) == 0 {
+		m.status = "service map search: no rows"
+		return
+	}
+	if direction == 0 {
+		direction = 1
+	}
+	start := m.serviceMapCursor + direction
+	for i := 0; i < len(lines); i++ {
+		idx := (start + i*direction + len(lines)*2) % len(lines)
+		fields := map[string]string{"line": lines[idx]}
+		if matcher.MatchFields(fields, lines[idx]) {
+			m.serviceMapCursor = idx
+			m.status = fmt.Sprintf("service map search %q -> row %d/%d", raw, idx+1, len(lines))
+			return
+		}
+	}
+	m.status = fmt.Sprintf("service map search %q: no match", raw)
+}
+
+func (m *Model) applyJSONSearch(matcher *searchMatcher, raw string, direction int) {
+	if matcher == nil {
+		m.status = "json search cleared"
+		return
+	}
+	if m.jsonTree == nil {
+		m.status = "json search unavailable"
+		return
+	}
+	matched := false
+	if direction < 0 {
+		matched = m.jsonTree.SearchPrev(matcher)
+	} else {
+		matched = m.jsonTree.SearchNext(matcher)
+	}
+	if matched {
+		m.status = fmt.Sprintf("json search %q matched", raw)
+		return
+	}
+	m.status = fmt.Sprintf("json search %q: no match", raw)
+}
+
+func (m *Model) applyValueSearch(matcher *searchMatcher, raw string, direction int) {
+	if m.valueView == nil {
+		return
+	}
+	if matcher == nil {
+		m.status = "value search cleared"
+		return
+	}
+	if len(m.valueView.lines) == 0 {
+		m.status = "value search: no lines"
+		return
+	}
+	if direction == 0 {
+		direction = 1
+	}
+	start := m.valueView.offset + direction
+	for i := 0; i < len(m.valueView.lines); i++ {
+		idx := (start + i*direction + len(m.valueView.lines)*2) % len(m.valueView.lines)
+		line := m.valueView.lines[idx]
+		fields := map[string]string{"line": line}
+		if matcher.MatchFields(fields, line) {
+			m.valueView.offset = idx
+			m.status = fmt.Sprintf("value search %q -> line %d/%d", raw, idx+1, len(m.valueView.lines))
+			return
+		}
+	}
+	m.status = fmt.Sprintf("value search %q: no match", raw)
+}
+
+func isTopPrefixKey(key string) bool {
+	return key == "g"
+}
+
+func isBottomShortcutKey(key string) bool {
+	return key == "G" || key == "shift+g"
+}
+
+func isSearchNextKey(key string) bool {
+	return key == "n"
+}
+
+func isSearchPrevKey(key string) bool {
+	return key == "N" || key == "shift+n"
+}
+
+func isPageDownKey(key string) bool {
+	return keysMatch("pgdown", key) || keysMatch("ctrl+f", key)
+}
+
+func isPageUpKey(key string) bool {
+	return keysMatch("pgup", key) || keysMatch("ctrl+b", key)
+}
+
+func isHalfPageDownKey(key string) bool {
+	return keysMatch("ctrl+d", key)
+}
+
+func isHalfPageUpKey(key string) bool {
+	return keysMatch("ctrl+u", key)
+}
+
+func (m Model) tracePageRows() int {
+	return max(1, m.traceVisibleRows())
+}
+
+func (m Model) traceHalfPageRows() int {
+	return max(1, m.traceVisibleRows()/2)
+}
+
+func (m Model) logsPageRows() int {
+	return max(1, m.logsVisibleRows())
+}
+
+func (m Model) logsHalfPageRows() int {
+	return max(1, m.logsVisibleRows()/2)
+}
+
+func (m Model) jsonPageRows() int {
+	return max(1, m.height-5)
+}
+
+func (m Model) jsonHalfPageRows() int {
+	return max(1, m.jsonPageRows()/2)
+}
+
+func (m Model) valuePageRows() int {
+	return max(1, m.height-5)
+}
+
+func (m Model) valueHalfPageRows() int {
+	return max(1, m.valuePageRows()/2)
+}
+
+func (m Model) serviceMapPageRows() int {
+	return max(1, m.serviceMapVisibleRows())
+}
+
+func (m Model) serviceMapHalfPageRows() int {
+	return max(1, m.serviceMapVisibleRows()/2)
+}
+
+func (m Model) traceVisibleRows() int {
+	if m.fullscreen && m.activePanel == panelTrace {
+		innerHeight := max(4, m.height-4)
+		return max(1, (innerHeight-2)/2)
+	}
+	return max(1, (max(4, m.height/3)-2)/2)
+}
+
+func (m Model) logsVisibleRows() int {
+	if m.fullscreen && m.activePanel == panelLogs {
+		innerHeight := max(4, m.height-4)
+		return max(1, innerHeight-3)
+	}
+	return max(1, max(4, m.height/3)-3)
+}
+
+func (m Model) serviceMapVisibleRows() int {
+	if m.fullscreen && m.activePanel == panelServiceMap {
+		innerHeight := max(3, m.height-4)
+		return max(1, innerHeight-1)
+	}
+	return max(1, max(3, m.height/3)-1)
+}
+
+func logSearchFields(entry domain.LogEntry) map[string]string {
+	fields := map[string]string{
+		"timestamp": entry.Timestamp.Format(time.RFC3339Nano),
+		"service":   entry.Service,
+		"level":     entry.Level,
+		"message":   entry.Message,
+		"raw":       entry.RawLine,
+	}
+	for k, v := range entry.Labels {
+		fields["labels."+k] = v
+	}
+	if entry.JSON != nil {
+		flattenAny("", entry.JSON, fields)
+	}
+	return fields
+}
+
+func logSearchBlob(entry domain.LogEntry) string {
+	parts := []string{entry.Service, entry.Level, entry.Message, entry.RawLine}
+	for k, v := range entry.Labels {
+		parts = append(parts, k, v)
+	}
+	return strings.Join(parts, " ")
+}
+
+func traceSearchFields(line traceLine, span *domain.Span) map[string]string {
+	fields := map[string]string{
+		"span.id":   line.SpanID,
+		"span.name": line.Label,
+		"service":   line.Service,
+		"kind":      line.Kind,
+		"error":     strconv.FormatBool(line.Error),
+	}
+	if span != nil {
+		fields["status"] = span.StatusCode
+		fields["status_message"] = span.StatusMsg
+		flattenAny("", span.Attributes, fields)
+	}
+	return fields
+}
+
+func traceSearchBlob(line traceLine, span *domain.Span) string {
+	parts := []string{line.SpanID, line.Service, line.Label, line.Kind}
+	if span != nil {
+		parts = append(parts, span.StatusCode, span.StatusMsg)
+	}
+	return strings.Join(parts, " ")
 }
 
 func (m Model) View() string {
 	if m.width == 0 || m.height == 0 {
 		return "loading..."
+	}
+	if m.configView != nil {
+		return clampToHeight(m.configView.View(), m.height)
 	}
 
 	if m.showHelp {
@@ -402,25 +997,29 @@ func (m Model) View() string {
 		return clampToHeight(m.layout(m.jsonTree.View(m.height-3)), m.height)
 	}
 
-	header := fmt.Sprintf("trace=%s env=%s operation=%s duration=%s spans=%d services=%d errors=%d",
-		m.session.Trace.TraceID,
-		m.session.Environment,
-		m.session.Trace.OperationName,
-		m.session.Trace.Duration.Round(time.Millisecond),
-		m.session.Trace.SpanCount,
-		m.session.Trace.ServiceCount,
-		m.session.Trace.ErrorSpanCount,
+	headerLine1 := m.summaryHeaderLine()
+	headerLine2 := m.summaryStatsLine()
+	headerRendered := lipgloss.JoinVertical(
+		lipgloss.Left,
+		lipgloss.NewStyle().Width(max(1, m.width)).Render(headerLine1),
+		lipgloss.NewStyle().Width(max(1, m.width)).Render(headerLine2),
 	)
-	headerRendered := titleStyle.Width(max(1, m.width)).Render(header)
 	headerHeight := max(1, lipgloss.Height(headerRendered))
 
 	if m.fullscreen {
 		innerHeight := max(1, m.height-headerHeight-2)
-		body := sectionStyle(true, m.width).Render(m.panelView(m.activePanel, innerHeight))
-		return clampToHeight(lipgloss.JoinVertical(lipgloss.Left, headerRendered, body), m.height)
+		body := sectionStyle(true, m.width, innerHeight).Render(m.panelView(m.activePanel, innerHeight))
+		footer := mutedStyle.Render(m.status + " | / search | n/N next/prev | gg/G top/bottom | ctrl+f/b page | ctrl+d/u half-page | f fullscreen")
+		if m.searchPrompt != nil {
+			footer += "\n" + mutedStyle.Render(m.searchPrompt.viewLine()) + "\n" + mutedStyle.Render(searchHint())
+		}
+		return clampToHeight(lipgloss.JoinVertical(lipgloss.Left, headerRendered, body, footer), m.height)
 	}
 
-	footer := mutedStyle.Render(m.status + " | f fullscreen | c collapse | tab/shift+tab switch | ? help")
+	footer := mutedStyle.Render(m.status + " | / search | n/N next/prev | gg/G top/bottom | ctrl+f/b page | ctrl+d/u half-page | f fullscreen | c collapse | tab/shift+tab switch | F2 config | ? help")
+	if m.searchPrompt != nil {
+		footer += "\n" + mutedStyle.Render(m.searchPrompt.viewLine()) + "\n" + mutedStyle.Render(searchHint())
+	}
 	footerHeight := max(1, lipgloss.Height(footer))
 	sectionCount := 3
 	borderOverhead := 2 * sectionCount
@@ -485,13 +1084,138 @@ func (m Model) View() string {
 	var rendered []string
 	for _, p := range order {
 		if m.collapsed[p] {
-			rendered = append(rendered, sectionStyle(m.activePanel == p, m.width).Render(panelTitle(p)+" (collapsed)"))
+			rendered = append(rendered, sectionStyle(m.activePanel == p, m.width, max(1, innerHeights[p])).Render(panelTitle(p)+" (collapsed)"))
 			continue
 		}
-		rendered = append(rendered, sectionStyle(m.activePanel == p, m.width).Render(m.panelView(p, max(1, innerHeights[p]))))
+		rendered = append(rendered, sectionStyle(m.activePanel == p, m.width, max(1, innerHeights[p])).Render(m.panelView(p, max(1, innerHeights[p]))))
 	}
 
 	return clampToHeight(lipgloss.JoinVertical(lipgloss.Left, append([]string{headerRendered}, append(rendered, footer)...)...), m.height)
+}
+
+func (m Model) summaryHeaderLine() string {
+	trace := m.session.Trace
+	if trace == nil {
+		return "[unknown]"
+	}
+	parts := []string{
+		summaryBrightStyle.Render("[") + summaryGrayStyle.Render(m.session.Environment) + summaryBrightStyle.Render("]"),
+	}
+	if trace.TraceID != "" {
+		parts = append(parts, summaryBrightStyle.Render(trace.TraceID))
+	}
+	if trace.ErrorSpanCount > 0 {
+		parts = append(parts, summaryErrorStyle.Render("!"))
+	}
+	if status, ok := m.rootHTTPStatus(); ok {
+		parts = append(parts, summaryHTTPStatusStyle(status).Render(fmt.Sprintf("%d", status)))
+	}
+	operation := strings.TrimSpace(trace.OperationName)
+	if operation == "" {
+		operation = "-"
+	}
+	parts = append(parts, summaryBrightStyle.Render(operation))
+	parts = append(parts,
+		summaryBrightStyle.Render("(")+summaryDurationStyle(trace.Duration).Render(trace.Duration.Round(time.Millisecond).String())+summaryBrightStyle.Render(")"),
+	)
+	if !trace.StartTime.IsZero() {
+		start := trace.StartTime.In(m.loc).Format("2006-01-02 15:04:05.000")
+		end := trace.StartTime.Add(trace.Duration).In(m.loc).Format("2006-01-02 15:04:05.000")
+		parts = append(parts,
+			summaryBrightStyle.Render("-"),
+			summaryBrightStyle.Render("[")+summaryGrayStyle.Render(start)+summaryBrightStyle.Render(" - ")+summaryGrayStyle.Render(end)+summaryBrightStyle.Render("]"),
+		)
+	}
+	return strings.Join(parts, " ")
+}
+
+func summaryHTTPStatusStyle(status int) lipgloss.Style {
+	switch status / 100 {
+	case 2:
+		return summarySuccessStyle
+	case 3:
+		return summaryInfoStyle
+	case 4:
+		return summaryWarnStyle
+	case 5:
+		return summaryErrorStyle
+	default:
+		return summaryBrightStyle
+	}
+}
+
+func summaryDurationStyle(d time.Duration) lipgloss.Style {
+	switch {
+	case d < 100*time.Millisecond:
+		return summarySuccessStyle
+	case d < time.Second:
+		return summaryBrightStyle
+	case d < 3*time.Second:
+		return summaryWarnStyle
+	default:
+		return summaryErrorStyle
+	}
+}
+
+func (m Model) rootHTTPStatus() (int, bool) {
+	trace := m.session.Trace
+	if trace == nil {
+		return 0, false
+	}
+	var root *domain.Span
+	for _, rootID := range trace.RootSpanIDs {
+		if span := trace.SpansByID[rootID]; span != nil {
+			root = span
+			break
+		}
+	}
+	if root == nil && len(trace.Spans) > 0 {
+		root = trace.Spans[0]
+	}
+	if root == nil || root.Attributes == nil {
+		return 0, false
+	}
+	v, ok := root.Attributes["http.response.status_code"]
+	if !ok {
+		return 0, false
+	}
+	s, ok := toInt(v)
+	if !ok || s <= 0 {
+		return 0, false
+	}
+	return s, true
+}
+
+func toInt(v any) (int, bool) {
+	s := strings.TrimSpace(fmt.Sprint(v))
+	if s == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+func (m Model) logsHeaderDate() string {
+	if entry, ok := m.currentLog(); ok {
+		return entry.Timestamp.In(m.loc).Format("2006-01-02")
+	}
+	if m.session != nil && m.session.Trace != nil && !m.session.Trace.StartTime.IsZero() {
+		return m.session.Trace.StartTime.In(m.loc).Format("2006-01-02")
+	}
+	return ""
+}
+
+func (m Model) summaryStatsLine() string {
+	parts := []string{
+		summaryGrayStyle.Render("services") + summaryGrayStyle.Render(":") + " " + summaryBrightStyle.Render(fmt.Sprintf("%d", m.session.Trace.ServiceCount)),
+		summaryGrayStyle.Render("errors") + summaryGrayStyle.Render(":") + " " + summaryBrightStyle.Render(fmt.Sprintf("%d", m.session.Trace.ErrorSpanCount)),
+		summaryGrayStyle.Render("spans") + summaryGrayStyle.Render(":") + " " + summaryBrightStyle.Render(fmt.Sprintf("%d", m.session.Trace.SpanCount)),
+		summaryGrayStyle.Render("logs") + summaryGrayStyle.Render(":") + " " + summaryBrightStyle.Render(fmt.Sprintf("%d", len(m.filteredLogs))),
+	}
+	return strings.Join(parts, "  ")
 }
 
 func (m Model) panelView(p panel, height int) string {
@@ -606,7 +1330,11 @@ func (m Model) nextPanel(step int) panel {
 }
 
 func (m Model) layout(body string) string {
-	return lipgloss.JoinVertical(lipgloss.Left, titleStyle.Render("trace viewer"), body, mutedStyle.Render(m.status+" | ? help | esc back"))
+	footer := mutedStyle.Render(m.status + " | / search | n/N next/prev | gg/G top/bottom | ctrl+f/b page | ctrl+d/u half-page | ? help | esc back")
+	if m.searchPrompt != nil {
+		footer += "\n" + mutedStyle.Render(m.searchPrompt.viewLine()) + "\n" + mutedStyle.Render(searchHint())
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, titleStyle.Render("trace viewer"), body, footer)
 }
 
 func (m Model) traceView(height int) string {
@@ -651,7 +1379,7 @@ func (m Model) traceView(height int) string {
 		left := fmt.Sprintf("%s%s%s%s%s %s [%s] %s %s", prefix, indent, toggle, errIcon, linkIcon, m.spanIcon(line.Kind), line.Service, line.Label, line.Duration.Round(time.Microsecond))
 		left = truncate(left, contentWidth)
 		bar := m.timelineBar(line, barWidth)
-		serviceStyle := colorForService(line.Service)
+		serviceStyle := m.colorForService(line.Service)
 		b.WriteString(serviceStyle.Render(left))
 		b.WriteString("\n")
 		b.WriteString("    ")
@@ -680,15 +1408,17 @@ func (m Model) serviceMapView(height int) string {
 	if maxRows < 1 {
 		maxRows = 1
 	}
-
-	if len(lines) > maxRows {
-		lines = append(lines[:maxRows-1], "(truncated; use fullscreen for more)")
-	}
+	start, end := m.window(len(lines), m.serviceMapCursor, maxRows)
 
 	var b strings.Builder
 	b.WriteString("Service map\n")
-	for _, line := range lines {
-		b.WriteString("  ")
+	for i := start; i < end; i++ {
+		prefix := "  "
+		if i == m.serviceMapCursor {
+			prefix = "> "
+		}
+		b.WriteString(prefix)
+		line := lines[i]
 		b.WriteString(line)
 		b.WriteString("\n")
 	}
@@ -773,7 +1503,13 @@ func (m Model) logsView(height int) string {
 	cols := m.logColumns()
 	widths := m.logColumnWidths(cols)
 
-	b.WriteString("Logs\n")
+	b.WriteString("Logs")
+	if date := m.logsHeaderDate(); date != "" {
+		b.WriteString(" [")
+		b.WriteString(date)
+		b.WriteString("]")
+	}
+	b.WriteString("\n")
 	b.WriteString("  ")
 	b.WriteString(m.renderLogRowHeader(cols, widths))
 	b.WriteString("\n")
@@ -949,7 +1685,7 @@ func (m Model) renderLogRow(entry domain.LogEntry, cols []logColumn, widths []in
 func (m Model) logFieldValue(entry domain.LogEntry, field string) string {
 	switch strings.ToLower(strings.TrimSpace(field)) {
 	case "timestamp", "time":
-		return entry.Timestamp.Format("15:04:05.000")
+		return entry.Timestamp.In(m.loc).Format("15:04:05.000")
 	case "service":
 		return entry.Service
 	case "level":
@@ -1089,9 +1825,70 @@ func (m Model) helpView() string {
 		}
 		b.WriteString("\n")
 	}
-	b.WriteString("Shortcuts are config-driven (config.json). esc/? close help; tab/shift+tab move sections.")
+	b.WriteString("Shortcuts are config-driven (config.json). esc/? close help; tab/shift+tab move sections; gg/G top/bottom; n/N next/prev search; ctrl+f/b page; ctrl+d/u half-page; / search.")
+	b.WriteString(" Press F2 (or Cmd+, when terminal supports it) for config mode.")
 
 	return m.layout(b.String())
+}
+
+func (m *Model) openConfigMode() {
+	loaded, err := config.Load(m.cfg.Path)
+	if err != nil {
+		m.status = "load config failed: " + err.Error()
+		return
+	}
+	cfgModel := NewConfigModel(loaded)
+	if m.width > 0 && m.height > 0 {
+		updated, _ := cfgModel.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
+		if next, ok := updated.(ConfigModel); ok {
+			cfgModel = next
+		}
+	}
+	m.configView = &cfgModel
+	m.status = "opened config mode"
+}
+
+func (m *Model) reloadConfig() {
+	loaded, err := config.Load(m.cfg.Path)
+	if err != nil {
+		m.status = "reload config failed: " + err.Error()
+		return
+	}
+	m.cfg = loaded
+	if loc, err := loaded.DisplayLocation(); err == nil {
+		m.loc = loc
+	}
+	m.initServiceColors()
+	m.levelThresholdIx = m.levelIndex(m.cfg.Logs.LevelThreshold)
+	m.applyLogThreshold()
+}
+
+func (m *Model) initServiceColors() {
+	palette := defaultServicePalette()
+	for _, raw := range m.cfg.UI.AdditionalServiceColors {
+		color := strings.TrimSpace(raw)
+		if color != "" {
+			palette = append(palette, color)
+		}
+	}
+
+	if len(palette) == 0 {
+		palette = []string{"244"}
+	}
+
+	m.serviceColors = map[string]string{}
+	next := 0
+	for _, line := range m.traceLines {
+		service := strings.TrimSpace(line.Service)
+		if service == "" {
+			continue
+		}
+		if _, ok := m.serviceColors[service]; ok {
+			continue
+		}
+		m.serviceColors[service] = palette[next%len(palette)]
+		next++
+	}
 }
 
 func (m Model) isAction(section, action, key string) bool {
@@ -1258,36 +2055,12 @@ func buildServiceEdges(trace *domain.Trace) []serviceEdge {
 		if span.Service == "" {
 			continue
 		}
-		for parent := trace.SpansByID[span.ParentID]; parent != nil; parent = trace.SpansByID[parent.ParentID] {
-			if parent.Service == "" || parent.Service == span.Service {
-				continue
-			}
-			key := parent.Service + "\x00" + span.Service
-			counts[key]++
-			break
+		parent := trace.SpansByID[span.ParentID]
+		if parent == nil || parent.Service == "" || parent.Service == span.Service {
+			continue
 		}
-		for _, link := range span.Links {
-			linked := trace.SpansByID[link.SpanID]
-			if linked == nil || linked.Service == "" || linked.Service == span.Service {
-				continue
-			}
-			key := span.Service + "\x00" + linked.Service
-			counts[key]++
-		}
-	}
-	if len(counts) == 0 {
-		sorted := append([]*domain.Span(nil), trace.Spans...)
-		sort.Slice(sorted, func(i, j int) bool {
-			return sorted[i].Start.Before(sorted[j].Start)
-		})
-		for i := 1; i < len(sorted); i++ {
-			from := sorted[i-1].Service
-			to := sorted[i].Service
-			if from == "" || to == "" || from == to {
-				continue
-			}
-			counts[from+"\x00"+to]++
-		}
+		key := parent.Service + "\x00" + span.Service
+		counts[key]++
 	}
 	out := make([]serviceEdge, 0, len(counts))
 	for key, count := range counts {
@@ -1332,7 +2105,7 @@ func (m Model) traceDetailRoot(span *domain.Span) OrderedRoot {
 		case "attributes":
 			entries = append(entries, RootEntry{Key: "attributes", Value: span.Attributes})
 		case "events":
-			entries = append(entries, RootEntry{Key: "events", Value: spanEventsPayload(span)})
+			entries = append(entries, RootEntry{Key: "events", Value: m.spanEventsPayload(span)})
 		case "links":
 			entries = append(entries, RootEntry{Key: "links", Value: spanLinksPayload(span.Links)})
 		}
@@ -1340,7 +2113,7 @@ func (m Model) traceDetailRoot(span *domain.Span) OrderedRoot {
 	if len(entries) == 0 {
 		entries = append(entries, RootEntry{Key: "metadata", Value: spanMetadataPayload(span)})
 		entries = append(entries, RootEntry{Key: "attributes", Value: span.Attributes})
-		entries = append(entries, RootEntry{Key: "events", Value: spanEventsPayload(span)})
+		entries = append(entries, RootEntry{Key: "events", Value: m.spanEventsPayload(span)})
 		entries = append(entries, RootEntry{Key: "links", Value: spanLinksPayload(span.Links)})
 	}
 	return OrderedRoot{Entries: entries}
@@ -1358,10 +2131,10 @@ func spanMetadataPayload(span *domain.Span) map[string]any {
 	}
 }
 
-func spanEventsPayload(span *domain.Span) map[string]any {
+func (m Model) spanEventsPayload(span *domain.Span) map[string]any {
 	events := map[string]any{}
 	for i, event := range span.Events {
-		key := fmt.Sprintf("%02d %s @ %s", i+1, event.Name, event.Time.Format("15:04:05.000"))
+		key := fmt.Sprintf("%02d %s @ %s", i+1, event.Name, event.Time.In(m.loc).Format("15:04:05.000"))
 		events[key] = event.Attributes
 	}
 	return events
@@ -1410,26 +2183,37 @@ func iconOrDefault(icons map[string]string, key, fallback string) string {
 var (
 	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
 	mutedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+
+	summaryBrightStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+	summaryGrayStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	summarySuccessStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
+	summaryInfoStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("4"))
+	summaryWarnStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
+	summaryErrorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
 )
 
-func sectionStyle(active bool, width int) lipgloss.Style {
+func sectionStyle(active bool, width int, height int) lipgloss.Style {
 	color := lipgloss.Color("240")
 	if active {
 		color = lipgloss.Color("33")
 	}
-	return lipgloss.NewStyle().Width(width).Border(lipgloss.NormalBorder()).BorderForeground(color).Padding(0, 1)
+	contentWidth := max(1, width-4)
+	return lipgloss.NewStyle().Width(contentWidth).Height(height).Border(lipgloss.NormalBorder()).BorderForeground(color).Padding(0, 1)
 }
 
-func colorForService(service string) lipgloss.Style {
-	palette := []string{"69", "75", "81", "111", "174", "208", "179", "141"}
+func (m Model) colorForService(service string) lipgloss.Style {
+	service = strings.TrimSpace(service)
 	if service == "" {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	}
-	h := 0
-	for _, r := range service {
-		h += int(r)
+	if color, ok := m.serviceColors[service]; ok {
+		return lipgloss.NewStyle().Foreground(lipgloss.Color(color))
 	}
-	return lipgloss.NewStyle().Foreground(lipgloss.Color(palette[h%len(palette)]))
+	return lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+}
+
+func defaultServicePalette() []string {
+	return []string{"68", "173", "71", "176", "74", "179", "109", "175", "75", "181"}
 }
 
 func shortID(id string) string {

@@ -136,6 +136,52 @@ func (j *JSONTree) CurrentScalar() (string, any, bool) {
 	return line.Key, line.Value, true
 }
 
+func (j *JSONTree) SearchNext(matcher *searchMatcher) bool {
+	if matcher == nil || len(j.lines) == 0 {
+		return false
+	}
+	start := j.cursor + 1
+	for i := 0; i < len(j.lines); i++ {
+		idx := (start + i) % len(j.lines)
+		line := j.lines[idx]
+		fields := map[string]string{
+			"path":  line.Path,
+			"key":   line.Key,
+			"label": line.Label,
+			"value": fmt.Sprint(line.Value),
+		}
+		blob := line.Path + " " + line.Label + " " + fmt.Sprint(line.Value)
+		if matcher.MatchFields(fields, blob) {
+			j.cursor = idx
+			return true
+		}
+	}
+	return false
+}
+
+func (j *JSONTree) SearchPrev(matcher *searchMatcher) bool {
+	if matcher == nil || len(j.lines) == 0 {
+		return false
+	}
+	start := j.cursor - 1
+	for i := 0; i < len(j.lines); i++ {
+		idx := (start - i + len(j.lines)*2) % len(j.lines)
+		line := j.lines[idx]
+		fields := map[string]string{
+			"path":  line.Path,
+			"key":   line.Key,
+			"label": line.Label,
+			"value": fmt.Sprint(line.Value),
+		}
+		blob := line.Path + " " + line.Label + " " + fmt.Sprint(line.Value)
+		if matcher.MatchFields(fields, blob) {
+			j.cursor = idx
+			return true
+		}
+	}
+	return false
+}
+
 func (j *JSONTree) View(height int) string {
 	if len(j.lines) == 0 {
 		return j.title + "\n(empty)"

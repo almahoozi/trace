@@ -15,6 +15,7 @@ import (
 
 	"github.com/almahoozi/trace/internal/app"
 	"github.com/almahoozi/trace/internal/config"
+	"github.com/almahoozi/trace/internal/domain"
 	"github.com/almahoozi/trace/internal/grafana"
 	"github.com/almahoozi/trace/internal/platform"
 	"github.com/almahoozi/trace/internal/secrets"
@@ -44,7 +45,12 @@ func main() {
 	}
 
 	args := flag.Args()
-	if len(args) == 1 && args[0] == "config" {
+	if len(args) >= 1 && args[0] == "config" {
+		if len(args) > 2 || (len(args) == 2 && args[1] != "edit") {
+			fmt.Fprintf(os.Stderr, "invalid command\n")
+			printUsage()
+			os.Exit(1)
+		}
 		path, err := config.EnsureFile(configPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to prepare config file: %v\n", err)
@@ -56,19 +62,24 @@ func main() {
 		}
 		return
 	}
-
-	if len(args) != 1 {
-		fmt.Fprintf(os.Stderr, "usage: %s [-v|--version] [--config path] <trace-id>\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "       %s [--config path] config\n", os.Args[0])
+	if len(args) == 0 {
+		printUsage()
 		os.Exit(1)
 	}
-	traceID := args[0]
 
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(1)
 	}
+
+	mode, err := resolveMode(args, cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		printUsage()
+		os.Exit(1)
+	}
+
 	if strings.TrimSpace(cfg.Grafana.BaseURL) == "" {
 		if err := promptAndSaveBaseURL(&cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to set grafana.base_url: %v\n", err)
@@ -90,6 +101,53 @@ func main() {
 	grafanaClient := grafana.NewClient(cfg.Grafana.BaseURL, token, httpClient)
 	fetcher := app.NewFetcher(grafanaClient)
 
+	if mode.isBrowse {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Grafana.TimeoutSeconds+10)*time.Second)
+		items, err := fetcher.FetchTraceList(ctx, cfg, mode.environment, mode.query, 50)
+		cancel()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to fetch trace list: %v\n", err)
+			os.Exit(1)
+		}
+
+		program := tea.NewProgram(
+			tui.NewBrowseModel(
+				cfg,
+				mode.environment,
+				mode.query,
+				items,
+				func(ctx context.Context, traceID string) (*domain.Session, error) {
+					return fetcher.FetchTraceSessionInEnvironment(ctx, cfg, mode.environment, traceID)
+				},
+				func(ctx context.Context) ([]domain.TraceListItem, error) {
+					return fetcher.FetchTraceList(ctx, cfg, mode.environment, mode.query, 50)
+				},
+				platform.OpenURL,
+			),
+			tea.WithAltScreen(),
+		)
+		finalModel, err := program.Run()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "tui failed: %v\n", err)
+			os.Exit(1)
+		}
+		browseModel, ok := finalModel.(tui.BrowseModel)
+		if ok {
+			if session := browseModel.LastSession(); session != nil {
+				summary, err := app.RenderTraceSummaryWithColor(cfg, session, shouldColorizeStdout())
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "trace summary warning: %v\n", err)
+				}
+				if strings.TrimSpace(summary) != "" {
+					fmt.Fprintln(os.Stdout, summary)
+				}
+			}
+		}
+		return
+	}
+
+	traceID := mode.traceID
+
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Grafana.TimeoutSeconds+10)*time.Second)
 	defer cancel()
 
@@ -108,6 +166,71 @@ func main() {
 		fmt.Fprintf(os.Stderr, "tui failed: %v\n", err)
 		os.Exit(1)
 	}
+
+	summary, err := app.RenderTraceSummaryWithColor(cfg, session, shouldColorizeStdout())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "trace summary warning: %v\n", err)
+	}
+	if strings.TrimSpace(summary) != "" {
+		fmt.Fprintln(os.Stdout, summary)
+	}
+}
+
+type cliMode struct {
+	isBrowse    bool
+	environment string
+	query       string
+	traceID     string
+}
+
+func resolveMode(args []string, cfg config.Config) (cliMode, error) {
+	if len(args) == 0 {
+		return cliMode{}, fmt.Errorf("missing command arguments")
+	}
+
+	if env := lookupEnvironment(cfg, args[0]); env != "" {
+		return cliMode{
+			isBrowse:    true,
+			environment: env,
+			query:       strings.TrimSpace(strings.Join(args[1:], " ")),
+		}, nil
+	}
+
+	if len(args) == 1 {
+		return cliMode{traceID: strings.TrimSpace(args[0])}, nil
+	}
+
+	return cliMode{}, fmt.Errorf("invalid command")
+}
+
+func lookupEnvironment(cfg config.Config, candidate string) string {
+	target := strings.TrimSpace(candidate)
+	for _, env := range cfg.Environments {
+		if strings.EqualFold(strings.TrimSpace(env.Name), target) {
+			return env.Name
+		}
+	}
+	return ""
+}
+
+func printUsage() {
+	fmt.Fprintf(os.Stderr, "usage: %s [-v|--version] [--config path] <trace-id>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--config path] <env> [query]\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--config path] config\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--config path] config edit\n", os.Args[0])
+}
+
+func shouldColorizeStdout() bool {
+	if !term.IsTerminal(int(os.Stdout.Fd())) {
+		return false
+	}
+	if strings.TrimSpace(os.Getenv("NO_COLOR")) != "" {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("TERM")), "dumb") {
+		return false
+	}
+	return true
 }
 
 func printBuildInfo() {

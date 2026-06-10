@@ -66,6 +66,36 @@ func (c *Client) FetchTrace(ctx context.Context, env config.Environment, traceID
 	return trace, nil
 }
 
+func (c *Client) SearchTraces(ctx context.Context, env config.Environment, query string, limit int) ([]domain.TraceListItem, error) {
+	v := url.Values{}
+	if trimmed := strings.TrimSpace(query); trimmed != "" {
+		v.Set("q", trimmed)
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	v.Set("limit", strconv.Itoa(limit))
+
+	u := fmt.Sprintf("%s/api/datasources/proxy/uid/%s/api/search?%s", c.baseURL, url.PathEscape(env.TempoDatasource), v.Encode())
+	body, statusCode, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	if statusCode >= 400 {
+		return nil, fmt.Errorf("search traces failed with status %d", statusCode)
+	}
+
+	items, err := parseTraceSearchPayload(body)
+	if err != nil {
+		dumpPath, dumpErr := dumpJSON("trace-search-payload-", body)
+		if dumpErr != nil {
+			return nil, fmt.Errorf("%w (also failed to dump payload: %v)", err, dumpErr)
+		}
+		return nil, fmt.Errorf("%w (payload dumped at %s)", err, dumpPath)
+	}
+	return items, nil
+}
+
 func (c *Client) FetchLogs(ctx context.Context, cfg config.Config, env config.Environment, traceID string, traceStart, traceEnd time.Time) ([]domain.LogEntry, error) {
 	query := strings.ReplaceAll(env.LogQueryTemplate, "{{trace_id}}", traceID)
 	trimmedQuery := strings.TrimSpace(query)
