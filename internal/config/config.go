@@ -12,6 +12,7 @@ import (
 )
 
 const appName = "trace"
+const runLogFileName = "run.log"
 
 type Config struct {
 	Path         string        `json:"-"`
@@ -101,6 +102,17 @@ func DefaultPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, appName, "config.json"), nil
+}
+
+func RunLogPath(configPath string) (string, error) {
+	if strings.TrimSpace(configPath) == "" {
+		path, err := DefaultPath()
+		if err != nil {
+			return "", err
+		}
+		configPath = path
+	}
+	return filepath.Join(filepath.Dir(filepath.Clean(configPath)), runLogFileName), nil
 }
 
 func EnsureFile(path string) (string, error) {

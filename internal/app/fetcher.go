@@ -13,6 +13,7 @@ import (
 	"github.com/almahoozi/trace/internal/config"
 	"github.com/almahoozi/trace/internal/domain"
 	"github.com/almahoozi/trace/internal/grafana"
+	"github.com/almahoozi/trace/internal/runlog"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -51,28 +52,38 @@ func (f *Fetcher) FetchTraceSession(ctx context.Context, cfg config.Config, trac
 	for _, env := range cfg.Environments {
 		env := env
 		g.Go(func() error {
+			runlog.Debug("querying environment for trace", "environment", env.Name, "trace_id", traceID)
 			logsCh := make(chan logsResult, 1)
 			go func() {
 				logsCtx, logsCancel := context.WithTimeout(context.Background(), cfg.Grafana.Timeout()+5*time.Second)
 				defer logsCancel()
+				startedAt := time.Now()
 				entries, err := f.client.FetchLogs(logsCtx, cfg, env, traceID, time.Time{}, time.Time{})
+				if err != nil {
+					runlog.Warn("prefetch logs failed", "environment", env.Name, "trace_id", traceID, "duration_ms", time.Since(startedAt).Milliseconds(), "error", err)
+				} else {
+					runlog.Debug("prefetch logs succeeded", "environment", env.Name, "trace_id", traceID, "entry_count", len(entries), "duration_ms", time.Since(startedAt).Milliseconds())
+				}
 				logsCh <- logsResult{entries: entries, err: err}
 			}()
 
 			trace, err := f.client.FetchTrace(egCtx, env, traceID)
 			if err != nil {
 				if errors.Is(err, grafana.ErrTraceNotFound) || errors.Is(err, context.Canceled) {
+					runlog.Debug("trace not found in environment", "environment", env.Name, "trace_id", traceID)
 					return nil
 				}
 				mu.Lock()
 				lastErr = fmt.Errorf("%s: %w", env.Name, err)
 				mu.Unlock()
+				runlog.Warn("fetch trace failed in environment", "environment", env.Name, "trace_id", traceID, "error", err)
 				return nil
 			}
 
 			mu.Lock()
 			if found == nil {
 				found = &traceMatch{env: env, trace: trace, prefetch: logsCh}
+				runlog.Info("trace matched environment", "environment", env.Name, "trace_id", traceID, "span_count", trace.SpanCount)
 				cancel()
 			}
 			mu.Unlock()
@@ -84,8 +95,10 @@ func (f *Fetcher) FetchTraceSession(ctx context.Context, cfg config.Config, trac
 
 	if found == nil {
 		if lastErr != nil {
+			runlog.Error("trace lookup failed", "trace_id", traceID, "last_error", lastErr)
 			return nil, lastErr
 		}
+		runlog.Warn("trace lookup yielded no matches", "trace_id", traceID)
 		return nil, ErrTraceNotFound
 	}
 
@@ -95,8 +108,12 @@ func (f *Fetcher) FetchTraceSession(ctx context.Context, cfg config.Config, trac
 		case res := <-found.prefetch:
 			if res.err == nil {
 				prefetched = res.entries
+				runlog.Debug("using prefetched logs", "environment", found.env.Name, "trace_id", traceID, "entry_count", len(prefetched))
+			} else {
+				runlog.Warn("prefetched logs unavailable", "environment", found.env.Name, "trace_id", traceID, "error", res.err)
 			}
 		case <-time.After(250 * time.Millisecond):
+			runlog.Warn("prefetched logs timed out", "environment", found.env.Name, "trace_id", traceID, "wait_ms", 250)
 		}
 	}
 
@@ -107,6 +124,9 @@ func (f *Fetcher) FetchTraceSession(ctx context.Context, cfg config.Config, trac
 		fetched, err := f.client.FetchLogs(logsCtx, cfg, found.env, traceID, found.trace.StartTime, found.trace.StartTime.Add(found.trace.Duration))
 		if err == nil {
 			logs = fetched
+			runlog.Info("fetched logs in trace window", "environment", found.env.Name, "trace_id", traceID, "entry_count", len(logs))
+		} else {
+			runlog.Warn("failed fetching logs in trace window", "environment", found.env.Name, "trace_id", traceID, "error", err)
 		}
 	}
 
@@ -144,8 +164,10 @@ func (f *Fetcher) FetchTraceSessionInEnvironment(ctx context.Context, cfg config
 	trace, err := f.client.FetchTrace(ctx, env, traceID)
 	if err != nil {
 		if errors.Is(err, grafana.ErrTraceNotFound) {
+			runlog.Warn("trace not found in explicit environment", "environment", envName, "trace_id", traceID)
 			return nil, ErrTraceNotFound
 		}
+		runlog.Error("failed to fetch trace in explicit environment", "environment", envName, "trace_id", traceID, "error", err)
 		return nil, err
 	}
 
@@ -153,7 +175,10 @@ func (f *Fetcher) FetchTraceSessionInEnvironment(ctx context.Context, cfg config
 	defer logsCancel()
 	logs, err := f.client.FetchLogs(logsCtx, cfg, env, traceID, trace.StartTime, trace.StartTime.Add(trace.Duration))
 	if err != nil {
+		runlog.Warn("failed to fetch logs in explicit environment", "environment", envName, "trace_id", traceID, "error", err)
 		logs = nil
+	} else {
+		runlog.Info("fetched logs in explicit environment", "environment", envName, "trace_id", traceID, "entry_count", len(logs))
 	}
 
 	grafanaURL := renderTemplate(cfg.URLs.GrafanaTraceTemplate, map[string]string{
@@ -184,14 +209,18 @@ func (f *Fetcher) FetchTraceSessionInEnvironment(ctx context.Context, cfg config
 func (f *Fetcher) FetchTraceList(ctx context.Context, cfg config.Config, envName, query string, limit int) ([]domain.TraceListItem, error) {
 	env, ok := findEnvironment(cfg, envName)
 	if !ok {
+		runlog.Warn("environment not found for browse", "environment", envName)
 		return nil, fmt.Errorf("%w: %s", ErrEnvironmentNotFound, envName)
 	}
+	runlog.Info("fetching trace list", "environment", env.Name, "query", strings.TrimSpace(query), "limit", limit)
 
 	items, err := f.client.SearchTraces(ctx, env, query, limit)
 	if err != nil {
+		runlog.Error("failed searching traces", "environment", env.Name, "error", err)
 		return nil, err
 	}
 	if len(items) == 0 {
+		runlog.Info("no traces returned from search", "environment", env.Name, "query", strings.TrimSpace(query))
 		return items, nil
 	}
 
@@ -228,6 +257,7 @@ func (f *Fetcher) FetchTraceList(ctx context.Context, cfg config.Config, envName
 	}
 
 	_ = g.Wait()
+	runlog.Info("trace list enrichment completed", "environment", env.Name, "trace_count", len(enriched))
 	return enriched, nil
 }
 

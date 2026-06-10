@@ -15,6 +15,7 @@ import (
 
 	"github.com/almahoozi/trace/internal/config"
 	"github.com/almahoozi/trace/internal/domain"
+	"github.com/almahoozi/trace/internal/runlog"
 )
 
 var ErrTraceNotFound = errors.New("trace not found")
@@ -42,15 +43,20 @@ func NewClient(baseURL, token string, httpClient *http.Client) *Client {
 
 func (c *Client) FetchTrace(ctx context.Context, env config.Environment, traceID string) (*domain.Trace, error) {
 	u := fmt.Sprintf("%s/api/datasources/proxy/uid/%s/api/traces/%s", c.baseURL, url.PathEscape(env.TempoDatasource), url.PathEscape(traceID))
+	startedAt := time.Now()
+	runlog.Debug("grafana fetch trace started", "environment", env.Name, "trace_id", traceID, "tempo_datasource_uid", env.TempoDatasource)
 
 	body, statusCode, err := c.get(ctx, u)
 	if err != nil {
+		runlog.Warn("grafana fetch trace request failed", "environment", env.Name, "trace_id", traceID, "duration_ms", time.Since(startedAt).Milliseconds(), "error", err)
 		return nil, err
 	}
 	if statusCode == http.StatusNotFound {
+		runlog.Debug("grafana fetch trace not found", "environment", env.Name, "trace_id", traceID, "duration_ms", time.Since(startedAt).Milliseconds())
 		return nil, ErrTraceNotFound
 	}
 	if statusCode >= 400 {
+		runlog.Warn("grafana fetch trace bad status", "environment", env.Name, "trace_id", traceID, "status_code", statusCode, "duration_ms", time.Since(startedAt).Milliseconds())
 		return nil, fmt.Errorf("fetch trace failed with status %d", statusCode)
 	}
 
@@ -58,15 +64,19 @@ func (c *Client) FetchTrace(ctx context.Context, env config.Environment, traceID
 	if err != nil {
 		dumpPath, dumpErr := dumpJSON("trace-payload-", body)
 		if dumpErr != nil {
+			runlog.Error("grafana trace parse failed and payload dump failed", "environment", env.Name, "trace_id", traceID, "parse_error", err, "dump_error", dumpErr)
 			return nil, fmt.Errorf("%w (also failed to dump payload: %v)", err, dumpErr)
 		}
+		runlog.Error("grafana trace parse failed", "environment", env.Name, "trace_id", traceID, "payload_dump", dumpPath)
 		return nil, fmt.Errorf("%w (payload dumped at %s)", err, dumpPath)
 	}
+	runlog.Info("grafana fetch trace succeeded", "environment", env.Name, "trace_id", traceID, "span_count", trace.SpanCount, "error_span_count", trace.ErrorSpanCount, "duration_ms", time.Since(startedAt).Milliseconds())
 	trace.Environment = env.Name
 	return trace, nil
 }
 
 func (c *Client) SearchTraces(ctx context.Context, env config.Environment, query string, limit int) ([]domain.TraceListItem, error) {
+	runlog.Debug("grafana search traces started", "environment", env.Name, "query", strings.TrimSpace(query), "limit", limit)
 	v := url.Values{}
 	if trimmed := strings.TrimSpace(query); trimmed != "" {
 		v.Set("q", trimmed)
@@ -79,9 +89,11 @@ func (c *Client) SearchTraces(ctx context.Context, env config.Environment, query
 	u := fmt.Sprintf("%s/api/datasources/proxy/uid/%s/api/search?%s", c.baseURL, url.PathEscape(env.TempoDatasource), v.Encode())
 	body, statusCode, err := c.get(ctx, u)
 	if err != nil {
+		runlog.Warn("grafana search traces request failed", "environment", env.Name, "error", err)
 		return nil, err
 	}
 	if statusCode >= 400 {
+		runlog.Warn("grafana search traces bad status", "environment", env.Name, "status_code", statusCode)
 		return nil, fmt.Errorf("search traces failed with status %d", statusCode)
 	}
 
@@ -89,21 +101,37 @@ func (c *Client) SearchTraces(ctx context.Context, env config.Environment, query
 	if err != nil {
 		dumpPath, dumpErr := dumpJSON("trace-search-payload-", body)
 		if dumpErr != nil {
+			runlog.Error("grafana search parse failed and payload dump failed", "environment", env.Name, "parse_error", err, "dump_error", dumpErr)
 			return nil, fmt.Errorf("%w (also failed to dump payload: %v)", err, dumpErr)
 		}
+		runlog.Error("grafana search parse failed", "environment", env.Name, "payload_dump", dumpPath)
 		return nil, fmt.Errorf("%w (payload dumped at %s)", err, dumpPath)
 	}
+	runlog.Info("grafana search traces succeeded", "environment", env.Name, "trace_count", len(items), "limit", limit)
 	return items, nil
 }
 
 func (c *Client) FetchLogs(ctx context.Context, cfg config.Config, env config.Environment, traceID string, traceStart, traceEnd time.Time) ([]domain.LogEntry, error) {
+	startedAt := time.Now()
 	query := strings.ReplaceAll(env.LogQueryTemplate, "{{trace_id}}", traceID)
 	trimmedQuery := strings.TrimSpace(query)
+	usedFallbackQuery := false
 	if trimmedQuery == "" || strings.Contains(trimmedQuery, `{trace_id="`) {
 		query = fmt.Sprintf(`{} |~ %q | json`, `"trace[-_]*id"\s*:\s*"`+traceID+`"`)
+		usedFallbackQuery = true
 	}
 
 	start, end := lokiRange(cfg.Logs.Since, traceStart, traceEnd)
+	runlog.Debug(
+		"grafana fetch logs started",
+		"environment", env.Name,
+		"trace_id", traceID,
+		"loki_datasource_uid", env.LokiDatasource,
+		"range_start", start.Format(time.RFC3339Nano),
+		"range_end", end.Format(time.RFC3339Nano),
+		"limit", max(1, cfg.Logs.Limit),
+		"used_fallback_query", usedFallbackQuery,
+	)
 	u := fmt.Sprintf(
 		"%s/api/datasources/proxy/uid/%s/loki/api/v1/query_range?query=%s&start=%s&end=%s&limit=%d&direction=forward",
 		c.baseURL,
@@ -116,9 +144,11 @@ func (c *Client) FetchLogs(ctx context.Context, cfg config.Config, env config.En
 
 	body, statusCode, err := c.get(ctx, u)
 	if err != nil {
+		runlog.Warn("grafana fetch logs request failed", "environment", env.Name, "trace_id", traceID, "duration_ms", time.Since(startedAt).Milliseconds(), "error", err)
 		return nil, err
 	}
 	if statusCode >= 400 {
+		runlog.Warn("grafana fetch logs bad status", "environment", env.Name, "trace_id", traceID, "status_code", statusCode, "duration_ms", time.Since(startedAt).Milliseconds())
 		return nil, fmt.Errorf("fetch logs failed with status %d", statusCode)
 	}
 
@@ -126,35 +156,53 @@ func (c *Client) FetchLogs(ctx context.Context, cfg config.Config, env config.En
 	if err != nil {
 		dumpPath, dumpErr := dumpJSON("loki-payload-", body)
 		if dumpErr != nil {
+			runlog.Error("grafana logs parse failed and payload dump failed", "environment", env.Name, "trace_id", traceID, "parse_error", err, "dump_error", dumpErr)
 			return nil, fmt.Errorf("%w (also failed to dump payload: %v)", err, dumpErr)
 		}
+		runlog.Error("grafana logs parse failed", "environment", env.Name, "trace_id", traceID, "payload_dump", dumpPath)
 		return nil, fmt.Errorf("%w (payload dumped at %s)", err, dumpPath)
 	}
-	return filterByLevel(entries, cfg.Logs.LevelThreshold, cfg.Logs.LevelOrder), nil
+	filtered := filterByLevel(entries, cfg.Logs.LevelThreshold, cfg.Logs.LevelOrder)
+	runlog.Info("grafana fetch logs succeeded", "environment", env.Name, "trace_id", traceID, "entry_count", len(entries), "filtered_count", len(filtered), "duration_ms", time.Since(startedAt).Milliseconds(), "level_threshold", cfg.Logs.LevelThreshold)
+	return filtered, nil
 }
 
 func (c *Client) get(ctx context.Context, requestURL string) ([]byte, int, error) {
+	startedAt := time.Now()
+	parsedURL, parseErr := url.Parse(requestURL)
+	requestPath := ""
+	queryLength := 0
+	if parseErr == nil {
+		requestPath = parsedURL.Path
+		queryLength = len(parsedURL.RawQuery)
+	}
+	runlog.Debug("grafana http request started", "method", http.MethodGet, "path", requestPath, "query_length", queryLength)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 	if err != nil {
+		runlog.Error("failed to build grafana request", "error", err)
 		return nil, 0, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		runlog.Warn("grafana http request failed", "method", http.MethodGet, "path", requestPath, "duration_ms", time.Since(startedAt).Milliseconds(), "error", err)
 		return nil, 0, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		runlog.Warn("failed to read grafana response body", "method", http.MethodGet, "path", requestPath, "status_code", resp.StatusCode, "duration_ms", time.Since(startedAt).Milliseconds(), "error", err)
 		return nil, 0, err
 	}
+	runlog.Debug("grafana http request completed", "method", http.MethodGet, "path", requestPath, "status_code", resp.StatusCode, "duration_ms", time.Since(startedAt).Milliseconds(), "response_bytes", len(body))
 
 	if resp.StatusCode >= 400 {
 		var e map[string]any
 		if json.Unmarshal(body, &e) == nil {
 			if msg, ok := e["message"].(string); ok && msg != "" {
+				runlog.Warn("grafana error response", "method", http.MethodGet, "path", requestPath, "status_code", resp.StatusCode, "message", msg)
 				return body, resp.StatusCode, fmt.Errorf("%s", msg)
 			}
 		}
