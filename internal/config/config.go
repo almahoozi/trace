@@ -21,6 +21,7 @@ type Config struct {
 	Environments []Environment `json:"environments"`
 	Logs         LogsConfig    `json:"logs"`
 	URLs         URLConfig     `json:"urls"`
+	Output       OutputConfig  `json:"output"`
 	UI           UIConfig      `json:"ui"`
 	Keymap       KeymapConfig  `json:"keymap"`
 }
@@ -66,15 +67,25 @@ type URLConfig struct {
 	BetterstackLogTemplate string `json:"betterstack_log_template"`
 }
 
+type OutputConfig struct {
+	TraceSummaryTemplate string `json:"trace_summary_template"`
+}
+
+const LegacyTraceSummaryTemplate = `{{bright "["}}{{gray .environment}}{{bright "]"}}{{if .has_errors}}{{red "!"}}{{end}}{{if .http_status_code}} {{http_status_color .http_status_code .http_status_code}}{{end}} {{bright .operation}} {{bright "("}}{{duration_color .duration .duration_display}}{{bright ")"}} {{bright "-"}} {{bright "["}}{{gray .start_display}}{{bright " - "}}{{gray .end_display}}{{bright "]"}}`
+
+const DefaultTraceSummaryTemplate = `{{bright "["}}{{gray .environment}}{{bright "]"}}{{if .trace_id}}{{bright .trace_id}}{{end}}{{if .has_errors}}{{red "!"}}{{end}}{{if .http_status_code}} {{http_status_color .http_status_code .http_status_code}}{{end}} {{bright .operation}} {{bright "("}}{{duration_color .duration .duration_display}}{{bright ")"}} {{bright "-"}} {{bright "["}}{{gray .start_display}}{{bright " - "}}{{gray .end_display}}{{bright "]"}}`
+
 type UIConfig struct {
-	LogColumns        []string          `json:"log_columns"`
-	LogDetailParts    []string          `json:"log_detail_parts"`
-	TraceDetailParts  []string          `json:"trace_detail_parts"`
-	SpanIcons         map[string]string `json:"span_icons"`
-	SectionOrder      []string          `json:"section_order"`
-	CollapsedSections []string          `json:"collapsed_sections"`
-	DefaultFullscreen bool              `json:"default_fullscreen"`
-	FocusSection      string            `json:"focus_section"`
+	LogColumns              []string          `json:"log_columns"`
+	LogDetailParts          []string          `json:"log_detail_parts"`
+	TraceDetailParts        []string          `json:"trace_detail_parts"`
+	SpanIcons               map[string]string `json:"span_icons"`
+	AdditionalServiceColors []string          `json:"additional_service_colors"`
+	Timezone                string            `json:"timezone"`
+	SectionOrder            []string          `json:"section_order"`
+	CollapsedSections       []string          `json:"collapsed_sections"`
+	DefaultFullscreen       bool              `json:"default_fullscreen"`
+	FocusSection            string            `json:"focus_section"`
 }
 
 type KeymapConfig struct {
@@ -161,7 +172,25 @@ func (c Config) validate() error {
 			return fmt.Errorf("invalid environment %+v", env)
 		}
 	}
+	if _, err := c.DisplayLocation(); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (c Config) DisplayLocation() (*time.Location, error) {
+	raw := strings.TrimSpace(c.UI.Timezone)
+	if raw == "" || strings.EqualFold(raw, "local") {
+		return time.Local, nil
+	}
+	if strings.EqualFold(raw, "utc") {
+		return time.UTC, nil
+	}
+	loc, err := time.LoadLocation(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid ui.timezone %q: %w", raw, err)
+	}
+	return loc, nil
 }
 
 func Save(cfg Config) error {
@@ -292,15 +321,20 @@ func DefaultConfig() Config {
 			GrafanaTraceTemplate:   "",
 			BetterstackLogTemplate: "https://telemetry.betterstack.com/team/t000000/tail?q={{trace_id}}&s={{betterstack_source_id}}&rf=now-60m",
 		},
+		Output: OutputConfig{
+			TraceSummaryTemplate: DefaultTraceSummaryTemplate,
+		},
 		UI: UIConfig{
-			LogColumns:        []string{"timestamp", "service", "level", "message"},
-			LogDetailParts:    []string{"log", "labels", "raw"},
-			TraceDetailParts:  []string{"metadata", "attributes", "events", "links"},
-			SpanIcons:         map[string]string{"server": "[srv]", "client": "[cli]", "producer": "[prd]", "consumer": "[con]", "internal": "[int]"},
-			SectionOrder:      []string{"trace", "service_map", "logs"},
-			CollapsedSections: []string{},
-			DefaultFullscreen: false,
-			FocusSection:      "trace",
+			LogColumns:              []string{"timestamp", "service", "level", "message"},
+			LogDetailParts:          []string{"log", "labels", "raw"},
+			TraceDetailParts:        []string{"metadata", "attributes", "events", "links"},
+			SpanIcons:               map[string]string{"server": "[srv]", "client": "[cli]", "producer": "[prd]", "consumer": "[con]", "internal": "[int]"},
+			AdditionalServiceColors: []string{},
+			Timezone:                "local",
+			SectionOrder:            []string{"trace", "service_map", "logs"},
+			CollapsedSections:       []string{},
+			DefaultFullscreen:       false,
+			FocusSection:            "trace",
 		},
 		Keymap: KeymapConfig{
 			Global: map[string][]string{

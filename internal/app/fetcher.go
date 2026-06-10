@@ -17,6 +17,7 @@ import (
 )
 
 var ErrTraceNotFound = errors.New("trace not found")
+var ErrEnvironmentNotFound = errors.New("environment not found")
 
 type Fetcher struct {
 	client *grafana.Client
@@ -132,6 +133,157 @@ func (f *Fetcher) FetchTraceSession(ctx context.Context, cfg config.Config, trac
 		GrafanaURL:     grafanaURL,
 		BetterstackURL: betterstackURL,
 	}, nil
+}
+
+func (f *Fetcher) FetchTraceSessionInEnvironment(ctx context.Context, cfg config.Config, envName, traceID string) (*domain.Session, error) {
+	env, ok := findEnvironment(cfg, envName)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrEnvironmentNotFound, envName)
+	}
+
+	trace, err := f.client.FetchTrace(ctx, env, traceID)
+	if err != nil {
+		if errors.Is(err, grafana.ErrTraceNotFound) {
+			return nil, ErrTraceNotFound
+		}
+		return nil, err
+	}
+
+	logsCtx, logsCancel := context.WithTimeout(context.Background(), cfg.Grafana.Timeout()+5*time.Second)
+	defer logsCancel()
+	logs, err := f.client.FetchLogs(logsCtx, cfg, env, traceID, trace.StartTime, trace.StartTime.Add(trace.Duration))
+	if err != nil {
+		logs = nil
+	}
+
+	grafanaURL := renderTemplate(cfg.URLs.GrafanaTraceTemplate, map[string]string{
+		"base_url":             cfg.Grafana.BaseURL,
+		"trace_id":             traceID,
+		"env":                  env.Name,
+		"tempo_datasource_uid": env.TempoDatasource,
+	})
+	if shouldAutoBuildGrafanaURL(cfg.URLs.GrafanaTraceTemplate) {
+		grafanaURL = buildGrafanaTraceURL(cfg.Grafana.BaseURL, env.TempoDatasource, traceID)
+	}
+	betterstackURL := renderTemplate(cfg.URLs.BetterstackLogTemplate, map[string]string{
+		"trace_id":              traceID,
+		"env":                   env.Name,
+		"betterstack_source_id": env.BetterstackID,
+	})
+
+	trace.GrafanaExternalURL = grafanaURL
+	return &domain.Session{
+		Trace:          trace,
+		Logs:           logs,
+		Environment:    env.Name,
+		GrafanaURL:     grafanaURL,
+		BetterstackURL: betterstackURL,
+	}, nil
+}
+
+func (f *Fetcher) FetchTraceList(ctx context.Context, cfg config.Config, envName, query string, limit int) ([]domain.TraceListItem, error) {
+	env, ok := findEnvironment(cfg, envName)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrEnvironmentNotFound, envName)
+	}
+
+	items, err := f.client.SearchTraces(ctx, env, query, limit)
+	if err != nil {
+		return nil, err
+	}
+	if len(items) == 0 {
+		return items, nil
+	}
+
+	enriched := make([]domain.TraceListItem, len(items))
+	copy(enriched, items)
+	var mu sync.Mutex
+	g, egCtx := errgroup.WithContext(ctx)
+	g.SetLimit(4)
+
+	for i := range enriched {
+		i := i
+		if strings.TrimSpace(enriched[i].TraceID) == "" {
+			continue
+		}
+		g.Go(func() error {
+			trace, err := f.client.FetchTrace(egCtx, env, enriched[i].TraceID)
+			if err != nil {
+				return nil
+			}
+
+			service := primaryService(trace)
+			mu.Lock()
+			enriched[i].OperationName = firstNonEmpty(trace.OperationName, enriched[i].OperationName)
+			enriched[i].Service = firstNonEmpty(service, enriched[i].Service)
+			enriched[i].SpanCount = trace.SpanCount
+			enriched[i].ErrorSpanCount = trace.ErrorSpanCount
+			enriched[i].Duration = trace.Duration
+			if enriched[i].StartTime.IsZero() {
+				enriched[i].StartTime = trace.StartTime
+			}
+			mu.Unlock()
+			return nil
+		})
+	}
+
+	_ = g.Wait()
+	return enriched, nil
+}
+
+func findEnvironment(cfg config.Config, name string) (config.Environment, bool) {
+	target := strings.TrimSpace(name)
+	for _, env := range cfg.Environments {
+		if strings.EqualFold(strings.TrimSpace(env.Name), target) {
+			return env, true
+		}
+	}
+	return config.Environment{}, false
+}
+
+func primaryService(trace *domain.Trace) string {
+	if trace == nil {
+		return ""
+	}
+	for _, rootID := range trace.RootSpanIDs {
+		span := trace.SpansByID[rootID]
+		if span == nil {
+			continue
+		}
+		if value, ok := span.Attributes["ctx.svc"]; ok {
+			svc := strings.TrimSpace(fmt.Sprint(value))
+			if svc != "" {
+				return svc
+			}
+		}
+		if svc := strings.TrimSpace(span.Service); svc != "" {
+			return svc
+		}
+	}
+	for _, span := range trace.Spans {
+		if span == nil {
+			continue
+		}
+		if value, ok := span.Attributes["ctx.svc"]; ok {
+			svc := strings.TrimSpace(fmt.Sprint(value))
+			if svc != "" {
+				return svc
+			}
+		}
+		if svc := strings.TrimSpace(span.Service); svc != "" {
+			return svc
+		}
+	}
+	return ""
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func renderTemplate(template string, values map[string]string) string {
