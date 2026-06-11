@@ -3,8 +3,8 @@ package secrets
 import "github.com/almahoozi/trace/internal/config"
 
 // Store abstracts credential retrieval/persistence.
-// Current implementation intentionally preserves existing insecure behavior
-// (env var + local token file) and is a seam for future secure backends.
+// KeyringStore is the default backend; InsecureFileEnvStore remains available
+// for compatibility and testing.
 type Store interface {
 	LoadToken(cfg config.Config) (string, error)
 	SaveToken(cfg config.Config, token string) error
@@ -14,7 +14,7 @@ type Store interface {
 type InsecureFileEnvStore struct{}
 
 func NewStore(config.Config) Store {
-	return InsecureFileEnvStore{}
+	return NewKeyringStore()
 }
 
 func (InsecureFileEnvStore) LoadToken(cfg config.Config) (string, error) {
