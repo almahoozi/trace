@@ -129,7 +129,7 @@ func main() {
 
 	token, err := secretStore.LoadToken(cfg)
 	if err != nil {
-		runlog.Warn("token not available from env/file; prompting user", "error", err)
+		runlog.Warn("token not available from env/keyring; prompting user", "error", err)
 		token, err = promptAndSaveToken(cfg, secretStore)
 		if err != nil {
 			runlog.Error("failed to resolve auth token", "error", err)
@@ -352,7 +352,7 @@ func promptAndSaveToken(cfg config.Config, store secrets.Store) (string, error) 
 	}
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "Grafana token is required before continuing.")
-	fmt.Fprintf(os.Stderr, "Token will be saved to %s (mode 600).\n", tokenPath)
+	fmt.Fprintf(os.Stderr, "Token will be saved to %s.\n", tokenPath)
 	fmt.Fprint(os.Stderr, "Enter Grafana token: ")
 	input, err := term.ReadPassword(int(os.Stdin.Fd()))
 	fmt.Fprintln(os.Stderr)
