@@ -377,6 +377,7 @@ func DefaultConfig() Config {
 			Global: map[string][]string{
 				"quit":              {"q", "ctrl+c"},
 				"help":              {"?"},
+				"export_snapshot":   {"E"},
 				"back":              {"esc"},
 				"switch_tab":        {"tab"},
 				"switch_tab_back":   {"shift+tab"},
