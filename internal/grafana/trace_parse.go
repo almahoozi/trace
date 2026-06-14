@@ -127,6 +127,14 @@ func parseTracePayload(traceID string, body []byte) (*domain.Trace, error) {
 		sort.Slice(span.Children, func(i, j int) bool {
 			return span.Children[i].Start.Before(span.Children[j].Start)
 		})
+		childDuration := time.Duration(0)
+		for _, child := range span.Children {
+			childDuration += overlapDuration(span.Start, span.End, child.Start, child.End)
+		}
+		span.XCost = span.Duration - childDuration
+		if span.XCost < 0 {
+			span.XCost = 0
+		}
 	}
 
 	operation := spans[0].Name
@@ -147,6 +155,24 @@ func parseTracePayload(traceID string, body []byte) (*domain.Trace, error) {
 		ErrorSpanCount: errorSpans,
 		SpanCount:      len(spans),
 	}, nil
+}
+
+func overlapDuration(aStart, aEnd, bStart, bEnd time.Time) time.Duration {
+	if aEnd.Before(aStart) || bEnd.Before(bStart) {
+		return 0
+	}
+	start := aStart
+	if bStart.After(start) {
+		start = bStart
+	}
+	end := aEnd
+	if bEnd.Before(end) {
+		end = bEnd
+	}
+	if !end.After(start) {
+		return 0
+	}
+	return end.Sub(start)
 }
 
 func convertSpan(src otlpSpan, defaultService string) *domain.Span {
