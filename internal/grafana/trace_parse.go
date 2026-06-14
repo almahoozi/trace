@@ -127,11 +127,8 @@ func parseTracePayload(traceID string, body []byte) (*domain.Trace, error) {
 		sort.Slice(span.Children, func(i, j int) bool {
 			return span.Children[i].Start.Before(span.Children[j].Start)
 		})
-		childDuration := time.Duration(0)
-		for _, child := range span.Children {
-			childDuration += overlapDuration(span.Start, span.End, child.Start, child.End)
-		}
-		span.XCost = span.Duration - childDuration
+		childCoverage := coveredChildDuration(span.Start, span.End, span.Children)
+		span.XCost = span.Duration - childCoverage
 		if span.XCost < 0 {
 			span.XCost = 0
 		}
@@ -157,22 +154,54 @@ func parseTracePayload(traceID string, body []byte) (*domain.Trace, error) {
 	}, nil
 }
 
-func overlapDuration(aStart, aEnd, bStart, bEnd time.Time) time.Duration {
-	if aEnd.Before(aStart) || bEnd.Before(bStart) {
+func coveredChildDuration(parentStart, parentEnd time.Time, children []*domain.Span) time.Duration {
+	if len(children) == 0 {
 		return 0
 	}
-	start := aStart
-	if bStart.After(start) {
-		start = bStart
+
+	type interval struct {
+		start time.Time
+		end   time.Time
 	}
-	end := aEnd
-	if bEnd.Before(end) {
-		end = bEnd
+
+	intervals := make([]interval, 0, len(children))
+	for _, child := range children {
+		start := parentStart
+		if child.Start.After(start) {
+			start = child.Start
+		}
+		end := parentEnd
+		if child.End.Before(end) {
+			end = child.End
+		}
+		if !end.After(start) {
+			continue
+		}
+		intervals = append(intervals, interval{start: start, end: end})
 	}
-	if !end.After(start) {
+	if len(intervals) == 0 {
 		return 0
 	}
-	return end.Sub(start)
+
+	sort.Slice(intervals, func(i, j int) bool {
+		return intervals[i].start.Before(intervals[j].start)
+	})
+
+	total := time.Duration(0)
+	current := intervals[0]
+	for i := 1; i < len(intervals); i++ {
+		next := intervals[i]
+		if !next.start.After(current.end) {
+			if next.end.After(current.end) {
+				current.end = next.end
+			}
+			continue
+		}
+		total += current.end.Sub(current.start)
+		current = next
+	}
+	total += current.end.Sub(current.start)
+	return total
 }
 
 func convertSpan(src otlpSpan, defaultService string) *domain.Span {

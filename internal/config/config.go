@@ -82,11 +82,27 @@ type UIConfig struct {
 	TraceDetailParts        []string          `json:"trace_detail_parts"`
 	SpanIcons               map[string]string `json:"span_icons"`
 	AdditionalServiceColors []string          `json:"additional_service_colors"`
+	ServiceMap              ServiceMapConfig  `json:"service_map"`
 	Timezone                string            `json:"timezone"`
 	SectionOrder            []string          `json:"section_order"`
 	CollapsedSections       []string          `json:"collapsed_sections"`
 	DefaultFullscreen       bool              `json:"default_fullscreen"`
 	FocusSection            string            `json:"focus_section"`
+}
+
+type ServiceMapConfig struct {
+	DependencyAliases   map[string]string    `json:"dependency_aliases"`
+	DependencyTypes     map[string]string    `json:"dependency_types"`
+	DependencyTypeRules []DependencyTypeRule `json:"dependency_type_rules"`
+	ServiceColor        string               `json:"service_color"`
+	SidecarColor        string               `json:"sidecar_color"`
+	ExternalColor       string               `json:"external_color"`
+	TypeColors          map[string]string    `json:"type_colors"`
+}
+
+type DependencyTypeRule struct {
+	Match string `json:"match"`
+	Type  string `json:"type"`
 }
 
 type KeymapConfig struct {
@@ -342,11 +358,20 @@ func DefaultConfig() Config {
 			TraceDetailParts:        []string{"metadata", "attributes", "events", "links"},
 			SpanIcons:               map[string]string{"server": "[srv]", "client": "[cli]", "producer": "[prd]", "consumer": "[con]", "internal": "[int]"},
 			AdditionalServiceColors: []string{},
-			Timezone:                "local",
-			SectionOrder:            []string{"trace", "service_map", "logs"},
-			CollapsedSections:       []string{},
-			DefaultFullscreen:       false,
-			FocusSection:            "trace",
+			ServiceMap: ServiceMapConfig{
+				DependencyAliases:   map[string]string{},
+				DependencyTypes:     map[string]string{},
+				DependencyTypeRules: []DependencyTypeRule{},
+				ServiceColor:        "68",
+				SidecarColor:        "244",
+				ExternalColor:       "214",
+				TypeColors:          map[string]string{"db": "39", "third_party": "178"},
+			},
+			Timezone:          "local",
+			SectionOrder:      []string{"trace", "service_map", "logs"},
+			CollapsedSections: []string{},
+			DefaultFullscreen: false,
+			FocusSection:      "trace",
 		},
 		Keymap: KeymapConfig{
 			Global: map[string][]string{
