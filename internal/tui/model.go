@@ -2,6 +2,8 @@ package tui
 
 import (
 	"fmt"
+	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -61,11 +63,11 @@ type Model struct {
 	fullscreen  bool
 	collapsed   map[panel]bool
 
-	traceLines       []traceLine
-	traceCursor      int
-	expanded         map[string]bool
-	serviceMapCursor int
-	serviceColors    map[string]string
+	traceLines     []traceLine
+	traceCursor    int
+	expanded       map[string]bool
+	serviceMapTree *JSONTree
+	serviceColors  map[string]string
 
 	allLogs          []domain.LogEntry
 	levelFilteredLog []domain.LogEntry
@@ -122,6 +124,7 @@ func NewModel(cfg config.Config, session *domain.Session, openURL func(string) e
 		}
 	}
 	m.traceLines = flattenTrace(session.Trace, m.expanded)
+	m.serviceMapTree = m.newServiceMapTree()
 	m.initServiceColors()
 	m.levelThresholdIx = m.levelIndex(cfg.Logs.LevelThreshold)
 	m.applyLogThreshold()
@@ -468,7 +471,9 @@ func (m *Model) moveToTop() {
 	case panelTrace:
 		m.traceCursor = 0
 	case panelServiceMap:
-		m.serviceMapCursor = 0
+		if m.serviceMapTree != nil {
+			m.serviceMapTree.cursor = 0
+		}
 	default:
 		m.logCursor = 0
 	}
@@ -493,9 +498,8 @@ func (m *Model) moveToBottom() {
 			m.traceCursor = len(m.traceLines) - 1
 		}
 	case panelServiceMap:
-		lines := m.serviceMapLines()
-		if len(lines) > 0 {
-			m.serviceMapCursor = len(lines) - 1
+		if m.serviceMapTree != nil && len(m.serviceMapTree.lines) > 0 {
+			m.serviceMapTree.cursor = len(m.serviceMapTree.lines) - 1
 		}
 	default:
 		if len(m.filteredLogs) > 0 {
@@ -553,28 +557,47 @@ func (m Model) updateTrace(key string) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) updateServiceMap(key string) (tea.Model, tea.Cmd) {
-	lines := m.serviceMapLines()
-	if len(lines) == 0 {
-		m.serviceMapCursor = 0
+	if m.serviceMapTree == nil {
+		m.serviceMapTree = m.newServiceMapTree()
+	}
+	if len(m.serviceMapTree.lines) == 0 {
+		m.serviceMapTree.cursor = 0
 		return m, nil
 	}
-	if m.isAction("trace", "up", key) && m.serviceMapCursor > 0 {
-		m.serviceMapCursor--
+	if m.isAction("trace", "up", key) {
+		m.serviceMapTree.MoveUp()
 	}
-	if m.isAction("trace", "down", key) && m.serviceMapCursor < len(lines)-1 {
-		m.serviceMapCursor++
+	if m.isAction("trace", "down", key) {
+		m.serviceMapTree.MoveDown()
 	}
 	if isPageDownKey(key) {
-		m.serviceMapCursor = min(len(lines)-1, m.serviceMapCursor+m.serviceMapPageRows())
+		for i := 0; i < m.serviceMapPageRows(); i++ {
+			m.serviceMapTree.MoveDown()
+		}
 	}
 	if isPageUpKey(key) {
-		m.serviceMapCursor = max(0, m.serviceMapCursor-m.serviceMapPageRows())
+		for i := 0; i < m.serviceMapPageRows(); i++ {
+			m.serviceMapTree.MoveUp()
+		}
 	}
 	if isHalfPageDownKey(key) {
-		m.serviceMapCursor = min(len(lines)-1, m.serviceMapCursor+m.serviceMapHalfPageRows())
+		for i := 0; i < m.serviceMapHalfPageRows(); i++ {
+			m.serviceMapTree.MoveDown()
+		}
 	}
 	if isHalfPageUpKey(key) {
-		m.serviceMapCursor = max(0, m.serviceMapCursor-m.serviceMapHalfPageRows())
+		for i := 0; i < m.serviceMapHalfPageRows(); i++ {
+			m.serviceMapTree.MoveUp()
+		}
+	}
+	if m.isAction("json", "expand", key) {
+		m.serviceMapTree.Expand()
+	}
+	if m.isAction("json", "collapse", key) {
+		m.serviceMapTree.Collapse()
+	}
+	if m.isAction("json", "toggle", key) || key == " " {
+		m.serviceMapTree.Toggle()
 	}
 	return m, nil
 }
@@ -759,6 +782,9 @@ func (m *Model) applyTraceSearch(matcher *searchMatcher, raw string, direction i
 }
 
 func (m *Model) applyServiceMapSearch(matcher *searchMatcher, raw string, direction int) {
+	if m.serviceMapTree == nil {
+		m.serviceMapTree = m.newServiceMapTree()
+	}
 	lines := m.serviceMapLines()
 	if matcher == nil {
 		m.status = "service map search cleared"
@@ -771,12 +797,12 @@ func (m *Model) applyServiceMapSearch(matcher *searchMatcher, raw string, direct
 	if direction == 0 {
 		direction = 1
 	}
-	start := m.serviceMapCursor + direction
+	start := m.serviceMapTree.cursor + direction
 	for i := 0; i < len(lines); i++ {
 		idx := (start + i*direction + len(lines)*2) % len(lines)
 		fields := map[string]string{"line": lines[idx]}
 		if matcher.MatchFields(fields, lines[idx]) {
-			m.serviceMapCursor = idx
+			m.serviceMapTree.cursor = idx
 			m.status = fmt.Sprintf("service map search %q -> row %d/%d", raw, idx+1, len(lines))
 			return
 		}
@@ -1405,30 +1431,13 @@ func (m Model) serviceMapView(height int) string {
 	if height < 2 {
 		height = 2
 	}
-	lines := m.serviceMapLines()
-	if len(lines) == 0 {
+	if m.serviceMapTree == nil {
+		m.serviceMapTree = m.newServiceMapTree()
+	}
+	if m.serviceMapTree == nil || len(m.serviceMapTree.lines) == 0 {
 		return "Service map\n(no rows)"
 	}
-	maxRows := height - 1
-	if maxRows < 1 {
-		maxRows = 1
-	}
-	start, end := m.window(len(lines), m.serviceMapCursor, maxRows)
-
-	var b strings.Builder
-	b.WriteString("Service map\n")
-	for i := start; i < end; i++ {
-		prefix := "  "
-		if i == m.serviceMapCursor {
-			prefix = "> "
-		}
-		b.WriteString(prefix)
-		line := lines[i]
-		b.WriteString(line)
-		b.WriteString("\n")
-	}
-
-	return strings.TrimRight(b.String(), "\n")
+	return m.serviceMapTree.View(height)
 }
 
 func newValueView(title string, value any, width int) *valueView {
@@ -1485,27 +1494,354 @@ func wrapText(text string, width int) []string {
 }
 
 func (m Model) serviceMapLines() []string {
-	edges := buildServiceEdges(m.session.Trace)
-	services := serviceList(m.session.Trace)
-	if len(services) == 0 {
-		return []string{"(no service names on spans)"}
+	if m.serviceMapTree == nil {
+		return nil
 	}
-
-	lines := make([]string, 0, len(edges)+4)
-	serviceCosts := serviceCosts(m.session.Trace)
-	nodes := make([]string, 0, len(services))
-	for _, service := range services {
-		nodes = append(nodes, fmt.Sprintf("%s (%s)", service, formatDurationDisplay(serviceCosts[service])))
-	}
-	lines = append(lines, "nodes: "+strings.Join(nodes, ", "))
-	if len(edges) == 0 {
-		return append(lines, "(no cross-service edges in this trace)")
-	}
-	lines = append(lines, "edges:")
-	for _, edge := range edges {
-		lines = append(lines, fmt.Sprintf("%s -> %s (%d calls)", edge.From, edge.To, edge.Count))
+	lines := make([]string, 0, len(m.serviceMapTree.lines))
+	for _, line := range m.serviceMapTree.lines {
+		lines = append(lines, line.Label)
 	}
 	return lines
+}
+
+func (m Model) newServiceMapTree() *JSONTree {
+	root := m.serviceMapRoot()
+	paths := m.serviceMapExpandedPaths(root)
+	return NewJSONTreeWithExpanded("Service map", root, paths...)
+}
+
+func (m Model) serviceMapExpandedPaths(root OrderedRoot) []string {
+	expanded := map[string]bool{}
+	for _, entry := range root.Entries {
+		if entry.Key != "map" {
+			continue
+		}
+		collectExpandablePaths("$.map", entry.Value, expanded)
+		break
+	}
+	if len(expanded) == 0 {
+		expanded["$.map"] = true
+	}
+	paths := make([]string, 0, len(expanded))
+	for path := range expanded {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+func (m Model) serviceMapRoot() OrderedRoot {
+	services := serviceList(m.session.Trace)
+	if len(services) == 0 {
+		return OrderedRoot{Entries: []RootEntry{{Key: "message", Value: "(no service names on spans)"}}}
+	}
+
+	totalCost := requestTotalCost(m.session.Trace)
+	nodeCosts := serviceNodeCosts(m.session.Trace)
+	edges := buildServiceEdges(m.session.Trace)
+	externals := buildExternalDependencies(m.session.Trace)
+	edgesByFrom := map[string][]serviceEdge{}
+	incoming := map[string]int{}
+	for _, edge := range edges {
+		edgesByFrom[edge.FromService] = append(edgesByFrom[edge.FromService], edge)
+		incoming[edge.ToService]++
+	}
+	allNodeCosts := serviceMapNodeCostsAll(m.session.Trace)
+	nodeNames := make([]string, 0, len(allNodeCosts))
+	nodeEntries := make([]RootEntry, 0, len(allNodeCosts))
+	for nodeName := range allNodeCosts {
+		nodeNames = append(nodeNames, nodeName)
+	}
+	sort.Slice(nodeNames, func(i, j int) bool {
+		iProxy := strings.HasSuffix(nodeNames[i], " [P]")
+		jProxy := strings.HasSuffix(nodeNames[j], " [P]")
+		if iProxy != jProxy {
+			return !iProxy
+		}
+		return nodeNames[i] < nodeNames[j]
+	})
+	for _, nodeName := range nodeNames {
+		isProxyNode := strings.HasSuffix(nodeName, " [P]")
+		key := m.renderNodeSummaryLabel(nodeName, isProxyNode)
+		nodeEntries = append(nodeEntries, RootEntry{Key: key, Value: formatDurationDisplay(allNodeCosts[nodeName])})
+	}
+
+	edgesSummary := map[string]any{}
+	for _, edge := range edges {
+		key := m.renderEntityLabel(edge.FromService, edge.FromSidecar, "service") + " -> " + m.renderEntityLabel(edge.ToService, edge.ToSidecar, "service")
+		edgesSummary[key] = "x" + strconv.Itoa(edge.Count)
+	}
+	externalsByFrom := map[string][]externalDependency{}
+	externalSummary := map[string]any{}
+	for _, dep := range externals {
+		label, depType := m.resolveDependencyLabelAndType(dep.Name)
+		dep.Name = label
+		dep.Type = depType
+		externalsByFrom[dep.FromService] = append(externalsByFrom[dep.FromService], dep)
+		key := m.renderEntityLabel(dep.FromService, dep.FromSidecar, "service") + " -> " + m.renderEntityLabel(dep.Name, dep.FromSidecar, dep.Type)
+		key += " [" + formatDurationDisplay(dep.Duration) + "]"
+		externalSummary[key] = "x" + strconv.Itoa(dep.Count)
+	}
+
+	roots := make([]string, 0)
+	for _, service := range services {
+		if incoming[service] == 0 {
+			roots = append(roots, service)
+		}
+	}
+	if len(roots) == 0 {
+		roots = append(roots, services...)
+	}
+	sort.Strings(roots)
+
+	mapTree := map[string]any{}
+	for _, root := range roots {
+		seen := map[string]bool{root: true}
+		leaf := len(edgesByFrom[root]) == 0 && len(externalsByFrom[root]) == 0
+		key := m.renderServiceNodeLabel(root, primarySidecarForService(root, edgesByFrom), nodeCosts[root], totalCost, 0, leaf)
+		children := m.buildServiceNodeTree(root, edgesByFrom, externalsByFrom, nodeCosts, totalCost, seen)
+		if len(children) == 0 {
+			mapTree[key] = ""
+		} else {
+			mapTree[key] = children
+		}
+	}
+
+	return OrderedRoot{Entries: []RootEntry{
+		{Key: "nodes", Value: OrderedRoot{Entries: nodeEntries}},
+		{Key: "edges", Value: edgesSummary},
+		{Key: "external", Value: externalSummary},
+		{Key: "map", Value: mapTree},
+	}}
+}
+
+func (m Model) buildServiceNodeTree(
+	service string,
+	edgesByFrom map[string][]serviceEdge,
+	externalsByFrom map[string][]externalDependency,
+	nodeCosts map[string]time.Duration,
+	totalCost time.Duration,
+	seen map[string]bool,
+) map[string]any {
+	out := map[string]any{}
+
+	for _, edge := range edgesByFrom[service] {
+		leaf := len(edgesByFrom[edge.ToService]) == 0 && len(externalsByFrom[edge.ToService]) == 0
+		callsInLabel := edge.Count
+		if leaf {
+			callsInLabel = 0
+		}
+		childKey := m.renderServiceNodeLabel(edge.ToService, edge.ToSidecar, nodeCosts[edge.ToService], totalCost, callsInLabel, leaf)
+		if seen[edge.ToService] {
+			out[childKey] = "(cycle)"
+			continue
+		}
+		nextSeen := make(map[string]bool, len(seen)+1)
+		for k, v := range seen {
+			nextSeen[k] = v
+		}
+		nextSeen[edge.ToService] = true
+		subtree := m.buildServiceNodeTree(edge.ToService, edgesByFrom, externalsByFrom, nodeCosts, totalCost, nextSeen)
+		if len(subtree) == 0 {
+			if edge.Count > 0 {
+				out[childKey] = "x" + strconv.Itoa(edge.Count)
+			} else {
+				out[childKey] = ""
+			}
+		} else {
+			out[childKey] = subtree
+		}
+	}
+
+	for _, dep := range externalsByFrom[service] {
+		leafKey := m.renderExternalNodeLabel(dep.Name, dep.Type, dep.FromSidecar, dep.Duration, totalCost, 0, true)
+		out[leafKey] = "x" + strconv.Itoa(dep.Count)
+	}
+
+	return out
+}
+
+func formatCostDisplay(cost, total time.Duration, includePercent bool) string {
+	if !includePercent {
+		return formatDurationDisplay(cost)
+	}
+	if total <= 0 {
+		return formatDurationDisplay(cost)
+	}
+	pct := (float64(cost) / float64(total)) * 100
+	return fmt.Sprintf("%s (%.1f%%)", formatDurationDisplay(cost), pct)
+}
+
+func requestTotalCost(trace *domain.Trace) time.Duration {
+	if trace == nil {
+		return 0
+	}
+	type interval struct {
+		start time.Time
+		end   time.Time
+	}
+	intervals := make([]interval, 0, len(trace.RootSpanIDs))
+	for _, rootID := range trace.RootSpanIDs {
+		span := trace.SpansByID[rootID]
+		if span == nil || !span.End.After(span.Start) {
+			continue
+		}
+		intervals = append(intervals, interval{start: span.Start, end: span.End})
+	}
+	if len(intervals) == 0 {
+		return 0
+	}
+	sort.Slice(intervals, func(i, j int) bool {
+		return intervals[i].start.Before(intervals[j].start)
+	})
+	total := time.Duration(0)
+	cur := intervals[0]
+	for i := 1; i < len(intervals); i++ {
+		next := intervals[i]
+		if !next.start.After(cur.end) {
+			if next.end.After(cur.end) {
+				cur.end = next.end
+			}
+			continue
+		}
+		total += cur.end.Sub(cur.start)
+		cur = next
+	}
+	total += cur.end.Sub(cur.start)
+	return total
+}
+
+func (m Model) renderServiceNodeLabel(service, proxy string, cost, totalCost time.Duration, calls int, includePercent bool) string {
+	label := m.renderEntityLabel(service, proxy, "service")
+	label += " [" + m.serviceMapCostStyle().Render(formatCostDisplay(cost, totalCost, includePercent)) + "]"
+	if calls > 0 {
+		label += " x" + strconv.Itoa(calls)
+	}
+	return label
+}
+
+func (m Model) renderExternalNodeLabel(name, depType, proxy string, cost, totalCost time.Duration, calls int, includePercent bool) string {
+	label := m.renderEntityLabel(name, proxy, depType)
+	label += " [" + m.serviceMapCostStyle().Render(formatCostDisplay(cost, totalCost, includePercent)) + "]"
+	if calls > 0 {
+		label += " x" + strconv.Itoa(calls)
+	}
+	return label
+}
+
+func (m Model) renderEntityLabel(name, proxy, entityType string) string {
+	name = strings.TrimSpace(name)
+	proxy = strings.TrimSpace(proxy)
+	style := m.serviceMapServiceStyle()
+	if entityType != "service" {
+		style = m.serviceMapDependencyStyle(entityType)
+	}
+	label := style.Render(name)
+	if proxy != "" {
+		label += " (" + m.serviceMapSidecarStyle().Render(formatProxyName(proxy)) + ")"
+	}
+	return label
+}
+
+func primarySidecarForService(service string, edgesByFrom map[string][]serviceEdge) string {
+	counts := map[string]int{}
+	for _, edge := range edgesByFrom[service] {
+		if strings.TrimSpace(edge.FromSidecar) == "" {
+			continue
+		}
+		counts[edge.FromSidecar] += edge.Count
+	}
+	best := ""
+	bestCount := 0
+	for sidecar, count := range counts {
+		if count > bestCount {
+			best = sidecar
+			bestCount = count
+		}
+	}
+	return best
+}
+
+func (m Model) resolveDependencyLabelAndType(name string) (string, string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "external", "external"
+	}
+	sm := m.cfg.UI.ServiceMap
+	label := lookupConfigValue(sm.DependencyAliases, name)
+	if label == "" {
+		label = name
+	}
+	typeName := lookupConfigValue(sm.DependencyTypes, name)
+	if typeName == "" {
+		typeName = dependencyTypeFromRules(sm.DependencyTypeRules, name)
+	}
+	if typeName == "" {
+		typeName = "external"
+	}
+	return label, strings.ToLower(strings.TrimSpace(typeName))
+}
+
+func lookupConfigValue(values map[string]string, key string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	if v := strings.TrimSpace(values[key]); v != "" {
+		return v
+	}
+	lower := strings.ToLower(key)
+	for k, v := range values {
+		if strings.EqualFold(strings.TrimSpace(k), lower) {
+			if strings.TrimSpace(v) != "" {
+				return strings.TrimSpace(v)
+			}
+		}
+	}
+	return ""
+}
+
+func dependencyTypeFromRules(rules []config.DependencyTypeRule, name string) string {
+	for _, rule := range rules {
+		pattern := strings.TrimSpace(rule.Match)
+		typeName := strings.TrimSpace(rule.Type)
+		if pattern == "" || typeName == "" {
+			continue
+		}
+		if matched, err := regexp.MatchString(pattern, name); err == nil && matched {
+			return typeName
+		}
+	}
+	return ""
+}
+
+func (m Model) serviceMapServiceStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(m.serviceMapColorOrDefault(m.cfg.UI.ServiceMap.ServiceColor, "68")))
+}
+
+func (m Model) serviceMapSidecarStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(m.serviceMapColorOrDefault(m.cfg.UI.ServiceMap.SidecarColor, "244")))
+}
+
+func (m Model) serviceMapDependencyStyle(typeName string) lipgloss.Style {
+	typeName = strings.ToLower(strings.TrimSpace(typeName))
+	if typeName != "" {
+		if color := lookupConfigValue(m.cfg.UI.ServiceMap.TypeColors, typeName); color != "" {
+			return lipgloss.NewStyle().Foreground(lipgloss.Color(color))
+		}
+	}
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(m.serviceMapColorOrDefault(m.cfg.UI.ServiceMap.ExternalColor, "214")))
+}
+
+func (m Model) serviceMapCostStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(lipgloss.Color("250"))
+}
+
+func (m Model) serviceMapColorOrDefault(color string, fallback string) string {
+	color = strings.TrimSpace(color)
+	if color == "" {
+		return fallback
+	}
+	return color
 }
 
 func (m Model) logsView(height int) string {
@@ -2055,44 +2391,233 @@ func walk(span *domain.Span, depth int, expanded map[string]bool, out *[]traceLi
 }
 
 type serviceEdge struct {
-	From  string
-	To    string
-	Count int
+	FromService string
+	FromSidecar string
+	ToService   string
+	ToSidecar   string
+	Count       int
+}
+
+type edgeTarget struct {
+	service     string
+	fromSidecar string
+	toSidecar   string
+}
+
+type externalDependency struct {
+	FromService string
+	FromSidecar string
+	Name        string
+	Type        string
+	Duration    time.Duration
+	Count       int
 }
 
 func buildServiceEdges(trace *domain.Trace) []serviceEdge {
 	counts := map[string]int{}
 	for _, span := range trace.Spans {
-		if span.Service == "" {
+		if span.Service == "" || isProxySpan(span) {
 			continue
 		}
-		parent := trace.SpansByID[span.ParentID]
-		if parent == nil || parent.Service == "" || parent.Service == span.Service {
-			continue
+
+		targets := make([]edgeTarget, 0, len(span.Children))
+		for _, child := range span.Children {
+			collectProxyRoutedTargets(child, "", "", 0, &targets)
 		}
-		key := parent.Service + "\x00" + span.Service
-		counts[key]++
+
+		for _, target := range targets {
+			if target.service == "" || target.service == span.Service {
+				continue
+			}
+			key := strings.Join([]string{span.Service, target.fromSidecar, target.service, target.toSidecar}, "\x00")
+			counts[key]++
+		}
 	}
+
 	out := make([]serviceEdge, 0, len(counts))
 	for key, count := range counts {
 		parts := strings.Split(key, "\x00")
-		out = append(out, serviceEdge{From: parts[0], To: parts[1], Count: count})
+		out = append(out, serviceEdge{
+			FromService: parts[0],
+			FromSidecar: parts[1],
+			ToService:   parts[2],
+			ToSidecar:   parts[3],
+			Count:       count,
+		})
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if out[i].From == out[j].From {
-			return out[i].To < out[j].To
+		if out[i].FromService == out[j].FromService {
+			if out[i].ToService == out[j].ToService {
+				if out[i].FromSidecar == out[j].FromSidecar {
+					return out[i].ToSidecar < out[j].ToSidecar
+				}
+				return out[i].FromSidecar < out[j].FromSidecar
+			}
+			return out[i].ToService < out[j].ToService
 		}
-		return out[i].From < out[j].From
+		return out[i].FromService < out[j].FromService
 	})
 	return out
+}
+
+func collectProxyRoutedTargets(span *domain.Span, fromSidecar, lastProxy string, proxyDepth int, out *[]edgeTarget) {
+	if span == nil {
+		return
+	}
+	if !isProxySpan(span) {
+		target := edgeTarget{
+			service:     span.Service,
+			fromSidecar: fromSidecar,
+		}
+		if proxyDepth > 1 {
+			target.toSidecar = lastProxy
+		}
+		*out = append(*out, target)
+		return
+	}
+	if fromSidecar == "" {
+		fromSidecar = span.Service
+	}
+	lastProxy = span.Service
+	for _, child := range span.Children {
+		collectProxyRoutedTargets(child, fromSidecar, lastProxy, proxyDepth+1, out)
+	}
+}
+
+func buildExternalDependencies(trace *domain.Trace) []externalDependency {
+	type depStats struct {
+		duration time.Duration
+		count    int
+	}
+
+	stats := map[string]depStats{}
+	for _, span := range trace.Spans {
+		if span == nil || span.Service == "" || isProxySpan(span) || !isOutboundKind(span.Kind) {
+			continue
+		}
+
+		targets := make([]edgeTarget, 0, len(span.Children))
+		for _, child := range span.Children {
+			collectProxyRoutedTargets(child, "", "", 0, &targets)
+		}
+
+		hasInstrumentedRemote := false
+		for _, target := range targets {
+			if target.service != "" && target.service != span.Service {
+				hasInstrumentedRemote = true
+				break
+			}
+		}
+		if hasInstrumentedRemote {
+			continue
+		}
+
+		depName := externalDependencyName(span)
+		if depName == "" {
+			continue
+		}
+		sidecar := firstProxyService(span.Children)
+		key := strings.Join([]string{span.Service, sidecar, depName}, "\x00")
+		agg := stats[key]
+		agg.count++
+		agg.duration += span.Duration
+		stats[key] = agg
+	}
+
+	out := make([]externalDependency, 0, len(stats))
+	for key, agg := range stats {
+		parts := strings.Split(key, "\x00")
+		out = append(out, externalDependency{
+			FromService: parts[0],
+			FromSidecar: parts[1],
+			Name:        parts[2],
+			Duration:    agg.duration,
+			Count:       agg.count,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].FromService == out[j].FromService {
+			if out[i].Name == out[j].Name {
+				return out[i].FromSidecar < out[j].FromSidecar
+			}
+			return out[i].Name < out[j].Name
+		}
+		return out[i].FromService < out[j].FromService
+	})
+	return out
+}
+
+func isOutboundKind(kind string) bool {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	return strings.Contains(kind, "client") || strings.Contains(kind, "producer")
+}
+
+func firstProxyService(children []*domain.Span) string {
+	for _, child := range children {
+		if isProxySpan(child) {
+			return strings.TrimSpace(child.Service)
+		}
+	}
+	return ""
+}
+
+func externalDependencyName(span *domain.Span) string {
+	if span == nil {
+		return ""
+	}
+	attrs := span.Attributes
+	for _, key := range []string{"peer.service", "server.address", "net.peer.name", "http.host"} {
+		if v := attrString(attrs, key); v != "" {
+			return v
+		}
+	}
+	if rawURL := attrString(attrs, "http.url"); rawURL != "" {
+		if parsed, err := url.Parse(rawURL); err == nil {
+			if host := strings.TrimSpace(parsed.Hostname()); host != "" {
+				return host
+			}
+		}
+	}
+	if system := attrString(attrs, "db.system"); system != "" {
+		if name := attrString(attrs, "db.name"); name != "" {
+			return system + "/" + name
+		}
+		return system
+	}
+	if system := attrString(attrs, "messaging.system"); system != "" {
+		if destination := attrString(attrs, "messaging.destination.name"); destination != "" {
+			return system + "/" + destination
+		}
+		if destination := attrString(attrs, "messaging.destination"); destination != "" {
+			return system + "/" + destination
+		}
+		return system
+	}
+	if name := strings.TrimSpace(span.Name); name != "" {
+		return name
+	}
+	return "external"
+}
+
+func attrString(attrs map[string]any, key string) string {
+	if attrs == nil {
+		return ""
+	}
+	raw, ok := attrs[key]
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(raw))
 }
 
 func serviceList(trace *domain.Trace) []string {
 	set := map[string]struct{}{}
 	for _, span := range trace.Spans {
-		if span.Service != "" {
-			set[span.Service] = struct{}{}
+		service := strings.TrimSpace(span.Service)
+		if service == "" || isProxySpan(span) {
+			continue
 		}
+		set[service] = struct{}{}
 	}
 	out := make([]string, 0, len(set))
 	for s := range set {
@@ -2102,15 +2627,60 @@ func serviceList(trace *domain.Trace) []string {
 	return out
 }
 
-func serviceCosts(trace *domain.Trace) map[string]time.Duration {
+func serviceNodeCosts(trace *domain.Trace) map[string]time.Duration {
 	out := map[string]time.Duration{}
 	for _, span := range trace.Spans {
-		if span.Service == "" {
+		service := strings.TrimSpace(span.Service)
+		if service == "" || isProxySpan(span) {
 			continue
 		}
-		out[span.Service] += span.XCost
+		out[service] += span.XCost
 	}
 	return out
+}
+
+func serviceMapNodeCostsAll(trace *domain.Trace) map[string]time.Duration {
+	out := map[string]time.Duration{}
+	for _, span := range trace.Spans {
+		service := strings.TrimSpace(span.Service)
+		if service == "" {
+			continue
+		}
+		if isProxySpan(span) {
+			service = formatProxyName(service)
+		}
+		out[service] += span.XCost
+	}
+	return out
+}
+
+func isProxySpan(span *domain.Span) bool {
+	if span == nil || span.Attributes == nil {
+		return false
+	}
+	component, ok := span.Attributes["component"].(string)
+	if !ok {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(component), "proxy")
+}
+
+func formatProxyName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	if strings.HasSuffix(name, " [P]") {
+		return name
+	}
+	return name + " [P]"
+}
+
+func (m Model) renderNodeSummaryLabel(name string, isProxy bool) string {
+	if isProxy {
+		return m.serviceMapSidecarStyle().Render(name)
+	}
+	return m.serviceMapServiceStyle().Render(name)
 }
 
 func (m Model) traceDetailRoot(span *domain.Span) OrderedRoot {

@@ -245,6 +245,17 @@ func buildJSONLines(path, key string, value any, depth int, expanded map[string]
 	line := jsonLine{Path: path, Depth: depth, Key: key, Label: key + ": " + scalarPreview(value), Value: value}
 
 	switch typed := value.(type) {
+	case OrderedRoot:
+		line.Collapsable = true
+		line.Expanded = expanded[path]
+		line.Label = key + fmt.Sprintf(" { %d }", len(typed.Entries))
+		*lines = append(*lines, line)
+		if !line.Expanded {
+			return
+		}
+		for _, entry := range typed.Entries {
+			buildJSONLines(path+"."+entry.Key, entry.Key, entry.Value, depth+1, expanded, lines)
+		}
 	case map[string]any:
 		line.Collapsable = true
 		line.Expanded = expanded[path]
