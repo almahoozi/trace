@@ -144,7 +144,7 @@ func (m BrowseModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.status = fmt.Sprintf("loaded trace %s", msg.traceID)
 		m.lastSession = msg.session
-		viewer := NewModel(m.cfg, msg.session, m.openURL)
+		viewer := NewModel(m.cfg, msg.session, m.openURL, defaultSnapshotSaver)
 		if m.width > 0 && m.height > 0 {
 			updated, _ := viewer.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
 			if next, ok := updated.(Model); ok {

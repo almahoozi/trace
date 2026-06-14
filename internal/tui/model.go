@@ -12,6 +12,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/almahoozi/trace/internal/app"
 	"github.com/almahoozi/trace/internal/config"
 	"github.com/almahoozi/trace/internal/domain"
 )
@@ -47,10 +48,11 @@ type logColumn struct {
 }
 
 type Model struct {
-	cfg     config.Config
-	session *domain.Session
-	openURL func(string) error
-	loc     *time.Location
+	cfg          config.Config
+	session      *domain.Session
+	openURL      func(string) error
+	saveSnapshot func(*domain.Session) (string, error)
+	loc          *time.Location
 
 	width  int
 	height int
@@ -91,11 +93,12 @@ type valueView struct {
 	offset int
 }
 
-func NewModel(cfg config.Config, session *domain.Session, openURL func(string) error) Model {
+func NewModel(cfg config.Config, session *domain.Session, openURL func(string) error, saveSnapshot func(*domain.Session) (string, error)) Model {
 	m := Model{
 		cfg:          cfg,
 		session:      session,
 		openURL:      openURL,
+		saveSnapshot: saveSnapshot,
 		loc:          time.Local,
 		expanded:     map[string]bool{},
 		collapsed:    map[panel]bool{},
@@ -129,6 +132,20 @@ func NewModel(cfg config.Config, session *domain.Session, openURL func(string) e
 	m.levelThresholdIx = m.levelIndex(cfg.Logs.LevelThreshold)
 	m.applyLogThreshold()
 	return m
+}
+
+func defaultSnapshotSaver(session *domain.Session) (string, error) {
+	if session == nil || session.Trace == nil {
+		return "", fmt.Errorf("nil session")
+	}
+	path, err := app.DefaultSnapshotPath(session.Trace.TraceID)
+	if err != nil {
+		return "", err
+	}
+	if err := app.SaveSessionSnapshot(path, session); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func parseFocusPanel(raw string) panel {
@@ -171,6 +188,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if m.isAction("global", "quit", key) {
 			return m, tea.Quit
+		}
+		if m.isAction("global", "export_snapshot", key) || strings.EqualFold(key, "e") {
+			if m.saveSnapshot == nil {
+				m.status = "snapshot export unavailable"
+				return m, nil
+			}
+			path, err := m.saveSnapshot(m.session)
+			if err != nil {
+				m.status = "snapshot export failed: " + err.Error()
+				return m, nil
+			}
+			m.status = "snapshot saved: " + path
+			return m, nil
 		}
 		if isConfigHotkey(key) {
 			m.openConfigMode()
@@ -1768,7 +1798,7 @@ func (m Model) resolveDependencyLabelAndType(name string) (string, string) {
 		return "external", "external"
 	}
 	sm := m.cfg.UI.ServiceMap
-	label := lookupConfigValue(sm.DependencyAliases, name)
+	label := lookupAliasValue(sm.DependencyAliases, name)
 	if label == "" {
 		label = name
 	}
@@ -1780,6 +1810,55 @@ func (m Model) resolveDependencyLabelAndType(name string) (string, string) {
 		typeName = "external"
 	}
 	return label, strings.ToLower(strings.TrimSpace(typeName))
+}
+
+func lookupAliasValue(values map[string]string, name string) string {
+	if label := lookupConfigValue(values, name); label != "" {
+		return label
+	}
+	for pattern, alias := range values {
+		alias = strings.TrimSpace(alias)
+		pattern = strings.TrimSpace(pattern)
+		if alias == "" || pattern == "" {
+			continue
+		}
+		if matchesAliasPattern(pattern, name) {
+			return alias
+		}
+	}
+	return ""
+}
+
+func matchesAliasPattern(pattern, value string) bool {
+	if len(pattern) >= 2 && strings.HasPrefix(pattern, "/") && strings.HasSuffix(pattern, "/") {
+		re := "(?i)" + pattern[1:len(pattern)-1]
+		matched, err := regexp.MatchString(re, value)
+		return err == nil && matched
+	}
+	if strings.ContainsAny(pattern, "*?") {
+		re := "(?i)^" + globToRegex(pattern) + "$"
+		matched, err := regexp.MatchString(re, value)
+		return err == nil && matched
+	}
+	return false
+}
+
+func globToRegex(pattern string) string {
+	var b strings.Builder
+	for _, r := range pattern {
+		switch r {
+		case '*':
+			b.WriteString(".*")
+		case '?':
+			b.WriteString(".")
+		case '.', '+', '(', ')', '[', ']', '{', '}', '^', '$', '|', '\\':
+			b.WriteRune('\\')
+			b.WriteRune(r)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func lookupConfigValue(values map[string]string, key string) string {
@@ -2136,6 +2215,7 @@ func (m Model) helpView() string {
 	labels := map[string]string{
 		"quit":              "Quit",
 		"help":              "Toggle help",
+		"export_snapshot":   "Export snapshot",
 		"back":              "Close current overlay",
 		"switch_tab":        "Cycle section forward",
 		"switch_tab_back":   "Cycle section backward",

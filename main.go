@@ -34,10 +34,13 @@ func main() {
 	var (
 		showVersion bool
 		configPath  string
+		forceFetch  bool
 	)
 
 	flag.BoolVar(&showVersion, "v", false, "print version information and exit")
 	flag.BoolVar(&showVersion, "version", false, "print version information and exit")
+	flag.BoolVar(&forceFetch, "f", false, "force network fetch instead of cache")
+	flag.BoolVar(&forceFetch, "force", false, "force network fetch instead of cache")
 	flag.StringVar(&configPath, "config", "", "config file path (defaults to platform config dir)")
 	flag.Parse()
 	args := flag.Args()
@@ -59,6 +62,27 @@ func main() {
 		}
 		if err := platform.OpenInEditor(path); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to open run log in editor: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(args) >= 1 && args[0] == "caches" {
+		if len(args) > 1 {
+			fmt.Fprintf(os.Stderr, "invalid command\n")
+			printUsage()
+			os.Exit(1)
+		}
+		dir, err := app.SnapshotCacheDir()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to resolve cache directory: %v\n", err)
+			os.Exit(1)
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to prepare cache directory: %v\n", err)
+			os.Exit(1)
+		}
+		if err := platform.OpenInEditor(dir); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to open cache directory: %v\n", err)
 			os.Exit(1)
 		}
 		return
@@ -94,6 +118,44 @@ func main() {
 		runlog.Info("opened config in editor", "config_path", path)
 		return
 	}
+	if len(args) >= 1 && args[0] == "open" {
+		if len(args) != 2 {
+			fmt.Fprintf(os.Stderr, "invalid command\n")
+			printUsage()
+			os.Exit(1)
+		}
+		cfg, err := loadConfigForOffline(configPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
+			os.Exit(1)
+		}
+		snapshotPath, err := app.ResolveSnapshotOpenPath(args[1])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to resolve snapshot path: %v\n", err)
+			os.Exit(1)
+		}
+		session, err := app.LoadSessionSnapshot(snapshotPath)
+		if err != nil {
+			runlog.Error("failed to load session snapshot", "error", err, "path", snapshotPath)
+			fmt.Fprintf(os.Stderr, "failed to load snapshot: %v\n", err)
+			os.Exit(1)
+		}
+		program := tea.NewProgram(tui.NewModel(cfg, session, platform.OpenURL, defaultSnapshotSaver), tea.WithAltScreen())
+		if _, err := program.Run(); err != nil {
+			runlog.Error("trace tui failed for snapshot", "error", err)
+			fmt.Fprintf(os.Stderr, "tui failed: %v\n", err)
+			os.Exit(1)
+		}
+		summary, err := app.RenderTraceSummaryWithColor(cfg, session, shouldColorizeStdout())
+		if err != nil {
+			runlog.Warn("trace summary render warning", "error", err)
+			fmt.Fprintf(os.Stderr, "trace summary warning: %v\n", err)
+		}
+		if strings.TrimSpace(summary) != "" {
+			fmt.Fprintln(os.Stdout, summary)
+		}
+		return
+	}
 	if len(args) == 0 {
 		printUsage()
 		os.Exit(1)
@@ -107,14 +169,30 @@ func main() {
 	}
 	runlog.Info("config loaded", "config_path", cfg.Path, "environment_count", len(cfg.Environments), "grafana_timeout_seconds", cfg.Grafana.TimeoutSeconds)
 
-	mode, err := resolveMode(args, cfg)
-	if err != nil {
-		runlog.Warn("invalid command arguments", "error", err, "argv", args)
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		printUsage()
-		os.Exit(1)
+	if !forceFetch && len(args) == 1 && lookupEnvironment(cfg, args[0]) == "" {
+		traceID := strings.TrimSpace(args[0])
+		if snapshotPath, err := app.ResolveSnapshotOpenPath(traceID); err == nil {
+			session, err := app.LoadSessionSnapshot(snapshotPath)
+			if err == nil {
+				runlog.Info("loaded trace session from snapshot cache", "trace_id", traceID, "snapshot_path", snapshotPath)
+				program := tea.NewProgram(tui.NewModel(cfg, session, platform.OpenURL, defaultSnapshotSaver), tea.WithAltScreen())
+				if _, err := program.Run(); err != nil {
+					runlog.Error("trace tui failed", "error", err)
+					fmt.Fprintf(os.Stderr, "tui failed: %v\n", err)
+					os.Exit(1)
+				}
+				summary, err := app.RenderTraceSummaryWithColor(cfg, session, shouldColorizeStdout())
+				if err != nil {
+					runlog.Warn("trace summary render warning", "error", err)
+					fmt.Fprintf(os.Stderr, "trace summary warning: %v\n", err)
+				}
+				if strings.TrimSpace(summary) != "" {
+					fmt.Fprintln(os.Stdout, summary)
+				}
+				return
+			}
+		}
 	}
-	runlog.Info("mode resolved", "browse", mode.isBrowse, "environment", mode.environment, "trace_id", mode.traceID, "query", mode.query)
 
 	if strings.TrimSpace(cfg.Grafana.BaseURL) == "" {
 		runlog.Warn("grafana base_url missing; prompting user")
@@ -142,6 +220,57 @@ func main() {
 	httpClient := grafana.NewHTTPClient(cfg.Grafana.Timeout())
 	grafanaClient := grafana.NewClient(cfg.Grafana.BaseURL, token, httpClient)
 	fetcher := app.NewFetcher(grafanaClient)
+
+	if len(args) >= 1 && args[0] == "export" {
+		if len(args) < 2 || len(args) > 3 {
+			fmt.Fprintf(os.Stderr, "invalid command\n")
+			printUsage()
+			os.Exit(1)
+		}
+		traceID := strings.TrimSpace(args[1])
+		if traceID == "" {
+			fmt.Fprintf(os.Stderr, "trace id is required\n")
+			os.Exit(1)
+		}
+		outPath := ""
+		if len(args) == 3 {
+			outPath = strings.TrimSpace(args[2])
+		}
+		if outPath == "" {
+			var err error
+			outPath, err = app.DefaultSnapshotPath(traceID)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to build default snapshot path: %v\n", err)
+				os.Exit(1)
+			}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Grafana.TimeoutSeconds+10)*time.Second)
+		session, err := fetcher.FetchTraceSession(ctx, cfg, traceID)
+		cancel()
+		if err != nil {
+			if errors.Is(err, app.ErrTraceNotFound) {
+				fmt.Fprintf(os.Stderr, "trace %q not found in configured environments\n", traceID)
+				os.Exit(2)
+			}
+			fmt.Fprintf(os.Stderr, "failed to fetch trace session: %v\n", err)
+			os.Exit(1)
+		}
+		if err := app.SaveSessionSnapshot(outPath, session); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to save snapshot: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stdout, "saved snapshot to %s\n", outPath)
+		return
+	}
+
+	mode, err := resolveMode(args, cfg)
+	if err != nil {
+		runlog.Warn("invalid command arguments", "error", err, "argv", args)
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		printUsage()
+		os.Exit(1)
+	}
+	runlog.Info("mode resolved", "browse", mode.isBrowse, "environment", mode.environment, "trace_id", mode.traceID, "query", mode.query)
 
 	if mode.isBrowse {
 		runlog.Info("browse mode started", "environment", mode.environment, "query", mode.query)
@@ -216,7 +345,7 @@ func main() {
 	}
 	runlog.Info("trace session fetched", "trace_id", traceID, "environment", session.Environment, "log_count", len(session.Logs), "span_count", spanCount)
 
-	program := tea.NewProgram(tui.NewModel(cfg, session, platform.OpenURL), tea.WithAltScreen())
+	program := tea.NewProgram(tui.NewModel(cfg, session, platform.OpenURL, defaultSnapshotSaver), tea.WithAltScreen())
 	if _, err := program.Run(); err != nil {
 		runlog.Error("trace tui failed", "error", err)
 		fmt.Fprintf(os.Stderr, "tui failed: %v\n", err)
@@ -272,10 +401,35 @@ func lookupEnvironment(cfg config.Config, candidate string) string {
 
 func printUsage() {
 	fmt.Fprintf(os.Stderr, "usage: %s [-v|--version] [--config path] <trace-id>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [-f|--force] [--config path] <trace-id>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] <env> [query]\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--config path] export <trace-id> [file]\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--config path] open <file>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--config path] caches\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config edit\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] logs\n", os.Args[0])
+}
+
+func loadConfigForOffline(configPath string) (config.Config, error) {
+	if cfg, err := config.Load(configPath); err == nil {
+		return cfg, nil
+	}
+	return config.DefaultConfig(), nil
+}
+
+func defaultSnapshotSaver(session *domain.Session) (string, error) {
+	if session == nil || session.Trace == nil {
+		return "", fmt.Errorf("nil session")
+	}
+	path, err := app.DefaultSnapshotPath(session.Trace.TraceID)
+	if err != nil {
+		return "", err
+	}
+	if err := app.SaveSessionSnapshot(path, session); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func initRunLog(configPath string) {
