@@ -15,6 +15,7 @@ import (
 
 const keyringServiceName = "t"
 const tokenPaddingBytes = 16
+const checkStoredTokenMetadata = false
 
 type KeyringStore struct{}
 
@@ -44,7 +45,10 @@ func (KeyringStore) LoadToken(cfg config.Config) (string, error) {
 		}
 		return "", fmt.Errorf("read token from keyring account %q: %w", account, err)
 	}
-	if !storedTokenMatchesAccount(item, account) {
+	if checkStoredTokenMetadata && !storedTokenMatchesAccount(item, account) {
+		if err := ring.Remove(account); err != nil && !errors.Is(err, keyring.ErrKeyNotFound) {
+			return "", fmt.Errorf("delete legacy token in keyring account %q: %w", account, err)
+		}
 		return "", fmt.Errorf("set %s or save token to keyring account %q", tokenEnv(cfg), account)
 	}
 

@@ -26,6 +26,7 @@ type Span struct {
 	Start      time.Time
 	End        time.Time
 	Duration   time.Duration
+	XCost      time.Duration
 	StatusCode string
 	StatusMsg  string
 	Attributes map[string]any

@@ -32,6 +32,7 @@ type traceLine struct {
 	Expanded  bool
 	Error     bool
 	Duration  time.Duration
+	XCost     time.Duration
 	Start     time.Time
 	End       time.Time
 	LinkCount int
@@ -1376,7 +1377,11 @@ func (m Model) traceView(height int) string {
 			linkIcon = "@"
 		}
 		indent := strings.Repeat("  ", line.Depth)
-		left := fmt.Sprintf("%s%s%s%s%s %s [%s] %s %s", prefix, indent, toggle, errIcon, linkIcon, m.spanIcon(line.Kind), line.Service, line.Label, line.Duration.Round(time.Microsecond))
+		durationInfo := formatDurationDisplay(line.Duration)
+		if line.HasKids {
+			durationInfo += " [" + formatDurationDisplay(line.XCost) + "]"
+		}
+		left := fmt.Sprintf("%s%s%s%s%s %s [%s] %s %s", prefix, indent, toggle, errIcon, linkIcon, m.spanIcon(line.Kind), line.Service, line.Label, durationInfo)
 		left = truncate(left, contentWidth)
 		bar := m.timelineBar(line, barWidth)
 		serviceStyle := m.colorForService(line.Service)
@@ -1487,7 +1492,12 @@ func (m Model) serviceMapLines() []string {
 	}
 
 	lines := make([]string, 0, len(edges)+4)
-	lines = append(lines, "nodes: "+strings.Join(services, ", "))
+	serviceCosts := serviceCosts(m.session.Trace)
+	nodes := make([]string, 0, len(services))
+	for _, service := range services {
+		nodes = append(nodes, fmt.Sprintf("%s (%s)", service, formatDurationDisplay(serviceCosts[service])))
+	}
+	lines = append(lines, "nodes: "+strings.Join(nodes, ", "))
 	if len(edges) == 0 {
 		return append(lines, "(no cross-service edges in this trace)")
 	}
@@ -2030,6 +2040,7 @@ func walk(span *domain.Span, depth int, expanded map[string]bool, out *[]traceLi
 		Expanded:  expanded[span.ID],
 		Error:     span.HasError(),
 		Duration:  span.Duration,
+		XCost:     span.XCost,
 		Start:     span.Start,
 		End:       span.End,
 		LinkCount: len(span.Links),
@@ -2091,6 +2102,17 @@ func serviceList(trace *domain.Trace) []string {
 	return out
 }
 
+func serviceCosts(trace *domain.Trace) map[string]time.Duration {
+	out := map[string]time.Duration{}
+	for _, span := range trace.Spans {
+		if span.Service == "" {
+			continue
+		}
+		out[span.Service] += span.XCost
+	}
+	return out
+}
+
 func (m Model) traceDetailRoot(span *domain.Span) OrderedRoot {
 	parts := m.cfg.UI.TraceDetailParts
 	if len(parts) == 0 {
@@ -2126,9 +2148,14 @@ func spanMetadataPayload(span *domain.Span) map[string]any {
 		"kind":      span.Kind,
 		"service":   span.Service,
 		"duration":  span.Duration.String(),
+		"x-cost":    span.XCost.String(),
 		"status":    span.StatusCode,
 		"error":     span.HasError(),
 	}
+}
+
+func formatDurationDisplay(d time.Duration) string {
+	return d.Round(time.Microsecond).String()
 }
 
 func (m Model) spanEventsPayload(span *domain.Span) map[string]any {
