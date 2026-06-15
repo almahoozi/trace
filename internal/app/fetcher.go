@@ -29,6 +29,11 @@ func NewFetcher(client *grafana.Client) *Fetcher {
 }
 
 func (f *Fetcher) FetchTraceSession(ctx context.Context, cfg config.Config, traceID string) (*domain.Session, error) {
+	sessionStartedAt := time.Now()
+	defer func() {
+		runlog.ObserveDuration("concurrent_group.fetch_trace_session_total", time.Since(sessionStartedAt))
+	}()
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -48,13 +53,29 @@ func (f *Fetcher) FetchTraceSession(ctx context.Context, cfg config.Config, trac
 		lastErr error
 	)
 
+	envLookupWallStartedAt := time.Now()
+	logsPrefetchWallStartedAt := time.Now()
+	var logsPrefetchWG sync.WaitGroup
+
 	g, egCtx := errgroup.WithContext(ctx)
 	for _, env := range cfg.Environments {
 		env := env
+		logsPrefetchWG.Add(1)
 		g.Go(func() error {
+			envLookupStartedAt := time.Now()
+			defer func() {
+				runlog.ObserveDuration("concurrent_group.fetch_trace_session_env_lookup", time.Since(envLookupStartedAt))
+			}()
+
 			runlog.Debug("querying environment for trace", "environment", env.Name, "trace_id", traceID)
 			logsCh := make(chan logsResult, 1)
 			go func() {
+				defer logsPrefetchWG.Done()
+				prefetchStartedAt := time.Now()
+				defer func() {
+					runlog.ObserveDuration("concurrent_group.fetch_trace_session_logs_prefetch", time.Since(prefetchStartedAt))
+				}()
+
 				logsCtx, logsCancel := context.WithTimeout(context.Background(), cfg.Grafana.Timeout()+5*time.Second)
 				defer logsCancel()
 				startedAt := time.Now()
@@ -90,8 +111,13 @@ func (f *Fetcher) FetchTraceSession(ctx context.Context, cfg config.Config, trac
 			return nil
 		})
 	}
+	go func() {
+		logsPrefetchWG.Wait()
+		runlog.ObserveDuration("concurrent_group.fetch_trace_session_logs_prefetch_wall", time.Since(logsPrefetchWallStartedAt))
+	}()
 
 	_ = g.Wait()
+	runlog.ObserveDuration("concurrent_group.fetch_trace_session_env_lookup_wall", time.Since(envLookupWallStartedAt))
 
 	if found == nil {
 		if lastErr != nil {
@@ -119,9 +145,11 @@ func (f *Fetcher) FetchTraceSession(ctx context.Context, cfg config.Config, trac
 
 	logs := prefetched
 	if len(logs) == 0 {
+		finalLogsStartedAt := time.Now()
 		logsCtx, logsCancel := context.WithTimeout(context.Background(), cfg.Grafana.Timeout()+5*time.Second)
 		defer logsCancel()
 		fetched, err := f.client.FetchLogs(logsCtx, cfg, found.env, traceID, found.trace.StartTime, found.trace.StartTime.Add(found.trace.Duration))
+		runlog.ObserveDuration("concurrent_group.fetch_trace_session_logs_final", time.Since(finalLogsStartedAt))
 		if err == nil {
 			logs = fetched
 			runlog.Info("fetched logs in trace window", "environment", found.env.Name, "trace_id", traceID, "entry_count", len(logs))

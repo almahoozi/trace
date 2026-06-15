@@ -15,6 +15,7 @@ import (
 	"github.com/almahoozi/trace/internal/app"
 	"github.com/almahoozi/trace/internal/config"
 	"github.com/almahoozi/trace/internal/domain"
+	"github.com/almahoozi/trace/internal/runlog"
 )
 
 type panel int
@@ -85,6 +86,9 @@ type Model struct {
 	searchPrompt *searchPrompt
 
 	status string
+
+	programCreatedAt  time.Time
+	firstVisualLogged bool
 }
 
 type valueView struct {
@@ -95,17 +99,18 @@ type valueView struct {
 
 func NewModel(cfg config.Config, session *domain.Session, openURL func(string) error, saveSnapshot func(*domain.Session) (string, error)) Model {
 	m := Model{
-		cfg:          cfg,
-		session:      session,
-		openURL:      openURL,
-		saveSnapshot: saveSnapshot,
-		loc:          time.Local,
-		expanded:     map[string]bool{},
-		collapsed:    map[panel]bool{},
-		fullscreen:   cfg.UI.DefaultFullscreen,
-		allLogs:      session.Logs,
-		filteredLogs: session.Logs,
-		status:       fmt.Sprintf("env=%s spans=%d logs=%d", session.Environment, len(session.Trace.Spans), len(session.Logs)),
+		cfg:              cfg,
+		session:          session,
+		openURL:          openURL,
+		saveSnapshot:     saveSnapshot,
+		loc:              time.Local,
+		programCreatedAt: time.Now(),
+		expanded:         map[string]bool{},
+		collapsed:        map[panel]bool{},
+		fullscreen:       cfg.UI.DefaultFullscreen,
+		allLogs:          session.Logs,
+		filteredLogs:     session.Logs,
+		status:           fmt.Sprintf("env=%s spans=%d logs=%d", session.Environment, len(session.Trace.Spans), len(session.Logs)),
 	}
 	if loc, err := cfg.DisplayLocation(); err == nil {
 		m.loc = loc
@@ -170,6 +175,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		if !m.firstVisualLogged {
+			runlog.ObserveSinceRunStart("cli.startup_total")
+			m.firstVisualLogged = true
+		}
 		if m.configView != nil {
 			updated, cmd := m.configView.Update(msg)
 			if next, ok := updated.(ConfigModel); ok {

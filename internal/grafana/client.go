@@ -186,6 +186,7 @@ func (c *Client) get(ctx context.Context, requestURL string) ([]byte, int, error
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		recordNetworkDuration(requestPath, startedAt)
 		runlog.Warn("grafana http request failed", "method", http.MethodGet, "path", requestPath, "duration_ms", time.Since(startedAt).Milliseconds(), "error", err)
 		return nil, 0, err
 	}
@@ -193,9 +194,11 @@ func (c *Client) get(ctx context.Context, requestURL string) ([]byte, int, error
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		recordNetworkDuration(requestPath, startedAt)
 		runlog.Warn("failed to read grafana response body", "method", http.MethodGet, "path", requestPath, "status_code", resp.StatusCode, "duration_ms", time.Since(startedAt).Milliseconds(), "error", err)
 		return nil, 0, err
 	}
+	recordNetworkDuration(requestPath, startedAt)
 	runlog.Debug("grafana http request completed", "method", http.MethodGet, "path", requestPath, "status_code", resp.StatusCode, "duration_ms", time.Since(startedAt).Milliseconds(), "response_bytes", len(body))
 
 	if resp.StatusCode >= 400 {
@@ -208,6 +211,14 @@ func (c *Client) get(ctx context.Context, requestURL string) ([]byte, int, error
 		}
 	}
 	return body, resp.StatusCode, nil
+}
+
+func recordNetworkDuration(requestPath string, startedAt time.Time) {
+	duration := time.Since(startedAt)
+	runlog.ObserveDuration("network.request_total", duration)
+	if requestPath != "" {
+		runlog.ObserveDuration("network.request.path."+requestPath, duration)
+	}
 }
 
 func max(a, b int) int {
