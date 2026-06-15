@@ -19,6 +19,7 @@ type Config struct {
 	ConfigDir    string        `json:"-"`
 	Grafana      GrafanaConfig `json:"grafana"`
 	Auth         AuthConfig    `json:"auth"`
+	Cache        CacheConfig   `json:"cache"`
 	Environments []Environment `json:"environments"`
 	Logs         LogsConfig    `json:"logs"`
 	URLs         URLConfig     `json:"urls"`
@@ -42,6 +43,10 @@ func (g GrafanaConfig) Timeout() time.Duration {
 type AuthConfig struct {
 	TokenEnv  string `json:"token_env"`
 	TokenFile string `json:"token_file"`
+}
+
+type CacheConfig struct {
+	AutoExportOnOpen bool `json:"auto_export_on_open"`
 }
 
 type Environment struct {
@@ -311,6 +316,9 @@ func DefaultConfig() Config {
 		Auth: AuthConfig{
 			TokenEnv:  "TRACE_GRAFANA_TOKEN",
 			TokenFile: "token",
+		},
+		Cache: CacheConfig{
+			AutoExportOnOpen: true,
 		},
 		Environments: []Environment{
 			{
