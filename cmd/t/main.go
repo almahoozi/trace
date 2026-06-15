@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -42,8 +43,8 @@ func main() {
 
 	flag.BoolVar(&showVersion, "v", false, "print version information and exit")
 	flag.BoolVar(&showVersion, "version", false, "print version information and exit")
-	flag.BoolVar(&forceFetch, "f", false, "force network fetch instead of cache")
-	flag.BoolVar(&forceFetch, "force", false, "force network fetch instead of cache")
+	flag.BoolVar(&forceFetch, "f", false, "force operations (trace fetch bypass cache, config import skip prompt)")
+	flag.BoolVar(&forceFetch, "force", false, "force operations (trace fetch bypass cache, config import skip prompt)")
 	flag.StringVar(&configPath, "config", "", "config file path (defaults to platform config dir)")
 	flag.Parse()
 	args := flag.Args()
@@ -116,7 +117,34 @@ func main() {
 	}
 
 	if len(args) >= 1 && args[0] == "config" {
-		if len(args) > 2 || (len(args) == 2 && args[1] != "edit") {
+		if len(args) > 3 {
+			fmt.Fprintf(os.Stderr, "invalid command\n")
+			printUsage()
+			os.Exit(1)
+		}
+		subcommand := ""
+		if len(args) >= 2 {
+			subcommand = strings.TrimSpace(args[1])
+		}
+		if subcommand == "import" && len(args) != 3 {
+			fmt.Fprintf(os.Stderr, "config import requires a file path\n")
+			os.Exit(1)
+		}
+		if subcommand == "diff" && len(args) != 3 {
+			fmt.Fprintf(os.Stderr, "config diff requires a file path\n")
+			os.Exit(1)
+		}
+		if subcommand == "edit" && len(args) != 2 {
+			fmt.Fprintf(os.Stderr, "invalid command\n")
+			printUsage()
+			os.Exit(1)
+		}
+		if subcommand == "export" && len(args) > 3 {
+			fmt.Fprintf(os.Stderr, "invalid command\n")
+			printUsage()
+			os.Exit(1)
+		}
+		if subcommand != "" && subcommand != "edit" && subcommand != "export" && subcommand != "import" && subcommand != "diff" {
 			fmt.Fprintf(os.Stderr, "invalid command\n")
 			printUsage()
 			os.Exit(1)
@@ -134,6 +162,126 @@ func main() {
 				os.Exit(1)
 			}
 			runlog.Info("opened config in editor", "config_path", path)
+			return
+		}
+		if len(args) >= 2 && args[1] == "export" {
+			cfg, err := config.Load(configPath)
+			if err != nil {
+				runlog.Error("failed to load config for export", "error", err, "config_path_flag", configPath)
+				fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
+				os.Exit(1)
+			}
+			payload, err := config.ExportNonDefault(cfg)
+			if err != nil {
+				runlog.Error("failed to export config", "error", err, "config_path", cfg.Path)
+				fmt.Fprintf(os.Stderr, "failed to export config: %v\n", err)
+				os.Exit(1)
+			}
+			if len(args) == 3 {
+				outPath := filepath.Clean(strings.TrimSpace(args[2]))
+				if outPath == "" {
+					fmt.Fprintf(os.Stderr, "invalid export path\n")
+					os.Exit(1)
+				}
+				if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+					fmt.Fprintf(os.Stderr, "failed to prepare export directory: %v\n", err)
+					os.Exit(1)
+				}
+				if err := os.WriteFile(outPath, payload, 0o644); err != nil {
+					fmt.Fprintf(os.Stderr, "failed to write export file: %v\n", err)
+					os.Exit(1)
+				}
+				runlog.Info("exported config patch", "config_path", cfg.Path, "export_path", outPath, "bytes", len(payload))
+				fmt.Fprintf(os.Stdout, "exported config patch to %s\n", outPath)
+				return
+			}
+			fmt.Fprint(os.Stdout, string(payload))
+			return
+		}
+		if len(args) >= 2 && args[1] == "import" {
+			inPath := filepath.Clean(strings.TrimSpace(args[2]))
+			if inPath == "" {
+				fmt.Fprintf(os.Stderr, "invalid import path\n")
+				os.Exit(1)
+			}
+			data, err := os.ReadFile(inPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to read import file: %v\n", err)
+				os.Exit(1)
+			}
+			cfg, err := config.Load(configPath)
+			if err != nil {
+				runlog.Error("failed to load config for import", "error", err, "config_path_flag", configPath)
+				fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
+				os.Exit(1)
+			}
+			changes, err := config.DiffImport(cfg, data)
+			if err != nil {
+				runlog.Error("failed to diff config import", "error", err, "config_path", cfg.Path, "import_path", inPath)
+				fmt.Fprintf(os.Stderr, "failed to diff config patch: %v\n", err)
+				os.Exit(1)
+			}
+			if len(changes) == 0 {
+				fmt.Fprintf(os.Stdout, "no config changes in %s\n", inPath)
+				return
+			}
+			if !forceFetch {
+				if info, statErr := os.Stat(cfg.Path); statErr == nil && info.Size() > 0 {
+					fmt.Fprintf(os.Stderr, "import will overwrite existing config values in %s\n", cfg.Path)
+					fmt.Fprintf(os.Stderr, "run '%s config diff %s' to review changes, or use -f to skip this prompt\n", os.Args[0], inPath)
+					if !promptYesNo("Continue import? [y/N]: ") {
+						fmt.Fprintln(os.Stderr, "import cancelled")
+						return
+					}
+				}
+			}
+			updated, err := config.ApplyImport(cfg, data)
+			if err != nil {
+				runlog.Error("failed to apply config import", "error", err, "config_path", cfg.Path, "import_path", inPath)
+				fmt.Fprintf(os.Stderr, "failed to import config patch: %v\n", err)
+				os.Exit(1)
+			}
+			if err := config.Save(updated); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to save imported config: %v\n", err)
+				os.Exit(1)
+			}
+			runlog.Info("imported config patch", "config_path", updated.Path, "import_path", inPath, "bytes", len(data))
+			fmt.Fprintf(os.Stdout, "imported config patch from %s\n", inPath)
+			return
+		}
+		if len(args) >= 2 && args[1] == "diff" {
+			inPath := filepath.Clean(strings.TrimSpace(args[2]))
+			if inPath == "" {
+				fmt.Fprintf(os.Stderr, "invalid diff path\n")
+				os.Exit(1)
+			}
+			data, err := os.ReadFile(inPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to read diff file: %v\n", err)
+				os.Exit(1)
+			}
+			cfg, err := config.Load(configPath)
+			if err != nil {
+				runlog.Error("failed to load config for diff", "error", err, "config_path_flag", configPath)
+				fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
+				os.Exit(1)
+			}
+			changes, err := config.DiffImport(cfg, data)
+			if err != nil {
+				runlog.Error("failed to diff config import", "error", err, "config_path", cfg.Path, "import_path", inPath)
+				fmt.Fprintf(os.Stderr, "failed to diff config patch: %v\n", err)
+				os.Exit(1)
+			}
+			if len(changes) == 0 {
+				fmt.Fprintf(os.Stdout, "no config changes in %s\n", inPath)
+				return
+			}
+			fmt.Fprintf(os.Stdout, "config diff for %s (%d changes):\n", inPath, len(changes))
+			for _, change := range changes {
+				fmt.Fprintf(os.Stdout, "- %s\n", change.Path)
+				fmt.Fprintf(os.Stdout, "    from: %s\n", formatAnyJSON(change.From))
+				fmt.Fprintf(os.Stdout, "      to: %s\n", formatAnyJSON(change.To))
+			}
 			return
 		}
 
@@ -599,6 +747,9 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "       %s [--config path] caches clear\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config edit\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--config path] config export [file]\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--config path] config import <file>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--config path] config diff <file>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] logs\n", os.Args[0])
 }
 
@@ -898,6 +1049,25 @@ func printBuildInfo() {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "build: %s %s %s\n", commit, ref, version)
+}
+
+func promptYesNo(prompt string) bool {
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Fprint(os.Stderr, prompt)
+	input, err := reader.ReadString('\n')
+	if err != nil {
+		return false
+	}
+	normalized := strings.ToLower(strings.TrimSpace(input))
+	return normalized == "y" || normalized == "yes"
+}
+
+func formatAnyJSON(value any) string {
+	buf, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Sprint(value)
+	}
+	return string(buf)
 }
 
 func promptAndSaveBaseURL(cfg *config.Config) error {
