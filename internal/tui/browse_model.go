@@ -288,8 +288,10 @@ func (m BrowseModel) View() string {
 	for i := start; i < end; i++ {
 		item := m.filtered[i]
 		prefix := "  "
+		rowStyle := tableRowBandStyle(i)
 		if i == m.cursor {
 			prefix = "> "
+			rowStyle = tableRowCursorStyle
 		}
 		line := fmt.Sprintf("%s%-*s | %-*s | %-*s | %-*s | %-*s | %-*s",
 			prefix,
@@ -300,7 +302,7 @@ func (m BrowseModel) View() string {
 			statsWidth, padRight(fmt.Sprintf("%d/%d", item.ErrorSpanCount, item.SpanCount), statsWidth),
 			durationWidth, padRight(formatBrowseDuration(item.Duration), durationWidth),
 		)
-		b.WriteString(sliceHorizontal(line, m.hOffset, m.width))
+		b.WriteString(rowStyle.Render(sliceHorizontal(line, m.hOffset, m.width)))
 		b.WriteString("\n")
 	}
 

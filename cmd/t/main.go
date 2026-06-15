@@ -70,7 +70,7 @@ func main() {
 		return
 	}
 	if len(args) >= 1 && args[0] == "caches" {
-		if len(args) > 1 {
+		if len(args) > 2 || (len(args) == 2 && args[1] != "clear") {
 			fmt.Fprintf(os.Stderr, "invalid command\n")
 			printUsage()
 			os.Exit(1)
@@ -83,6 +83,18 @@ func main() {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to prepare cache directory: %v\n", err)
 			os.Exit(1)
+		}
+		if len(args) == 2 && args[1] == "clear" {
+			if err := os.RemoveAll(dir); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to clear cache directory: %v\n", err)
+				os.Exit(1)
+			}
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to recreate cache directory: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stdout, "cleared caches in %s\n", dir)
+			return
 		}
 		if err := platform.OpenInEditor(dir); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to open cache directory: %v\n", err)
@@ -109,18 +121,37 @@ func main() {
 			printUsage()
 			os.Exit(1)
 		}
-		path, err := config.EnsureFile(configPath)
+		if len(args) == 2 && args[1] == "edit" {
+			path, err := config.EnsureFile(configPath)
+			if err != nil {
+				runlog.Error("failed to ensure config file", "error", err, "config_path_flag", configPath)
+				fmt.Fprintf(os.Stderr, "failed to prepare config file: %v\n", err)
+				os.Exit(1)
+			}
+			if err := platform.OpenInEditor(path); err != nil {
+				runlog.Error("failed to open config in editor", "error", err, "config_path", path)
+				fmt.Fprintf(os.Stderr, "failed to open config in editor: %v\n", err)
+				os.Exit(1)
+			}
+			runlog.Info("opened config in editor", "config_path", path)
+			return
+		}
+
+		cfg, err := config.Load(configPath)
 		if err != nil {
-			runlog.Error("failed to ensure config file", "error", err, "config_path_flag", configPath)
-			fmt.Fprintf(os.Stderr, "failed to prepare config file: %v\n", err)
+			runlog.Error("failed to load config for in-app editor", "error", err, "config_path_flag", configPath)
+			fmt.Fprintf(os.Stderr, "failed to load config for in-app mode: %v\n", err)
+			fmt.Fprintf(os.Stderr, "tip: use '%s config edit' to open the raw file\n", os.Args[0])
 			os.Exit(1)
 		}
-		if err := platform.OpenInEditor(path); err != nil {
-			runlog.Error("failed to open config in editor", "error", err, "config_path", path)
-			fmt.Fprintf(os.Stderr, "failed to open config in editor: %v\n", err)
+		configModel := tui.NewConfigModel(cfg)
+		program := tea.NewProgram(configModel, tea.WithAltScreen())
+		if _, err := program.Run(); err != nil {
+			runlog.Error("config tui failed", "error", err)
+			fmt.Fprintf(os.Stderr, "config tui failed: %v\n", err)
 			os.Exit(1)
 		}
-		runlog.Info("opened config in editor", "config_path", path)
+		runlog.Info("opened config in app mode", "config_path", cfg.Path)
 		return
 	}
 	if len(args) >= 1 && args[0] == "open" {
@@ -565,6 +596,7 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "       %s [--config path] export <trace-id> [file]\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] open <file>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] caches\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--config path] caches clear\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config edit\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] logs\n", os.Args[0])
