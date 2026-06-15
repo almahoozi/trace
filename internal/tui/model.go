@@ -2011,11 +2011,13 @@ func (m Model) logsView(height int) string {
 	for i := start; i < end; i++ {
 		entry := m.filteredLogs[i]
 		prefix := "  "
+		rowStyle := tableRowBandStyle(i)
 		if i == m.logCursor {
 			prefix = "> "
+			rowStyle = tableRowCursorStyle
 		}
 		row := prefix + m.renderLogRow(entry, cols, widths)
-		b.WriteString(row)
+		b.WriteString(rowStyle.Render(row))
 		b.WriteString("\n")
 	}
 
@@ -2930,6 +2932,10 @@ var (
 	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
 	mutedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 
+	tableRowBandStyleA  = lipgloss.NewStyle().Background(lipgloss.Color("234"))
+	tableRowBandStyleB  = lipgloss.NewStyle().Background(lipgloss.Color("235"))
+	tableRowCursorStyle = lipgloss.NewStyle().Background(lipgloss.Color("238"))
+
 	summaryBrightStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
 	summaryGrayStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	summarySuccessStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
@@ -2937,6 +2943,13 @@ var (
 	summaryWarnStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
 	summaryErrorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
 )
+
+func tableRowBandStyle(index int) lipgloss.Style {
+	if index%2 == 0 {
+		return tableRowBandStyleA
+	}
+	return tableRowBandStyleB
+}
 
 func sectionStyle(active bool, width int, height int) lipgloss.Style {
 	color := lipgloss.Color("240")
