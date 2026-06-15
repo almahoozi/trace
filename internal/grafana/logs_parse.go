@@ -148,9 +148,12 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func lokiRange(since string, traceStart, traceEnd time.Time) (start, end time.Time) {
+func lokiRange(since string, traceStart, traceEnd time.Time, padding time.Duration) (start, end time.Time) {
 	if !traceStart.IsZero() && !traceEnd.IsZero() {
-		buffer := 5 * time.Minute
+		buffer := padding
+		if buffer <= 0 {
+			buffer = 5 * time.Minute
+		}
 		if traceEnd.Before(traceStart) {
 			traceStart, traceEnd = traceEnd, traceStart
 		}

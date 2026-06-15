@@ -8,7 +8,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -169,27 +172,44 @@ func main() {
 	}
 	runlog.Info("config loaded", "config_path", cfg.Path, "environment_count", len(cfg.Environments), "grafana_timeout_seconds", cfg.Grafana.TimeoutSeconds)
 
-	if !forceFetch && len(args) == 1 && lookupEnvironment(cfg, args[0]) == "" {
-		traceID := strings.TrimSpace(args[0])
+	isExportMode := len(args) >= 1 && args[0] == "export"
+	mode := cliMode{}
+	if !isExportMode {
+		mode, err = resolveMode(args, cfg)
+		if err != nil {
+			runlog.Warn("invalid command arguments", "error", err, "argv", args)
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			printUsage()
+			os.Exit(1)
+		}
+		runlog.Info("mode resolved", "browse", mode.isBrowse, "environment", mode.environment, "trace_id", mode.traceID, "query", mode.query, "trace_in_env_only", mode.traceInEnvOnly)
+	}
+
+	if !isExportMode && !forceFetch && mode.traceID != "" {
+		traceID := strings.TrimSpace(mode.traceID)
 		if snapshotPath, err := app.ResolveSnapshotOpenPath(traceID); err == nil {
 			session, err := app.LoadSessionSnapshot(snapshotPath)
 			if err == nil {
-				runlog.Info("loaded trace session from snapshot cache", "trace_id", traceID, "snapshot_path", snapshotPath)
-				program := tea.NewProgram(tui.NewModel(cfg, session, platform.OpenURL, defaultSnapshotSaver), tea.WithAltScreen())
-				if _, err := program.Run(); err != nil {
-					runlog.Error("trace tui failed", "error", err)
-					fmt.Fprintf(os.Stderr, "tui failed: %v\n", err)
-					os.Exit(1)
+				if mode.traceInEnvOnly && !strings.EqualFold(strings.TrimSpace(mode.environment), strings.TrimSpace(session.Environment)) {
+					runlog.Info("snapshot environment mismatch; skipping cache", "trace_id", traceID, "requested_environment", mode.environment, "snapshot_environment", session.Environment)
+				} else {
+					runlog.Info("loaded trace session from snapshot cache", "trace_id", traceID, "snapshot_path", snapshotPath)
+					program := tea.NewProgram(tui.NewModel(cfg, session, platform.OpenURL, defaultSnapshotSaver), tea.WithAltScreen())
+					if _, err := program.Run(); err != nil {
+						runlog.Error("trace tui failed", "error", err)
+						fmt.Fprintf(os.Stderr, "tui failed: %v\n", err)
+						os.Exit(1)
+					}
+					summary, err := app.RenderTraceSummaryWithColor(cfg, session, shouldColorizeStdout())
+					if err != nil {
+						runlog.Warn("trace summary render warning", "error", err)
+						fmt.Fprintf(os.Stderr, "trace summary warning: %v\n", err)
+					}
+					if strings.TrimSpace(summary) != "" {
+						fmt.Fprintln(os.Stdout, summary)
+					}
+					return
 				}
-				summary, err := app.RenderTraceSummaryWithColor(cfg, session, shouldColorizeStdout())
-				if err != nil {
-					runlog.Warn("trace summary render warning", "error", err)
-					fmt.Fprintf(os.Stderr, "trace summary warning: %v\n", err)
-				}
-				if strings.TrimSpace(summary) != "" {
-					fmt.Fprintln(os.Stdout, summary)
-				}
-				return
 			}
 		}
 	}
@@ -263,15 +283,6 @@ func main() {
 		return
 	}
 
-	mode, err := resolveMode(args, cfg)
-	if err != nil {
-		runlog.Warn("invalid command arguments", "error", err, "argv", args)
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		printUsage()
-		os.Exit(1)
-	}
-	runlog.Info("mode resolved", "browse", mode.isBrowse, "environment", mode.environment, "trace_id", mode.traceID, "query", mode.query)
-
 	if mode.isBrowse {
 		runlog.Info("browse mode started", "environment", mode.environment, "query", mode.query)
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Grafana.TimeoutSeconds+10)*time.Second)
@@ -330,16 +341,121 @@ func main() {
 	}
 
 	traceID := mode.traceID
-	runlog.Info("trace mode started", "trace_id", traceID)
+	runlog.Info("trace mode started", "trace_id", traceID, "environment", mode.environment, "trace_in_env_only", mode.traceInEnvOnly)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Grafana.TimeoutSeconds+10)*time.Second)
-	defer cancel()
+	status := startProgressStatus("searching trace")
+	defer status.Stop()
 
-	session, err := fetcher.FetchTraceSession(ctx, cfg, traceID)
+	var session *domain.Session
+	if mode.traceInEnvOnly {
+		status.Update(fmt.Sprintf("searching trace in %s", mode.environment))
+		prefetchCtx, prefetchCancel := context.WithCancel(context.Background())
+		defer prefetchCancel()
+		prefetchResultCh := make(chan logsFetchResult, 1)
+		prefetchRangeStart, prefetchRangeEnd := sinceWindow(cfg.Logs.Since, time.Now())
+		go func() {
+			logsCtx, logsCancel := context.WithTimeout(prefetchCtx, time.Duration(cfg.Grafana.TimeoutSeconds+10)*time.Second)
+			defer logsCancel()
+			logs, logsErr := fetcher.FetchLogsForEnvironment(logsCtx, cfg, mode.environment, traceID, time.Time{}, time.Time{}, 0)
+			prefetchResultCh <- logsFetchResult{entries: logs, err: logsErr}
+		}()
+
+		session, err = fetcher.FindTraceSessionInEnvironment(ctx, cfg, mode.environment, traceID)
+
+		logsPadding := 30 * time.Second
+		logsLoader := func(ctx context.Context) ([]domain.LogEntry, error) {
+			wantedStart, wantedEnd := traceWindowWithPadding(session, logsPadding)
+			if windowsOverlap(prefetchRangeStart, prefetchRangeEnd, wantedStart, wantedEnd) {
+				select {
+				case prefetched := <-prefetchResultCh:
+					if prefetched.err == nil {
+						return filterLogsByWindow(prefetched.entries, wantedStart, wantedEnd), nil
+					}
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			} else {
+				prefetchCancel()
+			}
+
+			logsCtx, logsCancel := context.WithTimeout(ctx, time.Duration(cfg.Grafana.TimeoutSeconds+10)*time.Second)
+			defer logsCancel()
+			return fetcher.FetchLogsForSession(logsCtx, cfg, session, logsPadding)
+		}
+		logsReady := func(updated *domain.Session) {
+			if err := autoExportSnapshotOnOpen(cfg, updated); err != nil {
+				runlog.Warn("auto-export snapshot failed", "error", err, "trace_id", traceID)
+			}
+		}
+
+		if err == nil {
+			spanCount := 0
+			if session.Trace != nil {
+				spanCount = session.Trace.SpanCount
+			}
+			runlog.Info("trace session fetched", "trace_id", traceID, "environment", session.Environment, "span_count", spanCount)
+
+			cancel()
+			status.Stop()
+
+			program := tea.NewProgram(tui.NewModelWithDeferredLogs(cfg, session, platform.OpenURL, defaultSnapshotSaver, logsLoader, logsReady), tea.WithAltScreen())
+			if _, err := program.Run(); err != nil {
+				runlog.Error("trace tui failed", "error", err)
+				fmt.Fprintf(os.Stderr, "tui failed: %v\n", err)
+				os.Exit(1)
+			}
+
+			summary, err := app.RenderTraceSummaryWithColor(cfg, session, shouldColorizeStdout())
+			if err != nil {
+				runlog.Warn("trace summary render warning", "error", err)
+				fmt.Fprintf(os.Stderr, "trace summary warning: %v\n", err)
+			}
+			if strings.TrimSpace(summary) != "" {
+				fmt.Fprintln(os.Stdout, summary)
+			}
+			return
+		}
+	} else {
+		status.Update(formatEnvSearchStatus(nil, cfg.Environments, "searching trace"))
+		var (
+			obsMu       sync.Mutex
+			states      = map[string]string{}
+			matchLocked bool
+		)
+		session, err = fetcher.FindTraceSession(ctx, cfg, traceID, func(event app.TraceLookupEvent) {
+			obsMu.Lock()
+			defer obsMu.Unlock()
+			if matchLocked {
+				return
+			}
+			switch event.Stage {
+			case "querying":
+				states[event.Environment] = "querying"
+				status.Update(formatEnvSearchStatus(states, cfg.Environments, "searching trace"))
+			case "not_found":
+				states[event.Environment] = "not_found"
+				status.Update(formatEnvSearchStatus(states, cfg.Environments, "searching trace"))
+			case "error":
+				states[event.Environment] = "error"
+				status.Update(formatEnvSearchStatus(states, cfg.Environments, "searching trace"))
+			case "matched":
+				matchLocked = true
+				states[event.Environment] = "matched"
+				status.Update(formatEnvSearchStatus(states, cfg.Environments, fmt.Sprintf("trace found in %s", event.Environment)))
+			}
+		})
+	}
+	cancel()
+	status.Stop()
 	if err != nil {
 		if errors.Is(err, app.ErrTraceNotFound) {
 			runlog.Warn("trace not found", "trace_id", traceID)
-			fmt.Fprintf(os.Stderr, "trace %q not found in configured environments\n", traceID)
+			if mode.traceInEnvOnly {
+				fmt.Fprintf(os.Stderr, "trace %q not found in environment %q\n", traceID, mode.environment)
+			} else {
+				fmt.Fprintf(os.Stderr, "trace %q not found in configured environments\n", traceID)
+			}
 			os.Exit(2)
 		}
 		runlog.Error("failed to fetch trace session", "error", err, "trace_id", traceID)
@@ -350,12 +466,21 @@ func main() {
 	if session.Trace != nil {
 		spanCount = session.Trace.SpanCount
 	}
-	runlog.Info("trace session fetched", "trace_id", traceID, "environment", session.Environment, "log_count", len(session.Logs), "span_count", spanCount)
-	if err := autoExportSnapshotOnOpen(cfg, session); err != nil {
-		runlog.Warn("auto-export snapshot failed", "error", err, "trace_id", traceID)
+	runlog.Info("trace session fetched", "trace_id", traceID, "environment", session.Environment, "span_count", spanCount)
+
+	logsPadding := 30 * time.Second
+	logsLoader := func(ctx context.Context) ([]domain.LogEntry, error) {
+		logsCtx, logsCancel := context.WithTimeout(ctx, time.Duration(cfg.Grafana.TimeoutSeconds+10)*time.Second)
+		defer logsCancel()
+		return fetcher.FetchLogsForSession(logsCtx, cfg, session, logsPadding)
+	}
+	logsReady := func(updated *domain.Session) {
+		if err := autoExportSnapshotOnOpen(cfg, updated); err != nil {
+			runlog.Warn("auto-export snapshot failed", "error", err, "trace_id", traceID)
+		}
 	}
 
-	program := tea.NewProgram(tui.NewModel(cfg, session, platform.OpenURL, defaultSnapshotSaver), tea.WithAltScreen())
+	program := tea.NewProgram(tui.NewModelWithDeferredLogs(cfg, session, platform.OpenURL, defaultSnapshotSaver, logsLoader, logsReady), tea.WithAltScreen())
 	if _, err := program.Run(); err != nil {
 		runlog.Error("trace tui failed", "error", err)
 		fmt.Fprintf(os.Stderr, "tui failed: %v\n", err)
@@ -373,10 +498,11 @@ func main() {
 }
 
 type cliMode struct {
-	isBrowse    bool
-	environment string
-	query       string
-	traceID     string
+	isBrowse       bool
+	environment    string
+	query          string
+	traceID        string
+	traceInEnvOnly bool
 }
 
 func resolveMode(args []string, cfg config.Config) (cliMode, error) {
@@ -385,6 +511,13 @@ func resolveMode(args []string, cfg config.Config) (cliMode, error) {
 	}
 
 	if env := lookupEnvironment(cfg, args[0]); env != "" {
+		if len(args) == 2 && looksLikeTraceID(args[1]) {
+			return cliMode{
+				environment:    env,
+				traceID:        strings.TrimSpace(args[1]),
+				traceInEnvOnly: true,
+			}, nil
+		}
 		return cliMode{
 			isBrowse:    true,
 			environment: env,
@@ -409,9 +542,16 @@ func lookupEnvironment(cfg config.Config, candidate string) string {
 	return ""
 }
 
+var traceIDPattern = regexp.MustCompile(`^[a-fA-F0-9]{16,64}$`)
+
+func looksLikeTraceID(value string) bool {
+	return traceIDPattern.MatchString(strings.TrimSpace(value))
+}
+
 func printUsage() {
 	fmt.Fprintf(os.Stderr, "usage: %s [-v|--version] [--config path] <trace-id>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [-f|--force] [--config path] <trace-id>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [-f|--force] [--config path] <env> <trace-id>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] <env> [query]\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] export <trace-id> [file]\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] open <file>\n", os.Args[0])
@@ -500,6 +640,186 @@ func shouldColorizeStdout() bool {
 		return false
 	}
 	return true
+}
+
+type logsFetchResult struct {
+	entries []domain.LogEntry
+	err     error
+}
+
+func traceWindowWithPadding(session *domain.Session, padding time.Duration) (time.Time, time.Time) {
+	if session == nil || session.Trace == nil {
+		return time.Time{}, time.Time{}
+	}
+	start := session.Trace.StartTime
+	end := session.Trace.StartTime.Add(session.Trace.Duration)
+	if end.Before(start) {
+		start, end = end, start
+	}
+	if padding > 0 {
+		start = start.Add(-padding)
+		end = end.Add(padding)
+	}
+	return start, end
+}
+
+func sinceWindow(since string, now time.Time) (time.Time, time.Time) {
+	end := now
+	d, err := time.ParseDuration("-" + strings.TrimSpace(since))
+	if err != nil {
+		d = -60 * time.Minute
+	}
+	start := end.Add(d)
+	if end.Before(start) {
+		start, end = end, start
+	}
+	return start, end
+}
+
+func windowsOverlap(aStart, aEnd, bStart, bEnd time.Time) bool {
+	if aStart.IsZero() || aEnd.IsZero() || bStart.IsZero() || bEnd.IsZero() {
+		return false
+	}
+	if aEnd.Before(aStart) {
+		aStart, aEnd = aEnd, aStart
+	}
+	if bEnd.Before(bStart) {
+		bStart, bEnd = bEnd, bStart
+	}
+	return !aEnd.Before(bStart) && !bEnd.Before(aStart)
+}
+
+func filterLogsByWindow(entries []domain.LogEntry, start, end time.Time) []domain.LogEntry {
+	if start.IsZero() || end.IsZero() {
+		return entries
+	}
+	filtered := make([]domain.LogEntry, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Timestamp.IsZero() {
+			continue
+		}
+		if !entry.Timestamp.Before(start) && !entry.Timestamp.After(end) {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
+}
+
+func formatEnvSearchStatus(states map[string]string, envs []config.Environment, prefix string) string {
+	ordered := orderedEnvironmentNames(envs)
+	parts := make([]string, 0, len(ordered))
+	for _, envName := range ordered {
+		stage := "pending"
+		if states != nil {
+			if value, ok := states[envName]; ok && strings.TrimSpace(value) != "" {
+				stage = value
+			}
+		}
+		switch stage {
+		case "querying":
+			parts = append(parts, envName+":searching")
+		case "not_found":
+			parts = append(parts, envName+":miss")
+		case "error":
+			parts = append(parts, envName+":error")
+		case "matched":
+			parts = append(parts, envName+":match")
+		default:
+			parts = append(parts, envName+":pending")
+		}
+	}
+	if len(parts) == 0 {
+		return prefix
+	}
+	return prefix + " | " + strings.Join(parts, " ")
+}
+
+func orderedEnvironmentNames(envs []config.Environment) []string {
+	rank := map[string]int{"dev": 0, "stg": 1, "prd": 2}
+	names := make([]string, 0, len(envs))
+	for _, env := range envs {
+		name := strings.TrimSpace(env.Name)
+		if name == "" {
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.SliceStable(names, func(i, j int) bool {
+		li := strings.ToLower(names[i])
+		lj := strings.ToLower(names[j])
+		ri, iok := rank[li]
+		rj, jok := rank[lj]
+		if iok && jok {
+			return ri < rj
+		}
+		if iok != jok {
+			return iok
+		}
+		return li < lj
+	})
+	return names
+}
+
+type progressStatus struct {
+	mu      sync.Mutex
+	message string
+	done    chan struct{}
+	wg      sync.WaitGroup
+	enabled bool
+}
+
+func startProgressStatus(initial string) *progressStatus {
+	s := &progressStatus{
+		message: initial,
+		done:    make(chan struct{}),
+		enabled: term.IsTerminal(int(os.Stderr.Fd())),
+	}
+	if !s.enabled {
+		return s
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		frames := []string{"-", "\\", "|", "/"}
+		i := 0
+		ticker := time.NewTicker(120 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.done:
+				return
+			case <-ticker.C:
+				s.mu.Lock()
+				msg := s.message
+				s.mu.Unlock()
+				fmt.Fprintf(os.Stderr, "\r%s %s", frames[i%len(frames)], msg)
+				i++
+			}
+		}
+	}()
+	return s
+}
+
+func (s *progressStatus) Update(message string) {
+	s.mu.Lock()
+	s.message = message
+	s.mu.Unlock()
+}
+
+func (s *progressStatus) Stop() {
+	if s == nil {
+		return
+	}
+	select {
+	case <-s.done:
+		return
+	default:
+		close(s.done)
+	}
+	s.wg.Wait()
+	if s.enabled {
+		fmt.Fprint(os.Stderr, "\r\033[K")
+	}
 }
 
 func printBuildInfo() {
