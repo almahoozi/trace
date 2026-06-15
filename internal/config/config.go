@@ -84,6 +84,7 @@ type Environment struct {
 }
 
 type LogsConfig struct {
+	QueryTemplate  string   `json:"query_template"`
 	Since          string   `json:"since"`
 	Limit          int      `json:"limit"`
 	LevelThreshold string   `json:"level_threshold"`
@@ -351,27 +352,14 @@ func DefaultConfig() Config {
 		Environments: []Environment{
 			{
 				Name:             "dev",
-				TempoDatasource:  "traces-dev",
-				LokiDatasource:   "logs-dev",
-				LogQueryTemplate: `{k8s_namespace=~".+"} |~ ` + "`\"trace[-_]id\":\"{{trace_id}}\"`" + ` | json`,
-				BetterstackID:    "772925",
-			},
-			{
-				Name:             "stg",
-				TempoDatasource:  "traces-stg",
-				LokiDatasource:   "logs-stg",
-				LogQueryTemplate: `{k8s_namespace=~".+"} |~ ` + "`\"trace[-_]id\":\"{{trace_id}}\"`" + ` | json`,
-				BetterstackID:    "773432",
-			},
-			{
-				Name:             "prd",
-				TempoDatasource:  "traces-prd",
-				LokiDatasource:   "logs-prd",
-				LogQueryTemplate: `{k8s_namespace=~".+"} |~ ` + "`\"trace[-_]id\":\"{{trace_id}}\"`" + ` | json`,
-				BetterstackID:    "775784",
+				TempoDatasource:  "tempo",
+				LokiDatasource:   "loki",
+				LogQueryTemplate: "",
+				BetterstackID:    "",
 			},
 		},
 		Logs: LogsConfig{
+			QueryTemplate:  "",
 			Since:          "60m",
 			Limit:          500,
 			LevelThreshold: "debug",
@@ -383,7 +371,7 @@ func DefaultConfig() Config {
 		},
 		URLs: URLConfig{
 			GrafanaTraceTemplate:   "",
-			BetterstackLogTemplate: "https://telemetry.betterstack.com/team/t000000/tail?q={{trace_id}}&s={{betterstack_source_id}}&rf=now-60m",
+			BetterstackLogTemplate: "",
 		},
 		Output: OutputConfig{
 			TraceSummaryTemplate: DefaultTraceSummaryTemplate,

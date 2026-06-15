@@ -117,7 +117,11 @@ func (c *Client) FetchLogs(ctx context.Context, cfg config.Config, env config.En
 
 func (c *Client) FetchLogsWithPadding(ctx context.Context, cfg config.Config, env config.Environment, traceID string, traceStart, traceEnd time.Time, padding time.Duration) ([]domain.LogEntry, error) {
 	startedAt := time.Now()
-	query := strings.ReplaceAll(env.LogQueryTemplate, "{{trace_id}}", traceID)
+	queryTemplate := strings.TrimSpace(env.LogQueryTemplate)
+	if queryTemplate == "" {
+		queryTemplate = strings.TrimSpace(cfg.Logs.QueryTemplate)
+	}
+	query := strings.ReplaceAll(queryTemplate, "{{trace_id}}", traceID)
 	trimmedQuery := strings.TrimSpace(query)
 	usedFallbackQuery := false
 	if trimmedQuery == "" || strings.Contains(trimmedQuery, `{trace_id="`) {
