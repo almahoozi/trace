@@ -125,6 +125,48 @@ func diffAny(defaultValue, currentValue any) (any, bool) {
 		return out, true
 	}
 
+	defaultSlice, defaultIsSlice := defaultValue.([]any)
+	currentSlice, currentIsSlice := currentValue.([]any)
+	if defaultIsSlice && currentIsSlice {
+		if reflect.DeepEqual(defaultSlice, currentSlice) {
+			return nil, false
+		}
+
+		if len(currentSlice) == 0 {
+			return currentSlice, true
+		}
+
+		var defaultElem map[string]any
+		if len(defaultSlice) > 0 {
+			if m, ok := defaultSlice[0].(map[string]any); ok {
+				defaultElem = m
+			}
+		}
+
+		if defaultElem != nil {
+			trimmed := make([]any, 0, len(currentSlice))
+			for _, item := range currentSlice {
+				itemMap, ok := item.(map[string]any)
+				if !ok {
+					return currentSlice, true
+				}
+				diffed, include := diffAny(defaultElem, itemMap)
+				if !include {
+					trimmed = append(trimmed, map[string]any{})
+					continue
+				}
+				trimmedMap, ok := diffed.(map[string]any)
+				if !ok {
+					return currentSlice, true
+				}
+				trimmed = append(trimmed, trimmedMap)
+			}
+			return trimmed, true
+		}
+
+		return currentSlice, true
+	}
+
 	if reflect.DeepEqual(defaultValue, currentValue) {
 		return nil, false
 	}
