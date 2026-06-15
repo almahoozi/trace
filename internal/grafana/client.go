@@ -112,6 +112,10 @@ func (c *Client) SearchTraces(ctx context.Context, env config.Environment, query
 }
 
 func (c *Client) FetchLogs(ctx context.Context, cfg config.Config, env config.Environment, traceID string, traceStart, traceEnd time.Time) ([]domain.LogEntry, error) {
+	return c.FetchLogsWithPadding(ctx, cfg, env, traceID, traceStart, traceEnd, 0)
+}
+
+func (c *Client) FetchLogsWithPadding(ctx context.Context, cfg config.Config, env config.Environment, traceID string, traceStart, traceEnd time.Time, padding time.Duration) ([]domain.LogEntry, error) {
 	startedAt := time.Now()
 	query := strings.ReplaceAll(env.LogQueryTemplate, "{{trace_id}}", traceID)
 	trimmedQuery := strings.TrimSpace(query)
@@ -121,7 +125,7 @@ func (c *Client) FetchLogs(ctx context.Context, cfg config.Config, env config.En
 		usedFallbackQuery = true
 	}
 
-	start, end := lokiRange(cfg.Logs.Since, traceStart, traceEnd)
+	start, end := lokiRange(cfg.Logs.Since, traceStart, traceEnd, padding)
 	runlog.Debug(
 		"grafana fetch logs started",
 		"environment", env.Name,

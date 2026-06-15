@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -89,6 +90,14 @@ type Model struct {
 
 	programCreatedAt  time.Time
 	firstVisualLogged bool
+	loadLogs          func(context.Context) ([]domain.LogEntry, error)
+	onLogsReady       func(*domain.Session)
+	logsLoadErr       string
+}
+
+type logsLoadedMsg struct {
+	entries []domain.LogEntry
+	err     error
 }
 
 type valueView struct {
@@ -98,6 +107,14 @@ type valueView struct {
 }
 
 func NewModel(cfg config.Config, session *domain.Session, openURL func(string) error, saveSnapshot func(*domain.Session) (string, error)) Model {
+	return newModel(cfg, session, openURL, saveSnapshot, nil, nil)
+}
+
+func NewModelWithDeferredLogs(cfg config.Config, session *domain.Session, openURL func(string) error, saveSnapshot func(*domain.Session) (string, error), loadLogs func(context.Context) ([]domain.LogEntry, error), onLogsReady func(*domain.Session)) Model {
+	return newModel(cfg, session, openURL, saveSnapshot, loadLogs, onLogsReady)
+}
+
+func newModel(cfg config.Config, session *domain.Session, openURL func(string) error, saveSnapshot func(*domain.Session) (string, error), loadLogs func(context.Context) ([]domain.LogEntry, error), onLogsReady func(*domain.Session)) Model {
 	m := Model{
 		cfg:              cfg,
 		session:          session,
@@ -111,6 +128,8 @@ func NewModel(cfg config.Config, session *domain.Session, openURL func(string) e
 		allLogs:          session.Logs,
 		filteredLogs:     session.Logs,
 		status:           fmt.Sprintf("env=%s spans=%d logs=%d", session.Environment, len(session.Trace.Spans), len(session.Logs)),
+		loadLogs:         loadLogs,
+		onLogsReady:      onLogsReady,
 	}
 	if loc, err := cfg.DisplayLocation(); err == nil {
 		m.loc = loc
@@ -136,6 +155,9 @@ func NewModel(cfg config.Config, session *domain.Session, openURL func(string) e
 	m.initServiceColors()
 	m.levelThresholdIx = m.levelIndex(cfg.Logs.LevelThreshold)
 	m.applyLogThreshold()
+	if m.loadLogs != nil {
+		m.status = "trace loaded; fetching logs..."
+	}
 	return m
 }
 
@@ -167,11 +189,36 @@ func parseFocusPanel(raw string) panel {
 }
 
 func (m Model) Init() tea.Cmd {
-	return nil
+	if m.loadLogs == nil {
+		return nil
+	}
+	loader := m.loadLogs
+	return func() tea.Msg {
+		entries, err := loader(context.Background())
+		return logsLoadedMsg{entries: entries, err: err}
+	}
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case logsLoadedMsg:
+		if msg.err != nil {
+			m.status = "logs fetch failed: " + msg.err.Error()
+			m.logsLoadErr = msg.err.Error()
+			m.loadLogs = nil
+			return m, nil
+		}
+		m.session.Logs = msg.entries
+		m.allLogs = msg.entries
+		m.logCursor = 0
+		m.applyLogThreshold()
+		m.status = fmt.Sprintf("logs loaded (%d lines)", len(msg.entries))
+		m.logsLoadErr = ""
+		m.loadLogs = nil
+		if m.onLogsReady != nil {
+			m.onLogsReady(m.session)
+		}
+		return m, nil
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -1968,7 +2015,14 @@ func (m Model) logsView(height int) string {
 	}
 
 	if len(m.filteredLogs) == 0 {
-		b.WriteString("(no logs in current level filter)")
+		switch {
+		case m.loadLogs != nil:
+			b.WriteString("(loading logs...)")
+		case m.logsLoadErr != "":
+			b.WriteString("(logs unavailable; see status)")
+		default:
+			b.WriteString("(no logs in current level filter)")
+		}
 	}
 
 	return strings.TrimRight(b.String(), "\n")
