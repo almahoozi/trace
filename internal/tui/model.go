@@ -32,6 +32,7 @@ type traceLine struct {
 	Depth     int
 	Label     string
 	Kind      string
+	Proxy     bool
 	Service   string
 	HasKids   bool
 	Expanded  bool
@@ -1493,7 +1494,11 @@ func (m Model) traceView(height int) string {
 		if line.HasKids {
 			durationInfo += " [" + formatDurationDisplay(line.XCost) + "]"
 		}
-		left := fmt.Sprintf("%s%s%s%s%s %s [%s] %s %s", prefix, indent, toggle, errIcon, linkIcon, m.spanIcon(line.Kind), line.Service, line.Label, durationInfo)
+		proxyTag := ""
+		if line.Proxy {
+			proxyTag = " [P]"
+		}
+		left := fmt.Sprintf("%s%s%s%s%s %s%s [%s] %s %s", prefix, indent, toggle, errIcon, linkIcon, m.spanIcon(line.Kind), proxyTag, line.Service, line.Label, durationInfo)
 		left = truncate(left, contentWidth)
 		bar := m.timelineBar(line, barWidth)
 		serviceStyle := m.colorForService(line.Service)
@@ -2514,6 +2519,7 @@ func walk(span *domain.Span, depth int, expanded map[string]bool, out *[]traceLi
 		Depth:     depth,
 		Label:     span.Name,
 		Kind:      span.Kind,
+		Proxy:     isProxySpan(span),
 		Service:   span.Service,
 		HasKids:   len(span.Children) > 0,
 		Expanded:  expanded[span.ID],

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -162,6 +163,88 @@ func existingSnapshotPathCandidate(path string) string {
 		return path
 	}
 	return ""
+}
+
+func CleanupSnapshotCache(ctx context.Context, maxBytes, targetBytes int64) error {
+	if maxBytes <= 0 {
+		return nil
+	}
+	if targetBytes <= 0 {
+		targetBytes = maxBytes / 10
+	}
+	if targetBytes >= maxBytes {
+		targetBytes = maxBytes / 10
+	}
+	if targetBytes < 0 {
+		targetBytes = 0
+	}
+
+	dir, err := SnapshotCacheDir()
+	if err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	type cacheFile struct {
+		path    string
+		size    int64
+		modTime time.Time
+	}
+
+	files := make([]cacheFile, 0, len(entries))
+	totalSize := int64(0)
+	for _, entry := range entries {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if entry.IsDir() {
+			continue
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			continue
+		}
+		size := info.Size()
+		totalSize += size
+		files = append(files, cacheFile{
+			path:    filepath.Join(dir, entry.Name()),
+			size:    size,
+			modTime: info.ModTime(),
+		})
+	}
+
+	if totalSize <= maxBytes {
+		return nil
+	}
+
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].modTime.Before(files[j].modTime)
+	})
+
+	for _, file := range files {
+		if totalSize <= targetBytes {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if removeErr := os.Remove(file.path); removeErr != nil {
+			continue
+		}
+		totalSize -= file.size
+	}
+
+	return nil
 }
 
 func LoadSessionSnapshot(path string) (*domain.Session, error) {

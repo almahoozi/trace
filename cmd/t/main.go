@@ -93,6 +93,8 @@ func main() {
 
 	initRunLog(configPath)
 	defer runlog.Close()
+	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
+	defer cleanupCancel()
 	runlog.Info("cli args parsed", "argv", os.Args[1:], "show_version", showVersion, "arg_count", len(args))
 
 	if showVersion {
@@ -285,9 +287,16 @@ func main() {
 
 	if mode.isBrowse {
 		runlog.Info("browse mode started", "environment", mode.environment, "query", mode.query)
+		statusLabel := "fetching"
+		if strings.TrimSpace(mode.query) != "" {
+			statusLabel = "querying"
+		}
+		status := startProgressStatus(fmt.Sprintf("%s traces in %s", statusLabel, mode.environment))
+		defer status.Stop()
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Grafana.TimeoutSeconds+10)*time.Second)
 		items, err := fetcher.FetchTraceList(ctx, cfg, mode.environment, mode.query, 50)
 		cancel()
+		status.Stop()
 		if err != nil {
 			runlog.Error("failed to fetch trace list", "error", err, "environment", mode.environment)
 			fmt.Fprintf(os.Stderr, "failed to fetch trace list: %v\n", err)
@@ -306,7 +315,7 @@ func main() {
 					if err != nil {
 						return nil, err
 					}
-					if err := autoExportSnapshotOnOpen(cfg, session); err != nil {
+					if err := autoExportSnapshotOnOpen(cleanupCtx, cfg, session); err != nil {
 						runlog.Warn("auto-export snapshot failed", "error", err, "trace_id", traceID)
 					}
 					return session, nil
@@ -384,7 +393,7 @@ func main() {
 			return fetcher.FetchLogsForSession(logsCtx, cfg, session, logsPadding)
 		}
 		logsReady := func(updated *domain.Session) {
-			if err := autoExportSnapshotOnOpen(cfg, updated); err != nil {
+			if err := autoExportSnapshotOnOpen(cleanupCtx, cfg, updated); err != nil {
 				runlog.Warn("auto-export snapshot failed", "error", err, "trace_id", traceID)
 			}
 		}
@@ -475,7 +484,7 @@ func main() {
 		return fetcher.FetchLogsForSession(logsCtx, cfg, session, logsPadding)
 	}
 	logsReady := func(updated *domain.Session) {
-		if err := autoExportSnapshotOnOpen(cfg, updated); err != nil {
+		if err := autoExportSnapshotOnOpen(cleanupCtx, cfg, updated); err != nil {
 			runlog.Warn("auto-export snapshot failed", "error", err, "trace_id", traceID)
 		}
 	}
@@ -582,7 +591,12 @@ func defaultSnapshotSaver(session *domain.Session) (string, error) {
 	return path, nil
 }
 
-func autoExportSnapshotOnOpen(cfg config.Config, session *domain.Session) error {
+var snapshotCleanupState struct {
+	mu      sync.Mutex
+	running bool
+}
+
+func autoExportSnapshotOnOpen(ctx context.Context, cfg config.Config, session *domain.Session) error {
 	if !cfg.Cache.AutoExportOnOpen {
 		return nil
 	}
@@ -596,8 +610,33 @@ func autoExportSnapshotOnOpen(cfg config.Config, session *domain.Session) error 
 	if err := app.SaveSessionSnapshot(path, session); err != nil {
 		return err
 	}
+	startSnapshotCleanupWorker(ctx, cfg)
 	runlog.Info("auto-exported snapshot on open", "trace_id", session.Trace.TraceID, "snapshot_path", path)
 	return nil
+}
+
+func startSnapshotCleanupWorker(ctx context.Context, cfg config.Config) {
+	snapshotCleanupState.mu.Lock()
+	if snapshotCleanupState.running {
+		snapshotCleanupState.mu.Unlock()
+		return
+	}
+	snapshotCleanupState.running = true
+	snapshotCleanupState.mu.Unlock()
+
+	maxBytes := cfg.Cache.MaxSizeBytes()
+	targetBytes := cfg.Cache.CleanupTargetBytes()
+	go func() {
+		defer func() {
+			snapshotCleanupState.mu.Lock()
+			snapshotCleanupState.running = false
+			snapshotCleanupState.mu.Unlock()
+		}()
+		err := app.CleanupSnapshotCache(ctx, maxBytes, targetBytes)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			runlog.Warn("snapshot cache cleanup failed", "error", err)
+		}
+	}()
 }
 
 func initRunLog(configPath string) {
