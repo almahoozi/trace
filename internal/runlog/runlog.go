@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"sync"
+	"time"
 )
 
 var (
@@ -15,7 +17,14 @@ var (
 	logFile  *os.File
 	logPath  string
 	hasStart bool
+	timings  []timingEntry
+	runStart time.Time
 )
+
+type timingEntry struct {
+	operation string
+	duration  time.Duration
+}
 
 func Start(path string) error {
 	if path == "" {
@@ -39,6 +48,8 @@ func Start(path string) error {
 	handler := slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelDebug})
 	logger = slog.New(handler)
 	hasStart = true
+	timings = nil
+	runStart = time.Now()
 	logger.Info(
 		"run started",
 		"pid", os.Getpid(),
@@ -54,6 +65,7 @@ func Close() {
 	mu.Lock()
 	defer mu.Unlock()
 	if logFile != nil {
+		logTimingSummaryLocked()
 		if logger != nil && hasStart {
 			logger.Info("run finished", "pid", os.Getpid(), "log_path", logPath)
 		}
@@ -62,7 +74,84 @@ func Close() {
 		logger = nil
 		logPath = ""
 		hasStart = false
+		timings = nil
+		runStart = time.Time{}
 	}
+}
+
+func ObserveDuration(operation string, duration time.Duration) {
+	op := operation
+	if op == "" {
+		op = "unknown"
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if logger == nil {
+		return
+	}
+	timings = append(timings, timingEntry{operation: op, duration: duration})
+}
+
+func ObserveSinceRunStart(operation string) {
+	mu.RLock()
+	startedAt := runStart
+	mu.RUnlock()
+	if startedAt.IsZero() {
+		return
+	}
+	ObserveDuration(operation, time.Since(startedAt))
+}
+
+func logTimingSummaryLocked() {
+	if logger == nil {
+		return
+	}
+	logger.Info("timings summary begin")
+	if len(timings) == 0 {
+		logger.Info("timings summary empty")
+		logger.Info("timings summary end")
+		return
+	}
+
+	type agg struct {
+		count int
+		total time.Duration
+		max   time.Duration
+	}
+	aggs := map[string]agg{}
+	for _, sample := range timings {
+		current := aggs[sample.operation]
+		current.count++
+		current.total += sample.duration
+		if sample.duration > current.max {
+			current.max = sample.duration
+		}
+		aggs[sample.operation] = current
+	}
+
+	keys := make([]string, 0, len(aggs))
+	for key := range aggs {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		item := aggs[key]
+		avg := time.Duration(0)
+		if item.count > 0 {
+			avg = item.total / time.Duration(item.count)
+		}
+		logger.Info(
+			"timing",
+			"operation", key,
+			"count", item.count,
+			"total_ms", item.total.Milliseconds(),
+			"avg_ms", avg.Milliseconds(),
+			"max_ms", item.max.Milliseconds(),
+		)
+	}
+	logger.Info("timings summary end")
 }
 
 func Debug(msg string, args ...any) {
