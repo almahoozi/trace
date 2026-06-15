@@ -291,7 +291,14 @@ func main() {
 				mode.query,
 				items,
 				func(ctx context.Context, traceID string) (*domain.Session, error) {
-					return fetcher.FetchTraceSessionInEnvironment(ctx, cfg, mode.environment, traceID)
+					session, err := fetcher.FetchTraceSessionInEnvironment(ctx, cfg, mode.environment, traceID)
+					if err != nil {
+						return nil, err
+					}
+					if err := autoExportSnapshotOnOpen(cfg, session); err != nil {
+						runlog.Warn("auto-export snapshot failed", "error", err, "trace_id", traceID)
+					}
+					return session, nil
 				},
 				func(ctx context.Context) ([]domain.TraceListItem, error) {
 					return fetcher.FetchTraceList(ctx, cfg, mode.environment, mode.query, 50)
@@ -344,6 +351,9 @@ func main() {
 		spanCount = session.Trace.SpanCount
 	}
 	runlog.Info("trace session fetched", "trace_id", traceID, "environment", session.Environment, "log_count", len(session.Logs), "span_count", spanCount)
+	if err := autoExportSnapshotOnOpen(cfg, session); err != nil {
+		runlog.Warn("auto-export snapshot failed", "error", err, "trace_id", traceID)
+	}
 
 	program := tea.NewProgram(tui.NewModel(cfg, session, platform.OpenURL, defaultSnapshotSaver), tea.WithAltScreen())
 	if _, err := program.Run(); err != nil {
@@ -430,6 +440,24 @@ func defaultSnapshotSaver(session *domain.Session) (string, error) {
 		return "", err
 	}
 	return path, nil
+}
+
+func autoExportSnapshotOnOpen(cfg config.Config, session *domain.Session) error {
+	if !cfg.Cache.AutoExportOnOpen {
+		return nil
+	}
+	if session == nil || session.Trace == nil {
+		return nil
+	}
+	path, err := app.DefaultSnapshotPath(session.Trace.TraceID)
+	if err != nil {
+		return err
+	}
+	if err := app.SaveSessionSnapshot(path, session); err != nil {
+		return err
+	}
+	runlog.Info("auto-exported snapshot on open", "trace_id", session.Trace.TraceID, "snapshot_path", path)
+	return nil
 }
 
 func initRunLog(configPath string) {
