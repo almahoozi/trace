@@ -46,7 +46,33 @@ type AuthConfig struct {
 }
 
 type CacheConfig struct {
-	AutoExportOnOpen bool `json:"auto_export_on_open"`
+	AutoExportOnOpen  bool `json:"auto_export_on_open"`
+	MaxSizeMB         int  `json:"max_size_mb"`
+	CleanupTargetSize int  `json:"cleanup_target_size_mb"`
+}
+
+func (c CacheConfig) MaxSizeBytes() int64 {
+	maxMB := c.MaxSizeMB
+	if maxMB <= 0 {
+		maxMB = 100
+	}
+	return int64(maxMB) * 1024 * 1024
+}
+
+func (c CacheConfig) CleanupTargetBytes() int64 {
+	targetMB := c.CleanupTargetSize
+	if targetMB <= 0 {
+		targetMB = 10
+	}
+	target := int64(targetMB) * 1024 * 1024
+	max := c.MaxSizeBytes()
+	if target >= max {
+		if max > 1024*1024 {
+			return max - 1024*1024
+		}
+		return max / 2
+	}
+	return target
 }
 
 type Environment struct {
@@ -318,7 +344,9 @@ func DefaultConfig() Config {
 			TokenFile: "token",
 		},
 		Cache: CacheConfig{
-			AutoExportOnOpen: true,
+			AutoExportOnOpen:  true,
+			MaxSizeMB:         100,
+			CleanupTargetSize: 10,
 		},
 		Environments: []Environment{
 			{
