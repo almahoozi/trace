@@ -1,7 +1,7 @@
 # AGENTS
 
 ## Fastest reliable commands
-- Build binary (with embedded commit/ref/version): `make build` -> `./bin/trace` from `./cmd/t`.
+- Build binary: `make build` -> `./bin/trace` from `./cmd/t`.
 - Run locally with build metadata: `make run -- <trace-id>`.
 - Install CLI to `GOBIN`: `make install`.
 - Verify changes: `make test` (currently just `go test -v ./...`; no repo lint/typecheck configs or CI workflows found).

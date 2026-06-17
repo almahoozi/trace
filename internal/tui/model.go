@@ -2016,8 +2016,8 @@ func (m Model) logsView(height int) string {
 			prefix = "> "
 			rowStyle = tableRowCursorStyle
 		}
-		row := prefix + m.renderLogRow(entry, cols, widths)
-		b.WriteString(rowStyle.Render(row))
+		b.WriteString(rowStyle.Render(prefix))
+		b.WriteString(m.renderLogRow(entry, cols, widths, rowStyle))
 		b.WriteString("\n")
 	}
 
@@ -2169,12 +2169,38 @@ func (m Model) renderLogRowHeader(cols []logColumn, widths []int) string {
 	return strings.Join(parts, " | ")
 }
 
-func (m Model) renderLogRow(entry domain.LogEntry, cols []logColumn, widths []int) string {
-	parts := make([]string, 0, len(cols))
+func (m Model) renderLogRow(entry domain.LogEntry, cols []logColumn, widths []int, baseStyle lipgloss.Style) string {
+	var b strings.Builder
 	for i, col := range cols {
-		parts = append(parts, padRight(truncate(m.logFieldValue(entry, col.Field), widths[i]), widths[i]))
+		if i > 0 {
+			b.WriteString(baseStyle.Render(" | "))
+		}
+		value := padRight(truncate(m.logFieldValue(entry, col.Field), widths[i]), widths[i])
+		cellStyle := baseStyle
+		if strings.EqualFold(strings.TrimSpace(col.Field), "level") {
+			cellStyle = lipgloss.NewStyle().Inherit(baseStyle).Foreground(logLevelColor(entry.Level))
+		}
+		b.WriteString(cellStyle.Render(value))
 	}
-	return strings.Join(parts, " | ")
+	return b.String()
+}
+
+func logLevelColor(level string) lipgloss.Color {
+	normalized := strings.ToLower(strings.TrimSpace(level))
+	switch normalized {
+	case "fatal", "panic", "critical", "crit", "alert", "emerg", "emergency", "error", "err":
+		return lipgloss.Color("196")
+	case "warn", "warning":
+		return lipgloss.Color("214")
+	case "info", "information", "notice":
+		return lipgloss.Color("39")
+	case "debug":
+		return lipgloss.Color("111")
+	case "trace":
+		return lipgloss.Color("244")
+	default:
+		return lipgloss.Color("250")
+	}
 }
 
 func (m Model) logFieldValue(entry domain.LogEntry, field string) string {
