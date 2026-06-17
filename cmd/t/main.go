@@ -19,6 +19,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/almahoozi/trace/internal/app"
+	"github.com/almahoozi/trace/internal/buildinfo"
 	"github.com/almahoozi/trace/internal/config"
 	"github.com/almahoozi/trace/internal/domain"
 	"github.com/almahoozi/trace/internal/grafana"
@@ -26,12 +27,6 @@ import (
 	"github.com/almahoozi/trace/internal/runlog"
 	"github.com/almahoozi/trace/internal/secrets"
 	"github.com/almahoozi/trace/internal/tui"
-)
-
-var (
-	commit  string
-	ref     string
-	version string
 )
 
 func main() {
@@ -1045,10 +1040,11 @@ func (s *progressStatus) Stop() {
 }
 
 func printBuildInfo() {
-	if commit == "" && ref == "" && version == "" {
+	version := strings.TrimSpace(buildinfo.Current().Version)
+	if version == "" {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "build: %s %s %s\n", commit, ref, version)
+	fmt.Fprintln(os.Stdout, version)
 }
 
 func promptYesNo(prompt string) bool {
