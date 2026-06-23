@@ -76,11 +76,12 @@ func (c CacheConfig) CleanupTargetBytes() int64 {
 }
 
 type Environment struct {
-	Name             string `json:"name"`
-	TempoDatasource  string `json:"tempo_datasource_uid"`
-	LokiDatasource   string `json:"loki_datasource_uid"`
-	LogQueryTemplate string `json:"log_query_template"`
-	BetterstackID    string `json:"betterstack_source_id"`
+	Name             string   `json:"name"`
+	Aliases          []string `json:"aliases"`
+	TempoDatasource  string   `json:"tempo_datasource_uid"`
+	LokiDatasource   string   `json:"loki_datasource_uid"`
+	LogQueryTemplate string   `json:"log_query_template"`
+	BetterstackID    string   `json:"betterstack_source_id"`
 }
 
 type LogsConfig struct {
@@ -227,9 +228,28 @@ func (c Config) validate() error {
 	if len(c.Environments) == 0 {
 		return errors.New("at least one environment is required")
 	}
+	seen := make(map[string]string)
 	for _, env := range c.Environments {
-		if env.Name == "" || env.TempoDatasource == "" || env.LokiDatasource == "" {
+		name := strings.TrimSpace(env.Name)
+		if name == "" || strings.TrimSpace(env.TempoDatasource) == "" || strings.TrimSpace(env.LokiDatasource) == "" {
 			return fmt.Errorf("invalid environment %+v", env)
+		}
+		canonicalName := strings.ToLower(name)
+		if owner, ok := seen[canonicalName]; ok {
+			return fmt.Errorf("environment name/alias %q conflicts with %q", name, owner)
+		}
+		seen[canonicalName] = name
+
+		for _, alias := range env.Aliases {
+			trimmed := strings.TrimSpace(alias)
+			if trimmed == "" {
+				return fmt.Errorf("environment %q has empty alias", name)
+			}
+			canonicalAlias := strings.ToLower(trimmed)
+			if owner, ok := seen[canonicalAlias]; ok {
+				return fmt.Errorf("environment alias %q for %q conflicts with %q", trimmed, name, owner)
+			}
+			seen[canonicalAlias] = name
 		}
 	}
 	if _, err := c.DisplayLocation(); err != nil {
@@ -352,6 +372,7 @@ func DefaultConfig() Config {
 		Environments: []Environment{
 			{
 				Name:             "dev",
+				Aliases:          []string{},
 				TempoDatasource:  "tempo",
 				LokiDatasource:   "loki",
 				LogQueryTemplate: "",
