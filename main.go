@@ -721,6 +721,11 @@ func lookupEnvironment(cfg config.Config, candidate string) string {
 		if strings.EqualFold(strings.TrimSpace(env.Name), target) {
 			return env.Name
 		}
+		for _, alias := range env.Aliases {
+			if strings.EqualFold(strings.TrimSpace(alias), target) {
+				return env.Name
+			}
+		}
 	}
 	return ""
 }
