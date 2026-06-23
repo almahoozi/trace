@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -28,6 +29,8 @@ import (
 	"github.com/almahoozi/trace/internal/secrets"
 	"github.com/almahoozi/trace/internal/tui"
 )
+
+const upgradeInstallTarget = "github.com/almahoozi/trace/cmd/t@latest"
 
 func main() {
 	var (
@@ -94,6 +97,18 @@ func main() {
 		}
 		if err := platform.OpenInEditor(dir); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to open cache directory: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(args) >= 1 && args[0] == "upgrade" {
+		if len(args) > 1 {
+			fmt.Fprintf(os.Stderr, "invalid command\n")
+			printUsage()
+			os.Exit(1)
+		}
+		if err := runUpgrade(context.Background()); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to upgrade trace: %v\n", err)
 			os.Exit(1)
 		}
 		return
@@ -751,6 +766,16 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config import <file>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config diff <file>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] logs\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s upgrade\n", os.Args[0])
+}
+
+func runUpgrade(ctx context.Context) error {
+	fmt.Fprintf(os.Stdout, "> go install %s\n", upgradeInstallTarget)
+	cmd := exec.CommandContext(ctx, "go", "install", upgradeInstallTarget)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	return cmd.Run()
 }
 
 func loadConfigForOffline(configPath string) (config.Config, error) {
