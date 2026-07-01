@@ -37,15 +37,27 @@ func main() {
 		showVersion bool
 		configPath  string
 		forceFetch  bool
+		queryFlags  multiStringFlag
 	)
 
 	flag.BoolVar(&showVersion, "v", false, "print version information and exit")
 	flag.BoolVar(&showVersion, "version", false, "print version information and exit")
 	flag.BoolVar(&forceFetch, "f", false, "force operations (trace fetch bypass cache, config import skip prompt)")
 	flag.BoolVar(&forceFetch, "force", false, "force operations (trace fetch bypass cache, config import skip prompt)")
+	flag.Var(&queryFlags, "q", "query clause (repeatable); compiled into TraceQL when used with an environment")
+	flag.Var(&queryFlags, "query", "query clause (repeatable); compiled into TraceQL when used with an environment")
 	flag.StringVar(&configPath, "config", "", "config file path (defaults to platform config dir)")
 	flag.Parse()
 	args := flag.Args()
+	inlineQueryFlags, cleanedArgs, err := extractInlineQueryFlags(args)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid query flag usage: %v\n", err)
+		printUsage()
+		os.Exit(1)
+	}
+	args = cleanedArgs
+	queryClauses := append([]string{}, queryFlags.values...)
+	queryClauses = append(queryClauses, inlineQueryFlags...)
 	exportMessage := ""
 
 	if len(args) >= 1 && args[0] == "logs" {
@@ -386,7 +398,7 @@ func main() {
 	isExportMode := len(args) >= 1 && args[0] == "export"
 	mode := cliMode{}
 	if !isExportMode {
-		mode, err = resolveMode(args, cfg)
+		mode, err = resolveMode(args, cfg, queryClauses)
 		if err != nil {
 			runlog.Warn("invalid command arguments", "error", err, "argv", args)
 			fmt.Fprintf(os.Stderr, "%v\n", err)
@@ -496,28 +508,32 @@ func main() {
 
 	if mode.isBrowse {
 		runlog.Info("browse mode started", "environment", mode.environment, "query", mode.query)
-		statusLabel := "fetching"
-		if strings.TrimSpace(mode.query) != "" {
-			statusLabel = "querying"
+		items := []domain.TraceListItem{}
+		if !mode.openQueryBuilder {
+			statusLabel := "fetching"
+			if strings.TrimSpace(mode.query) != "" {
+				statusLabel = "querying"
+			}
+			status := startProgressStatus(fmt.Sprintf("%s traces in %s", statusLabel, mode.environment))
+			defer status.Stop()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Grafana.TimeoutSeconds+10)*time.Second)
+			items, err = fetcher.FetchTraceList(ctx, cfg, mode.environment, mode.query, 50)
+			cancel()
+			status.Stop()
+			if err != nil {
+				runlog.Error("failed to fetch trace list", "error", err, "environment", mode.environment)
+				fmt.Fprintf(os.Stderr, "failed to fetch trace list: %v\n", err)
+				os.Exit(1)
+			}
+			runlog.Info("browse list fetched", "environment", mode.environment, "trace_count", len(items))
 		}
-		status := startProgressStatus(fmt.Sprintf("%s traces in %s", statusLabel, mode.environment))
-		defer status.Stop()
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Grafana.TimeoutSeconds+10)*time.Second)
-		items, err := fetcher.FetchTraceList(ctx, cfg, mode.environment, mode.query, 50)
-		cancel()
-		status.Stop()
-		if err != nil {
-			runlog.Error("failed to fetch trace list", "error", err, "environment", mode.environment)
-			fmt.Fprintf(os.Stderr, "failed to fetch trace list: %v\n", err)
-			os.Exit(1)
-		}
-		runlog.Info("browse list fetched", "environment", mode.environment, "trace_count", len(items))
 
 		program := tea.NewProgram(
 			tui.NewBrowseModel(
 				cfg,
 				mode.environment,
 				mode.query,
+				mode.openQueryBuilder,
 				items,
 				func(ctx context.Context, traceID string) (*domain.Session, error) {
 					session, err := fetcher.FetchTraceSessionInEnvironment(ctx, cfg, mode.environment, traceID)
@@ -529,8 +545,8 @@ func main() {
 					}
 					return session, nil
 				},
-				func(ctx context.Context) ([]domain.TraceListItem, error) {
-					return fetcher.FetchTraceList(ctx, cfg, mode.environment, mode.query, 50)
+				func(ctx context.Context, query string) ([]domain.TraceListItem, error) {
+					return fetcher.FetchTraceList(ctx, cfg, mode.environment, query, 50)
 				},
 				platform.OpenURL,
 			),
@@ -716,31 +732,55 @@ func main() {
 }
 
 type cliMode struct {
-	isBrowse       bool
-	environment    string
-	query          string
-	traceID        string
-	traceInEnvOnly bool
+	isBrowse         bool
+	environment      string
+	query            string
+	openQueryBuilder bool
+	traceID          string
+	traceInEnvOnly   bool
 }
 
-func resolveMode(args []string, cfg config.Config) (cliMode, error) {
+func resolveMode(args []string, cfg config.Config, queryClauses []string) (cliMode, error) {
 	if len(args) == 0 {
 		return cliMode{}, fmt.Errorf("missing command arguments")
 	}
 
 	if env := lookupEnvironment(cfg, args[0]); env != "" {
+		if len(queryClauses) > 0 && len(args) == 2 && strings.TrimSpace(args[1]) == "?" {
+			return cliMode{}, fmt.Errorf("cannot combine ? with -q/--query")
+		}
 		if len(args) == 2 && looksLikeTraceID(args[1]) {
+			if len(queryClauses) > 0 {
+				return cliMode{}, fmt.Errorf("-q/--query can only be used in browse mode")
+			}
 			return cliMode{
 				environment:    env,
 				traceID:        strings.TrimSpace(args[1]),
 				traceInEnvOnly: true,
 			}, nil
 		}
+
+		positionalQuery := strings.TrimSpace(strings.Join(args[1:], " "))
+		if len(queryClauses) > 0 && positionalQuery != "" {
+			return cliMode{}, fmt.Errorf("cannot combine positional query with -q/--query")
+		}
+		if positionalQuery == "?" {
+			positionalQuery = ""
+		}
+		query := positionalQuery
+		if len(queryClauses) > 0 {
+			query = compileTraceQLFromClauses(queryClauses)
+		}
 		return cliMode{
-			isBrowse:    true,
-			environment: env,
-			query:       strings.TrimSpace(strings.Join(args[1:], " ")),
+			isBrowse:         true,
+			environment:      env,
+			query:            query,
+			openQueryBuilder: len(args) == 2 && strings.TrimSpace(args[1]) == "?",
 		}, nil
+	}
+
+	if len(queryClauses) > 0 {
+		return cliMode{}, fmt.Errorf("-q/--query requires an environment argument")
 	}
 
 	if len(args) == 1 {
@@ -776,6 +816,8 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "       %s version\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [-f|--force] [--config path] <trace-id>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [-f|--force] [--config path] <env> <trace-id>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--config path] <env> ?\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--config path] <env> -q/--query <clause> [-q/--query <clause> ...]\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] <env> [query]\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] export <trace-id> [file]\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] open <file>\n", os.Args[0])
@@ -788,6 +830,81 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config diff <file>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] logs\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s upgrade\n", os.Args[0])
+}
+
+type multiStringFlag struct {
+	values []string
+}
+
+func (f *multiStringFlag) String() string {
+	if f == nil {
+		return ""
+	}
+	return strings.Join(f.values, ",")
+}
+
+func (f *multiStringFlag) Set(value string) error {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return fmt.Errorf("empty query clause")
+	}
+	f.values = append(f.values, trimmed)
+	return nil
+}
+
+func extractInlineQueryFlags(args []string) ([]string, []string, error) {
+	clauses := []string{}
+	cleaned := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := strings.TrimSpace(args[i])
+		switch {
+		case arg == "-q" || arg == "--query":
+			if i+1 >= len(args) {
+				return nil, nil, fmt.Errorf("%s requires a value", arg)
+			}
+			next := strings.TrimSpace(args[i+1])
+			if next == "" {
+				return nil, nil, fmt.Errorf("%s requires a non-empty value", arg)
+			}
+			clauses = append(clauses, next)
+			i++
+		case strings.HasPrefix(arg, "-q="):
+			value := strings.TrimSpace(strings.TrimPrefix(arg, "-q="))
+			if value == "" {
+				return nil, nil, fmt.Errorf("-q requires a non-empty value")
+			}
+			clauses = append(clauses, value)
+		case strings.HasPrefix(arg, "--query="):
+			value := strings.TrimSpace(strings.TrimPrefix(arg, "--query="))
+			if value == "" {
+				return nil, nil, fmt.Errorf("--query requires a non-empty value")
+			}
+			clauses = append(clauses, value)
+		default:
+			cleaned = append(cleaned, args[i])
+		}
+	}
+	return clauses, cleaned, nil
+}
+
+func compileTraceQLFromClauses(clauses []string) string {
+	parts := make([]string, 0, len(clauses))
+	for _, clause := range clauses {
+		trimmed := strings.TrimSpace(clause)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}") {
+			trimmed = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(trimmed, "{"), "}"))
+		}
+		if trimmed != "" {
+			parts = append(parts, trimmed)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "{" + strings.Join(parts, " && ") + "}"
 }
 
 func runUpgrade(ctx context.Context) error {
