@@ -27,6 +27,7 @@ import (
 	"github.com/almahoozi/trace/internal/platform"
 	"github.com/almahoozi/trace/internal/runlog"
 	"github.com/almahoozi/trace/internal/secrets"
+	"github.com/almahoozi/trace/internal/traceql"
 	"github.com/almahoozi/trace/internal/tui"
 )
 
@@ -488,6 +489,16 @@ func main() {
 
 	if mode.isBrowse {
 		runlog.Info("browse mode started", "environment", mode.environment, "query", mode.query)
+		environmentNames := orderedEnvironmentNames(cfg.Environments)
+		queryFields := []string{}
+		fieldsCtx, fieldsCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		if tags, tagsErr := fetcher.FetchTraceQueryFields(fieldsCtx, cfg, mode.environment); tagsErr == nil {
+			queryFields = tags
+		} else {
+			runlog.Debug("failed to fetch trace query fields", "environment", mode.environment, "error", tagsErr)
+		}
+		fieldsCancel()
+
 		items := []domain.TraceListItem{}
 		if !mode.openQueryBuilder {
 			statusLabel := "fetching"
@@ -514,9 +525,11 @@ func main() {
 				mode.environment,
 				mode.query,
 				mode.openQueryBuilder,
+				environmentNames,
+				queryFields,
 				items,
-				func(ctx context.Context, traceID string) (*domain.Session, error) {
-					session, err := fetcher.FetchTraceSessionInEnvironment(ctx, cfg, mode.environment, traceID)
+				func(ctx context.Context, environment, traceID string) (*domain.Session, error) {
+					session, err := fetcher.FetchTraceSessionInEnvironment(ctx, cfg, environment, traceID)
 					if err != nil {
 						return nil, err
 					}
@@ -525,8 +538,8 @@ func main() {
 					}
 					return session, nil
 				},
-				func(ctx context.Context, query string) ([]domain.TraceListItem, error) {
-					return fetcher.FetchTraceList(ctx, cfg, mode.environment, query, 50)
+				func(ctx context.Context, environment, query string) ([]domain.TraceListItem, error) {
+					return fetcher.FetchTraceList(ctx, cfg, environment, query, 50)
 				},
 				platform.OpenURL,
 			),
@@ -724,10 +737,20 @@ func resolveMode(args []string, cfg config.Config, queryClauses []string) (cliMo
 	if len(args) == 0 {
 		return cliMode{}, fmt.Errorf("missing command arguments")
 	}
+	if len(args) == 1 && isQueryBuilderToken(args[0]) {
+		envName := ""
+		if len(cfg.Environments) > 0 {
+			envName = strings.TrimSpace(cfg.Environments[0].Name)
+		}
+		if envName == "" {
+			return cliMode{}, fmt.Errorf("no environments configured")
+		}
+		return cliMode{isBrowse: true, environment: envName, openQueryBuilder: true}, nil
+	}
 
 	if env := lookupEnvironment(cfg, args[0]); env != "" {
-		if len(queryClauses) > 0 && len(args) == 2 && strings.TrimSpace(args[1]) == "?" {
-			return cliMode{}, fmt.Errorf("cannot combine ? with -q/--query")
+		if len(queryClauses) > 0 && len(args) == 2 && isQueryBuilderToken(args[1]) {
+			return cliMode{}, fmt.Errorf("cannot combine query-builder positional arg with -q/--query")
 		}
 		if len(args) == 2 && looksLikeTraceID(args[1]) {
 			if len(queryClauses) > 0 {
@@ -744,18 +767,18 @@ func resolveMode(args []string, cfg config.Config, queryClauses []string) (cliMo
 		if len(queryClauses) > 0 && positionalQuery != "" {
 			return cliMode{}, fmt.Errorf("cannot combine positional query with -q/--query")
 		}
-		if positionalQuery == "?" {
+		if isQueryBuilderToken(positionalQuery) {
 			positionalQuery = ""
 		}
 		query := positionalQuery
 		if len(queryClauses) > 0 {
-			query = compileTraceQLFromClauses(queryClauses)
+			query = traceql.CompileClauses(queryClauses)
 		}
 		return cliMode{
 			isBrowse:         true,
 			environment:      env,
 			query:            query,
-			openQueryBuilder: len(args) == 2 && strings.TrimSpace(args[1]) == "?",
+			openQueryBuilder: len(args) == 2 && isQueryBuilderToken(args[1]),
 		}, nil
 	}
 
@@ -795,7 +818,8 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "usage: %s [-v|--version] [--config path] <trace-id>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [-f|--force] [--config path] <trace-id>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [-f|--force] [--config path] <env> <trace-id>\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "       %s [--config path] <env> ?\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--config path] q|query\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--config path] <env> q|query\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] <env> -q/--query <clause> [-q/--query <clause> ...]\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] <env> [query]\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] export <trace-id> [file]\n", os.Args[0])
@@ -866,24 +890,9 @@ func extractInlineQueryFlags(args []string) ([]string, []string, error) {
 	return clauses, cleaned, nil
 }
 
-func compileTraceQLFromClauses(clauses []string) string {
-	parts := make([]string, 0, len(clauses))
-	for _, clause := range clauses {
-		trimmed := strings.TrimSpace(clause)
-		if trimmed == "" {
-			continue
-		}
-		if strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}") {
-			trimmed = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(trimmed, "{"), "}"))
-		}
-		if trimmed != "" {
-			parts = append(parts, trimmed)
-		}
-	}
-	if len(parts) == 0 {
-		return ""
-	}
-	return "{" + strings.Join(parts, " && ") + "}"
+func isQueryBuilderToken(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	return strings.EqualFold(trimmed, "q") || strings.EqualFold(trimmed, "query")
 }
 
 func runUpgrade(ctx context.Context) error {

@@ -94,6 +94,10 @@ func (c *Client) SearchTraces(ctx context.Context, env config.Environment, query
 	}
 	if statusCode >= 400 {
 		runlog.Warn("grafana search traces bad status", "environment", env.Name, "status_code", statusCode)
+		detail := extractErrorDetail(body)
+		if detail != "" {
+			return nil, fmt.Errorf("search traces failed with status %d: %s", statusCode, detail)
+		}
 		return nil, fmt.Errorf("search traces failed with status %d", statusCode)
 	}
 
@@ -109,6 +113,32 @@ func (c *Client) SearchTraces(ctx context.Context, env config.Environment, query
 	}
 	runlog.Info("grafana search traces succeeded", "environment", env.Name, "trace_count", len(items), "limit", limit)
 	return items, nil
+}
+
+func (c *Client) SearchTraceTags(ctx context.Context, env config.Environment, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 5000
+	}
+	u := fmt.Sprintf("%s/api/datasources/uid/%s/resources/tags?limit=%d", c.baseURL, url.PathEscape(env.TempoDatasource), limit)
+	body, statusCode, err := c.get(ctx, u)
+	if err != nil {
+		runlog.Warn("grafana search trace tags request failed", "environment", env.Name, "error", err)
+		return nil, err
+	}
+	if statusCode >= 400 {
+		runlog.Warn("grafana search trace tags bad status", "environment", env.Name, "status_code", statusCode)
+		return nil, fmt.Errorf("search trace tags failed with status %d", statusCode)
+	}
+
+	tags, err := parseTraceSearchTagsPayload(body)
+	if err != nil {
+		dumpPath, dumpErr := dumpJSON("trace-tags-payload-", body)
+		if dumpErr != nil {
+			return nil, fmt.Errorf("%w (also failed to dump payload: %v)", err, dumpErr)
+		}
+		return nil, fmt.Errorf("%w (payload dumped at %s)", err, dumpPath)
+	}
+	return tags, nil
 }
 
 func (c *Client) FetchLogs(ctx context.Context, cfg config.Config, env config.Environment, traceID string, traceStart, traceEnd time.Time) ([]domain.LogEntry, error) {
@@ -246,4 +276,28 @@ func dumpJSON(prefix string, body []byte) (string, error) {
 		return "", err
 	}
 	return f.Name(), nil
+}
+
+func extractErrorDetail(body []byte) string {
+	trimmedBody := strings.TrimSpace(string(body))
+	if trimmedBody == "" {
+		return ""
+	}
+
+	var payload map[string]any
+	if json.Unmarshal(body, &payload) == nil {
+		for _, key := range []string{"message", "error", "detail", "description"} {
+			if value, ok := payload[key]; ok {
+				text := strings.TrimSpace(fmt.Sprint(value))
+				if text != "" {
+					return text
+				}
+			}
+		}
+	}
+
+	if len(trimmedBody) > 300 {
+		return trimmedBody[:300] + "..."
+	}
+	return trimmedBody
 }

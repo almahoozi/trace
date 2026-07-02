@@ -12,32 +12,39 @@ import (
 	"github.com/almahoozi/trace/internal/domain"
 )
 
-type fetchSessionFunc func(context.Context, string) (*domain.Session, error)
-type fetchListFunc func(context.Context, string) ([]domain.TraceListItem, error)
+type fetchSessionFunc func(context.Context, string, string) (*domain.Session, error)
+type fetchListFunc func(context.Context, string, string) ([]domain.TraceListItem, error)
 
 type BrowseModel struct {
 	cfg          config.Config
 	loc          *time.Location
 	environment  string
+	environments []string
 	query        string
+	queryFields  []string
 	items        []domain.TraceListItem
 	filtered     []domain.TraceListItem
 	fetchSession fetchSessionFunc
 	fetchList    fetchListFunc
 	openURL      func(string) error
 
-	width        int
-	height       int
-	hOffset      int
-	cursor       int
-	loadingTrace bool
-	loadingList  bool
-	searchRaw    string
-	search       *searchPrompt
-	searchMatch  *searchMatcher
-	queryBuilder *queryBuilder
-	pendingGG    bool
-	status       string
+	width         int
+	height        int
+	hOffset       int
+	cursor        int
+	loadingTrace  bool
+	loadingList   bool
+	searchRaw     string
+	search        *searchPrompt
+	searchMatch   *searchMatcher
+	queryBuilder  *queryBuilder
+	querySince    time.Duration
+	queryStartAt  time.Time
+	queryEndAt    time.Time
+	hasQueryStart bool
+	hasQueryEnd   bool
+	pendingGG     bool
+	status        string
 
 	configView  *ConfigModel
 	viewer      *Model
@@ -56,7 +63,7 @@ type browseReloadResultMsg struct {
 	err   error
 }
 
-func NewBrowseModel(cfg config.Config, envName, query string, openQueryBuilder bool, items []domain.TraceListItem, fetchSession fetchSessionFunc, fetchList fetchListFunc, openURL func(string) error) BrowseModel {
+func NewBrowseModel(cfg config.Config, envName, query string, openQueryBuilder bool, environments []string, queryFields []string, items []domain.TraceListItem, fetchSession fetchSessionFunc, fetchList fetchListFunc, openURL func(string) error) BrowseModel {
 	status := fmt.Sprintf("env=%s traces=%d", envName, len(items))
 	if strings.TrimSpace(query) != "" {
 		status = fmt.Sprintf("env=%s query=%q traces=%d", envName, query, len(items))
@@ -69,16 +76,22 @@ func NewBrowseModel(cfg config.Config, envName, query string, openQueryBuilder b
 		cfg:          cfg,
 		loc:          loc,
 		environment:  envName,
+		environments: append([]string{}, environments...),
 		query:        query,
+		queryFields:  queryFields,
 		items:        items,
 		filtered:     items,
 		fetchSession: fetchSession,
 		fetchList:    fetchList,
 		openURL:      openURL,
+		querySince:   parseBrowseSince(cfg.Logs.Since),
 		status:       status,
 	}
+	b.items = filterTraceItemsByWindow(items, b.querySince, b.queryStartAt, b.queryEndAt, b.hasQueryStart, b.hasQueryEnd, time.Now())
+	b.filtered = b.items
 	if openQueryBuilder {
-		b.queryBuilder = newQueryBuilder(query)
+		b.queryBuilder = newQueryBuilder(query, b.availableQueryFields(), b.environments, b.environment, b.querySince, b.queryStartAt, b.queryEndAt, b.hasQueryStart, b.hasQueryEnd)
+		b.queryBuilder.SetSize(b.width, b.height)
 		b.status = "query builder: edit clauses and press enter"
 	}
 	return b
@@ -131,13 +144,14 @@ func (m BrowseModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	if m.queryBuilder != nil {
-		if keyMsg, ok := msg.(tea.KeyMsg); ok {
-			if m.isGlobalAction("quit", keyMsg.String()) {
-				return m, tea.Quit
-			}
-			return m.updateQueryBuilder(keyMsg)
+		if sizeMsg, ok := msg.(tea.WindowSizeMsg); ok {
+			m.width = sizeMsg.Width
+			m.height = sizeMsg.Height
+			m.hOffset = min(m.hOffset, m.maxHorizontalOffset())
+			m.queryBuilder.SetSize(m.width, m.height)
+			return m, nil
 		}
-		return m, nil
+		return m.updateQueryBuilder(msg)
 	}
 
 	if m.search != nil {
@@ -177,7 +191,7 @@ func (m BrowseModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.query = msg.query
-		m.items = msg.items
+		m.items = filterTraceItemsByWindow(msg.items, m.querySince, m.queryStartAt, m.queryEndAt, m.hasQueryStart, m.hasQueryEnd, time.Now())
 		m.applySearchFilter()
 		if strings.TrimSpace(m.query) != "" {
 			m.status = fmt.Sprintf("reloaded %d traces for query %q", len(m.items), m.query)
@@ -196,7 +210,8 @@ func (m BrowseModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if key == ":" {
-			m.queryBuilder = newQueryBuilder(m.query)
+			m.queryBuilder = newQueryBuilder(m.query, m.availableQueryFields(), m.environments, m.environment, m.querySince, m.queryStartAt, m.queryEndAt, m.hasQueryStart, m.hasQueryEnd)
+			m.queryBuilder.SetSize(m.width, m.height)
 			m.status = "query builder: edit clauses and press enter"
 			return m, nil
 		}
@@ -228,7 +243,7 @@ func (m BrowseModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !m.loadingList && (strings.EqualFold(key, "r") || strings.EqualFold(key, "ctrl+r")) {
 			m.loadingList = true
 			m.status = "reloading trace list"
-			return m, m.reloadListCmd(m.query)
+			return m, m.reloadListCmd(m.environment, m.query)
 		}
 		if m.isMoveUp(key) && m.cursor > 0 {
 			m.cursor--
@@ -274,6 +289,9 @@ func (m BrowseModel) View() string {
 	}
 	if m.configView != nil {
 		return m.configView.View()
+	}
+	if m.queryBuilder != nil {
+		return m.viewQueryBuilderOnly()
 	}
 	if m.width == 0 || m.height == 0 {
 		return "loading..."
@@ -334,7 +352,11 @@ func (m BrowseModel) View() string {
 	}
 
 	if len(m.filtered) == 0 {
-		b.WriteString("(no traces found)\n")
+		if m.loadingList {
+			b.WriteString("(querying traces...)\n")
+		} else {
+			b.WriteString("(no traces found)\n")
+		}
 	}
 
 	footer := m.status + " | : query builder | / search | n/N next/prev | gg/G top/bottom | <-/-> or h/l scroll | enter open | F2 config | esc back from trace | ctrl+f/b page | ctrl+d/u half page | r reload | q quit"
@@ -344,14 +366,30 @@ func (m BrowseModel) View() string {
 	if m.loadingList {
 		footer = "reloading trace list..."
 	}
-	if m.search != nil {
-		footer += "\n" + m.search.viewLine() + "\n" + searchHint()
-	}
-	if m.queryBuilder != nil {
-		footer += "\n" + m.queryBuilder.View(m.width)
-	}
 	b.WriteString(mutedStyle.Render(footer))
+	if m.search != nil {
+		b.WriteString("\n")
+		b.WriteString(mutedStyle.Render(m.search.viewLine()))
+		b.WriteString("\n")
+		b.WriteString(mutedStyle.Render(searchHint()))
+	}
 
+	return clampToHeight(b.String(), m.height)
+}
+
+func (m BrowseModel) viewQueryBuilderOnly() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("trace query builder"))
+	b.WriteString("\n")
+	b.WriteString(mutedStyle.Render(fmt.Sprintf("env=%s traces=%d", m.environment, len(m.items))))
+	if strings.TrimSpace(m.query) != "" {
+		b.WriteString("\n")
+		b.WriteString(mutedStyle.Render(fmt.Sprintf("active query=%q", m.query)))
+	}
+	b.WriteString("\n\n")
+	b.WriteString(m.queryBuilder.View(m.width))
+	b.WriteString("\n\n")
+	b.WriteString(mutedStyle.Render(m.status))
 	return clampToHeight(b.String(), m.height)
 }
 
@@ -574,45 +612,140 @@ func (m BrowseModel) loadSessionCmd(traceID string) tea.Cmd {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(m.cfg.Grafana.TimeoutSeconds+10)*time.Second)
 		defer cancel()
-		session, err := m.fetchSession(ctx, traceID)
+		session, err := m.fetchSession(ctx, m.environment, traceID)
 		return browseLoadResultMsg{traceID: traceID, session: session, err: err}
 	}
 }
 
-func (m BrowseModel) reloadListCmd(query string) tea.Cmd {
+func (m BrowseModel) reloadListCmd(environment, query string) tea.Cmd {
 	return func() tea.Msg {
 		if m.fetchList == nil {
 			return browseReloadResultMsg{err: fmt.Errorf("trace list fetcher not configured")}
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(m.cfg.Grafana.TimeoutSeconds+10)*time.Second)
 		defer cancel()
-		items, err := m.fetchList(ctx, query)
+		items, err := m.fetchList(ctx, environment, query)
 		return browseReloadResultMsg{query: query, items: items, err: err}
 	}
 }
 
-func (m BrowseModel) updateQueryBuilder(keyMsg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m BrowseModel) updateQueryBuilder(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.queryBuilder == nil {
 		return m, nil
 	}
-	query, apply, cancel := m.queryBuilder.Update(keyMsg)
-	if cancel {
+	result := m.queryBuilder.Update(msg)
+	if result.Quit {
+		return m, tea.Quit
+	}
+	m.querySince = result.Since
+	if env := strings.TrimSpace(result.Environment); env != "" {
+		m.environment = env
+	}
+	m.queryStartAt = result.StartAt
+	m.queryEndAt = result.EndAt
+	m.hasQueryStart = result.HasStartAt
+	m.hasQueryEnd = result.HasEndAt
+	if result.Cancel {
 		m.queryBuilder = nil
 		m.status = "query builder cancelled"
-		return m, nil
+		return m, result.Cmd
 	}
-	if !apply {
-		return m, nil
+	if !result.Apply {
+		return m, result.Cmd
 	}
 	m.queryBuilder = nil
 	m.loadingList = true
-	m.query = query
-	if strings.TrimSpace(query) == "" {
+	m.query = result.Query
+	if strings.TrimSpace(result.Query) == "" {
 		m.status = "reloading trace list"
 	} else {
-		m.status = fmt.Sprintf("querying traces with %q", query)
+		m.status = fmt.Sprintf("querying traces in %s with %q", m.environment, result.Query)
 	}
-	return m, m.reloadListCmd(query)
+	return m, tea.Batch(result.Cmd, m.reloadListCmd(m.environment, result.Query))
+}
+
+func (m BrowseModel) availableQueryFields() []string {
+	fields := []string{"name", "service.name", "status.code", "duration"}
+	seen := map[string]bool{}
+	for _, f := range fields {
+		seen[strings.ToLower(strings.TrimSpace(f))] = true
+	}
+	for _, field := range m.queryFields {
+		trimmed := strings.TrimSpace(field)
+		if trimmed == "" {
+			continue
+		}
+		key := strings.ToLower(trimmed)
+		if seen[key] {
+			continue
+		}
+		fields = append(fields, trimmed)
+		seen[key] = true
+	}
+	for _, item := range m.items {
+		if strings.TrimSpace(item.OperationName) != "" {
+			if !seen["operation"] {
+				fields = append(fields, "operation")
+				seen["operation"] = true
+			}
+			if !seen["name"] {
+				fields = append(fields, "name")
+				seen["name"] = true
+			}
+		}
+		if strings.TrimSpace(item.Service) != "" && !seen["service.name"] {
+			fields = append(fields, "service.name")
+			seen["service.name"] = true
+		}
+		if item.Duration > 0 && !seen["duration"] {
+			fields = append(fields, "duration")
+			seen["duration"] = true
+		}
+	}
+	return fields
+}
+
+func parseBrowseSince(raw string) time.Duration {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(trimmed)
+	if err != nil {
+		return 0
+	}
+	if d < 0 {
+		d = -d
+	}
+	return d
+}
+
+func filterTraceItemsByWindow(items []domain.TraceListItem, since time.Duration, startAt, endAt time.Time, hasStartAt, hasEndAt bool, now time.Time) []domain.TraceListItem {
+	if since <= 0 && !hasStartAt && !hasEndAt {
+		return items
+	}
+	cutoff := time.Time{}
+	if since > 0 {
+		cutoff = now.Add(-since)
+	}
+	filtered := make([]domain.TraceListItem, 0, len(items))
+	for _, item := range items {
+		if item.StartTime.IsZero() {
+			filtered = append(filtered, item)
+			continue
+		}
+		if !cutoff.IsZero() && item.StartTime.Before(cutoff) {
+			continue
+		}
+		if hasStartAt && item.StartTime.Before(startAt) {
+			continue
+		}
+		if hasEndAt && item.StartTime.After(endAt) {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
 }
 
 func formatBrowseDuration(d time.Duration) string {
