@@ -126,6 +126,14 @@ func main() {
 		}
 		return
 	}
+	if len(args) >= 1 && args[0] == "version" {
+		if len(args) > 1 {
+			fmt.Fprintf(os.Stderr, "invalid command\n")
+			printUsage()
+			os.Exit(1)
+		}
+		showVersion = true
+	}
 
 	initRunLog(configPath)
 	defer runlog.Close()
@@ -816,6 +824,7 @@ func looksLikeTraceID(value string) bool {
 
 func printUsage() {
 	fmt.Fprintf(os.Stderr, "usage: %s [-v|--version] [--config path] <trace-id>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s version\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [-f|--force] [--config path] <trace-id>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [-f|--force] [--config path] <env> <trace-id>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] q|query\n", os.Args[0])
