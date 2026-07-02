@@ -316,6 +316,13 @@ func (b *queryBuilder) updateTable(msg tea.Msg) queryBuilderResult {
 	case "g":
 		b.startGlobalForm()
 		return queryBuilderResult{Cmd: b.globalForm.Init()}
+	case "o":
+		if b.tableDisabled {
+			return queryBuilderResult{}
+		}
+		b.row = len(b.rows)
+		b.startRowForm()
+		return queryBuilderResult{Cmd: b.rowForm.Init()}
 	case "ctrl+r", "ctrl+enter", "ctrl+j":
 		res := b.snapshotResult()
 		res.Apply = true
@@ -354,6 +361,9 @@ func (b *queryBuilder) updateRowForm(msg tea.Msg) queryBuilderResult {
 	result := queryBuilderResult{Cmd: cmd}
 	if wantCustom := b.rowField == customFieldOptionValue; wantCustom != b.rowFormHasCustom {
 		b.rebuildRowForm()
+		if wantCustom {
+			return queryBuilderResult{Cmd: tea.Batch(b.rowForm.Init(), focusNextFieldCmd())}
+		}
 		return queryBuilderResult{Cmd: b.rowForm.Init()}
 	}
 	if b.rowForm.State == huh.StateAborted {
@@ -832,6 +842,12 @@ func commonDateSuggestions() []string {
 		now.Add(-time.Hour).Format(time.RFC3339),
 		now.Add(-24 * time.Hour).Format(time.RFC3339),
 		time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).Format(time.RFC3339),
+	}
+}
+
+func focusNextFieldCmd() tea.Cmd {
+	return func() tea.Msg {
+		return tea.KeyMsg{Type: tea.KeyTab}
 	}
 }
 
