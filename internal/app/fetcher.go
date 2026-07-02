@@ -471,6 +471,14 @@ func (f *Fetcher) FetchTraceList(ctx context.Context, cfg config.Config, envName
 	return enriched, nil
 }
 
+func (f *Fetcher) FetchTraceQueryFields(ctx context.Context, cfg config.Config, envName string) ([]string, error) {
+	env, ok := findEnvironment(cfg, envName)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrEnvironmentNotFound, envName)
+	}
+	return f.client.SearchTraceTags(ctx, env, 5000)
+}
+
 func findEnvironment(cfg config.Config, name string) (config.Environment, bool) {
 	target := strings.TrimSpace(name)
 	for _, env := range cfg.Environments {
