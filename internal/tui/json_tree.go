@@ -17,11 +17,13 @@ type jsonLine struct {
 }
 
 type JSONTree struct {
-	title    string
-	root     any
-	expanded map[string]bool
-	lines    []jsonLine
-	cursor   int
+	title     string
+	root      any
+	expanded  map[string]bool
+	lines     []jsonLine
+	cursor    int
+	scrollTop int
+	viewRows  int
 }
 
 type RootEntry struct {
@@ -69,12 +71,14 @@ func (j *JSONTree) MoveUp() {
 	if j.cursor > 0 {
 		j.cursor--
 	}
+	j.ensureCursorVisible(-1, j.visibleRows())
 }
 
 func (j *JSONTree) MoveDown() {
 	if j.cursor < len(j.lines)-1 {
 		j.cursor++
 	}
+	j.ensureCursorVisible(1, j.visibleRows())
 }
 
 func (j *JSONTree) Expand() {
@@ -86,6 +90,7 @@ func (j *JSONTree) Expand() {
 		j.expanded[line.Path] = true
 		j.rebuild()
 	}
+	j.ensureCursorVisible(0, j.visibleRows())
 }
 
 func (j *JSONTree) Collapse() {
@@ -96,6 +101,7 @@ func (j *JSONTree) Collapse() {
 	if line.Collapsable && line.Expanded {
 		j.expanded[line.Path] = false
 		j.rebuild()
+		j.ensureCursorVisible(0, j.visibleRows())
 		return
 	}
 	if line.Path != "$" {
@@ -103,10 +109,12 @@ func (j *JSONTree) Collapse() {
 		for i := range j.lines {
 			if j.lines[i].Path == parent {
 				j.cursor = i
+				j.ensureCursorVisible(-1, j.visibleRows())
 				return
 			}
 		}
 	}
+	j.ensureCursorVisible(0, j.visibleRows())
 }
 
 func (j *JSONTree) Toggle() {
@@ -123,6 +131,7 @@ func (j *JSONTree) Toggle() {
 		j.expanded[line.Path] = true
 	}
 	j.rebuild()
+	j.ensureCursorVisible(0, j.visibleRows())
 }
 
 func (j *JSONTree) CurrentScalar() (string, any, bool) {
@@ -153,6 +162,7 @@ func (j *JSONTree) SearchNext(matcher *searchMatcher) bool {
 		blob := line.Path + " " + line.Label + " " + fmt.Sprint(line.Value)
 		if matcher.MatchFields(fields, blob) {
 			j.cursor = idx
+			j.ensureCursorVisible(1, j.visibleRows())
 			return true
 		}
 	}
@@ -176,6 +186,7 @@ func (j *JSONTree) SearchPrev(matcher *searchMatcher) bool {
 		blob := line.Path + " " + line.Label + " " + fmt.Sprint(line.Value)
 		if matcher.MatchFields(fields, blob) {
 			j.cursor = idx
+			j.ensureCursorVisible(-1, j.visibleRows())
 			return true
 		}
 	}
@@ -189,14 +200,10 @@ func (j *JSONTree) View(height int) string {
 	if height < 3 {
 		height = 3
 	}
-	start := 0
-	if j.cursor >= height-2 {
-		start = j.cursor - (height - 3)
-	}
-	end := start + height - 1
-	if end > len(j.lines) {
-		end = len(j.lines)
-	}
+	visible := max(1, height-1)
+	j.viewRows = visible
+	j.ensureCursorVisible(0, visible)
+	start, end := treeWindowFromTop(len(j.lines), j.scrollTop, visible)
 
 	var b strings.Builder
 	b.WriteString(j.title)
@@ -239,6 +246,37 @@ func (j *JSONTree) rebuild() {
 	if j.cursor >= len(j.lines) {
 		j.cursor = max(0, len(j.lines)-1)
 	}
+	j.ensureCursorVisible(0, j.visibleRows())
+}
+
+func (j *JSONTree) visibleRows() int {
+	if j.viewRows <= 0 {
+		return 1
+	}
+	return j.viewRows
+}
+
+func (j *JSONTree) ensureCursorVisible(moveDir int, rows int) {
+	clampCursorAndScroll(len(j.lines), rows, &j.cursor, &j.scrollTop, moveDir)
+}
+
+func treeWindowFromTop(total, scrollTop, visible int) (int, int) {
+	if visible < 1 {
+		visible = 1
+	}
+	if total <= 0 {
+		return 0, 0
+	}
+	maxTop := max(0, total-visible)
+	start := scrollTop
+	if start < 0 {
+		start = 0
+	}
+	if start > maxTop {
+		start = maxTop
+	}
+	end := min(total, start+visible)
+	return start, end
 }
 
 func buildJSONLines(path, key string, value any, depth int, expanded map[string]bool, lines *[]jsonLine) {

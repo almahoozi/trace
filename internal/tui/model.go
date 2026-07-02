@@ -70,6 +70,7 @@ type Model struct {
 
 	traceLines     []traceLine
 	traceCursor    int
+	traceScrollTop int
 	expanded       map[string]bool
 	serviceMapTree *JSONTree
 	serviceColors  map[string]string
@@ -78,6 +79,7 @@ type Model struct {
 	levelFilteredLog []domain.LogEntry
 	filteredLogs     []domain.LogEntry
 	logCursor        int
+	logScrollTop     int
 	levelThresholdIx int
 	logSearchRaw     string
 	logSearchMatcher *searchMatcher
@@ -223,6 +225,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.ensureTraceCursorVisible(0)
+		m.ensureLogCursorVisible(0)
 		if !m.firstVisualLogged {
 			runlog.ObserveSinceRunStart("cli.startup_total")
 			m.firstVisualLogged = true
@@ -469,10 +473,12 @@ func (m *Model) applySearch(raw string) {
 	switch m.activePanel {
 	case panelTrace:
 		m.applyTraceSearch(matcher, raw, 1)
+		m.ensureTraceCursorVisible(1)
 	case panelServiceMap:
 		m.applyServiceMapSearch(matcher, raw, 1)
 	default:
 		m.applyLogSearch(matcher, raw)
+		m.ensureLogCursorVisible(0)
 	}
 }
 
@@ -538,6 +544,7 @@ func (m *Model) handleSearchRepeatShortcut(key string) bool {
 		} else {
 			m.logCursor = (m.logCursor - 1 + len(m.filteredLogs)) % len(m.filteredLogs)
 		}
+		m.ensureLogCursorVisible(direction)
 		m.status = fmt.Sprintf("log search %q -> row %d/%d", m.lastSearchRaw, m.logCursor+1, len(m.filteredLogs))
 	}
 	return true
@@ -557,12 +564,15 @@ func (m *Model) moveToTop() {
 	switch m.activePanel {
 	case panelTrace:
 		m.traceCursor = 0
+		m.traceScrollTop = 0
 	case panelServiceMap:
 		if m.serviceMapTree != nil {
 			m.serviceMapTree.cursor = 0
+			m.serviceMapTree.ensureCursorVisible(0, m.serviceMapVisibleRows())
 		}
 	default:
 		m.logCursor = 0
+		m.logScrollTop = 0
 	}
 }
 
@@ -583,36 +593,58 @@ func (m *Model) moveToBottom() {
 	case panelTrace:
 		if len(m.traceLines) > 0 {
 			m.traceCursor = len(m.traceLines) - 1
+			m.ensureTraceCursorVisible(1)
 		}
 	case panelServiceMap:
 		if m.serviceMapTree != nil && len(m.serviceMapTree.lines) > 0 {
 			m.serviceMapTree.cursor = len(m.serviceMapTree.lines) - 1
+			m.serviceMapTree.ensureCursorVisible(1, m.serviceMapVisibleRows())
 		}
 	default:
 		if len(m.filteredLogs) > 0 {
 			m.logCursor = len(m.filteredLogs) - 1
+			m.ensureLogCursorVisible(1)
 		}
 	}
 }
 
 func (m Model) updateTrace(key string) (tea.Model, tea.Cmd) {
+	moveDir := 0
 	if m.isAction("trace", "up", key) && m.traceCursor > 0 {
 		m.traceCursor--
+		moveDir = -1
 	}
 	if m.isAction("trace", "down", key) && m.traceCursor < len(m.traceLines)-1 {
 		m.traceCursor++
+		moveDir = 1
 	}
 	if isPageDownKey(key) && len(m.traceLines) > 0 {
+		before := m.traceCursor
 		m.traceCursor = min(len(m.traceLines)-1, m.traceCursor+m.tracePageRows())
+		if m.traceCursor > before {
+			moveDir = 1
+		}
 	}
 	if isPageUpKey(key) && len(m.traceLines) > 0 {
+		before := m.traceCursor
 		m.traceCursor = max(0, m.traceCursor-m.tracePageRows())
+		if m.traceCursor < before {
+			moveDir = -1
+		}
 	}
 	if isHalfPageDownKey(key) && len(m.traceLines) > 0 {
+		before := m.traceCursor
 		m.traceCursor = min(len(m.traceLines)-1, m.traceCursor+m.traceHalfPageRows())
+		if m.traceCursor > before {
+			moveDir = 1
+		}
 	}
 	if isHalfPageUpKey(key) && len(m.traceLines) > 0 {
+		before := m.traceCursor
 		m.traceCursor = max(0, m.traceCursor-m.traceHalfPageRows())
+		if m.traceCursor < before {
+			moveDir = -1
+		}
 	}
 	if m.isAction("trace", "expand", key) {
 		m.toggleTraceNode(true)
@@ -640,6 +672,7 @@ func (m Model) updateTrace(key string) (tea.Model, tea.Cmd) {
 			}
 		}
 	}
+	m.ensureTraceCursorVisible(moveDir)
 	return m, nil
 }
 
@@ -649,33 +682,41 @@ func (m Model) updateServiceMap(key string) (tea.Model, tea.Cmd) {
 	}
 	if len(m.serviceMapTree.lines) == 0 {
 		m.serviceMapTree.cursor = 0
+		m.serviceMapTree.ensureCursorVisible(0, m.serviceMapVisibleRows())
 		return m, nil
 	}
+	moveDir := 0
 	if m.isAction("trace", "up", key) {
 		m.serviceMapTree.MoveUp()
+		moveDir = -1
 	}
 	if m.isAction("trace", "down", key) {
 		m.serviceMapTree.MoveDown()
+		moveDir = 1
 	}
 	if isPageDownKey(key) {
 		for i := 0; i < m.serviceMapPageRows(); i++ {
 			m.serviceMapTree.MoveDown()
 		}
+		moveDir = 1
 	}
 	if isPageUpKey(key) {
 		for i := 0; i < m.serviceMapPageRows(); i++ {
 			m.serviceMapTree.MoveUp()
 		}
+		moveDir = -1
 	}
 	if isHalfPageDownKey(key) {
 		for i := 0; i < m.serviceMapHalfPageRows(); i++ {
 			m.serviceMapTree.MoveDown()
 		}
+		moveDir = 1
 	}
 	if isHalfPageUpKey(key) {
 		for i := 0; i < m.serviceMapHalfPageRows(); i++ {
 			m.serviceMapTree.MoveUp()
 		}
+		moveDir = -1
 	}
 	if m.isAction("json", "expand", key) {
 		m.serviceMapTree.Expand()
@@ -686,27 +727,47 @@ func (m Model) updateServiceMap(key string) (tea.Model, tea.Cmd) {
 	if m.isAction("json", "toggle", key) || key == " " {
 		m.serviceMapTree.Toggle()
 	}
+	m.serviceMapTree.ensureCursorVisible(moveDir, m.serviceMapVisibleRows())
 	return m, nil
 }
 
 func (m Model) updateLogs(key string) (tea.Model, tea.Cmd) {
+	moveDir := 0
 	if m.isAction("logs", "up", key) && m.logCursor > 0 {
 		m.logCursor--
+		moveDir = -1
 	}
 	if m.isAction("logs", "down", key) && m.logCursor < len(m.filteredLogs)-1 {
 		m.logCursor++
+		moveDir = 1
 	}
 	if isPageDownKey(key) && len(m.filteredLogs) > 0 {
+		before := m.logCursor
 		m.logCursor = min(len(m.filteredLogs)-1, m.logCursor+m.logsPageRows())
+		if m.logCursor > before {
+			moveDir = 1
+		}
 	}
 	if isPageUpKey(key) && len(m.filteredLogs) > 0 {
+		before := m.logCursor
 		m.logCursor = max(0, m.logCursor-m.logsPageRows())
+		if m.logCursor < before {
+			moveDir = -1
+		}
 	}
 	if isHalfPageDownKey(key) && len(m.filteredLogs) > 0 {
+		before := m.logCursor
 		m.logCursor = min(len(m.filteredLogs)-1, m.logCursor+m.logsHalfPageRows())
+		if m.logCursor > before {
+			moveDir = 1
+		}
 	}
 	if isHalfPageUpKey(key) && len(m.filteredLogs) > 0 {
+		before := m.logCursor
 		m.logCursor = max(0, m.logCursor-m.logsHalfPageRows())
+		if m.logCursor < before {
+			moveDir = -1
+		}
 	}
 	if m.isAction("logs", "level_up", key) && m.levelThresholdIx < len(m.cfg.Logs.LevelOrder)-1 {
 		m.levelThresholdIx++
@@ -730,6 +791,7 @@ func (m Model) updateLogs(key string) (tea.Model, tea.Cmd) {
 			}
 		}
 	}
+	m.ensureLogCursorVisible(moveDir)
 	return m, nil
 }
 
@@ -827,6 +889,7 @@ func (m *Model) applyLogSearchFilter() {
 	if m.logCursor >= len(m.filteredLogs) {
 		m.logCursor = max(0, len(m.filteredLogs)-1)
 	}
+	m.ensureLogCursorVisible(0)
 }
 
 func (m *Model) applyLogSearch(matcher *searchMatcher, raw string) {
@@ -861,6 +924,7 @@ func (m *Model) applyTraceSearch(matcher *searchMatcher, raw string, direction i
 		blob := traceSearchBlob(line, span)
 		if matcher.MatchFields(fields, blob) {
 			m.traceCursor = idx
+			m.ensureTraceCursorVisible(direction)
 			m.status = fmt.Sprintf("trace search %q -> row %d/%d", raw, idx+1, len(m.traceLines))
 			return
 		}
@@ -890,6 +954,7 @@ func (m *Model) applyServiceMapSearch(matcher *searchMatcher, raw string, direct
 		fields := map[string]string{"line": lines[idx]}
 		if matcher.MatchFields(fields, lines[idx]) {
 			m.serviceMapTree.cursor = idx
+			m.serviceMapTree.ensureCursorVisible(direction, m.serviceMapVisibleRows())
 			m.status = fmt.Sprintf("service map search %q -> row %d/%d", raw, idx+1, len(lines))
 			return
 		}
@@ -1021,27 +1086,107 @@ func (m Model) serviceMapHalfPageRows() int {
 }
 
 func (m Model) traceVisibleRows() int {
-	if m.fullscreen && m.activePanel == panelTrace {
-		innerHeight := max(4, m.height-4)
-		return max(1, (innerHeight-2)/2)
-	}
-	return max(1, (max(4, m.height/3)-2)/2)
+	innerHeight := m.panelInnerHeight(panelTrace)
+	return max(1, (max(4, innerHeight)-2)/2)
 }
 
 func (m Model) logsVisibleRows() int {
-	if m.fullscreen && m.activePanel == panelLogs {
-		innerHeight := max(4, m.height-4)
-		return max(1, innerHeight-3)
-	}
-	return max(1, max(4, m.height/3)-3)
+	innerHeight := m.panelInnerHeight(panelLogs)
+	return max(1, max(4, innerHeight)-3)
 }
 
 func (m Model) serviceMapVisibleRows() int {
-	if m.fullscreen && m.activePanel == panelServiceMap {
-		innerHeight := max(3, m.height-4)
-		return max(1, innerHeight-1)
+	innerHeight := m.panelInnerHeight(panelServiceMap)
+	return max(1, max(3, innerHeight)-1)
+}
+
+func (m Model) panelInnerHeight(target panel) int {
+	if m.width <= 0 || m.height <= 0 {
+		return 1
 	}
-	return max(1, max(3, m.height/3)-1)
+
+	headerLine1 := m.summaryHeaderLine()
+	headerLine2 := m.summaryStatsLine()
+	headerRendered := lipgloss.JoinVertical(
+		lipgloss.Left,
+		lipgloss.NewStyle().Width(max(1, m.width)).Render(headerLine1),
+		lipgloss.NewStyle().Width(max(1, m.width)).Render(headerLine2),
+	)
+	headerHeight := max(1, lipgloss.Height(headerRendered))
+
+	if m.fullscreen {
+		if m.activePanel != target {
+			return 1
+		}
+		return max(1, m.height-headerHeight-2)
+	}
+
+	footer := mutedStyle.Render(m.status + " | / search | n/N next/prev | gg/G top/bottom | ctrl+f/b page | ctrl+d/u half-page | f fullscreen | c collapse | tab/shift+tab switch | F2 config | ? help")
+	if m.searchPrompt != nil {
+		footer += "\n" + mutedStyle.Render(m.searchPrompt.viewLine()) + "\n" + mutedStyle.Render(searchHint())
+	}
+	footerHeight := max(1, lipgloss.Height(footer))
+	sectionCount := 3
+	borderOverhead := 2 * sectionCount
+	availableInner := max(3, m.height-headerHeight-footerHeight-borderOverhead)
+
+	order := m.sectionOrder()
+	weights := m.sectionWeights()
+
+	innerHeights := map[panel]int{}
+	for _, p := range order {
+		if m.collapsed[p] {
+			innerHeights[p] = 1
+		}
+	}
+
+	fixed := innerHeights[panelTrace] + innerHeights[panelServiceMap] + innerHeights[panelLogs]
+	remaining := max(0, availableInner-fixed)
+
+	visible := make([]panel, 0, len(order))
+	for _, p := range order {
+		if !m.collapsed[p] {
+			visible = append(visible, p)
+		}
+	}
+	minPerSection := 3
+	for _, p := range visible {
+		if remaining <= 0 {
+			break
+		}
+		grant := min(minPerSection, remaining)
+		innerHeights[p] = grant
+		remaining -= grant
+	}
+	weightTotal := 0
+	for _, p := range visible {
+		w := weights[p]
+		if w <= 0 {
+			w = 1
+		}
+		weightTotal += w
+	}
+	if weightTotal == 0 {
+		weightTotal = 1
+	}
+	if remaining > 0 && len(visible) > 0 {
+		used := 0
+		for _, p := range visible {
+			w := weights[p]
+			if w <= 0 {
+				w = 1
+			}
+			add := (remaining * w) / weightTotal
+			innerHeights[p] += add
+			used += add
+		}
+		left := remaining - used
+		for i := 0; i < left; i++ {
+			innerHeights[visible[i%len(visible)]]++
+		}
+	}
+
+	return max(1, innerHeights[target])
 }
 
 func logSearchFields(entry domain.LogEntry) map[string]string {
@@ -1466,7 +1611,7 @@ func (m Model) traceView(height int) string {
 	barWidth := max(6, contentWidth-4)
 
 	maxRows := max(1, (height-2)/2)
-	start, end := m.window(len(m.traceLines), m.traceCursor, maxRows)
+	start, end := m.windowFromTop(len(m.traceLines), m.traceScrollTop, maxRows)
 	for i := start; i < end; i++ {
 		line := m.traceLines[i]
 		prefix := "  "
@@ -2007,7 +2152,7 @@ func (m Model) logsView(height int) string {
 		height = 4
 	}
 	rows := max(1, height-3)
-	start, end := m.window(len(m.filteredLogs), m.logCursor, rows)
+	start, end := m.windowFromTop(len(m.filteredLogs), m.logScrollTop, rows)
 	for i := start; i < end; i++ {
 		entry := m.filteredLogs[i]
 		prefix := "  "
@@ -2524,6 +2669,80 @@ func (m Model) window(total, cursor, visible int) (int, int) {
 	start := 0
 	if cursor > visible-1 {
 		start = cursor - (visible - 1)
+	}
+	end := min(total, start+visible)
+	return start, end
+}
+
+func (m *Model) ensureTraceCursorVisible(moveDir int) {
+	rows := m.traceVisibleRows()
+	clampCursorAndScroll(len(m.traceLines), rows, &m.traceCursor, &m.traceScrollTop, moveDir)
+}
+
+func (m *Model) ensureLogCursorVisible(moveDir int) {
+	rows := m.logsVisibleRows()
+	clampCursorAndScroll(len(m.filteredLogs), rows, &m.logCursor, &m.logScrollTop, moveDir)
+}
+
+func clampCursorAndScroll(total, rows int, cursor *int, scrollTop *int, moveDir int) {
+	if rows <= 0 {
+		rows = 1
+	}
+	if total <= 0 {
+		*cursor = 0
+		*scrollTop = 0
+		return
+	}
+	if *cursor < 0 {
+		*cursor = 0
+	}
+	if *cursor >= total {
+		*cursor = total - 1
+	}
+	maxTop := max(0, total-rows)
+	if *scrollTop < 0 {
+		*scrollTop = 0
+	}
+	if *scrollTop > maxTop {
+		*scrollTop = maxTop
+	}
+
+	bottom := *scrollTop + rows - 1
+	if moveDir > 0 {
+		if *cursor > bottom {
+			*scrollTop = min(maxTop, *cursor-rows+1)
+		}
+		return
+	}
+	if moveDir < 0 {
+		threshold := *scrollTop + 1
+		if *cursor < threshold {
+			*scrollTop = max(0, *cursor-1)
+		}
+		return
+	}
+	if *cursor < *scrollTop {
+		*scrollTop = *cursor
+	}
+	if *cursor > bottom {
+		*scrollTop = min(maxTop, *cursor-rows+1)
+	}
+}
+
+func (m Model) windowFromTop(total, scrollTop, visible int) (int, int) {
+	if visible < 1 {
+		visible = 1
+	}
+	if total <= 0 {
+		return 0, 0
+	}
+	maxTop := max(0, total-visible)
+	start := scrollTop
+	if start < 0 {
+		start = 0
+	}
+	if start > maxTop {
+		start = maxTop
 	}
 	end := min(total, start+visible)
 	return start, end

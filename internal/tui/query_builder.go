@@ -26,22 +26,24 @@ type queryBuilderResult struct {
 }
 
 type queryBuilder struct {
-	rows         []queryRow
-	row          int
-	tableRow     int
-	queryText    string
-	queryCursor  int
-	queryEditing bool
-	width        int
-	height       int
-	fields       []string
-	operators    []string
-	environments []string
-	environment  string
-	timeframe    []timeframeOption
-	timeIdx      int
-	startRaw     string
-	endRaw       string
+	rows          []queryRow
+	row           int
+	tableRow      int
+	queryText     string
+	queryCursor   int
+	queryEditing  bool
+	tableDisabled bool
+	tableReason   string
+	width         int
+	height        int
+	fields        []string
+	operators     []string
+	environments  []string
+	environment   string
+	timeframe     []timeframeOption
+	timeIdx       int
+	startRaw      string
+	endRaw        string
 
 	mode string
 
@@ -64,7 +66,7 @@ type queryBuilder struct {
 
 const customFieldOptionValue = "__custom_field__"
 
-func newQueryBuilder(query string, fields, environments []string, activeEnv string, activeSince time.Duration, startAt, endAt time.Time, hasStartAt, hasEndAt bool) *queryBuilder {
+func newQueryBuilder(query string, fields, environments []string, activeEnv string, activeSince time.Duration, startAt, endAt time.Time, hasStartAt, hasEndAt bool, knownQueryError string) *queryBuilder {
 	clauses := traceql.SplitClauses(query)
 	rows := make([]queryRow, 0, len(clauses))
 	for _, clause := range clauses {
@@ -135,7 +137,7 @@ func newQueryBuilder(query string, fields, environments []string, activeEnv stri
 		endRaw = endAt.Format(time.RFC3339)
 	}
 
-	return &queryBuilder{
+	b := &queryBuilder{
 		rows:         rows,
 		tableRow:     0,
 		fields:       availableFields,
@@ -149,6 +151,8 @@ func newQueryBuilder(query string, fields, environments []string, activeEnv stri
 		queryText:    strings.TrimSpace(query),
 		mode:         "table",
 	}
+	b.refreshTableSupport(strings.TrimSpace(knownQueryError))
+	return b
 }
 
 var defaultQueryFields = []string{
@@ -213,6 +217,7 @@ func (b *queryBuilder) updateTable(msg tea.Msg) queryBuilderResult {
 		case "enter":
 			b.queryEditing = false
 			b.syncRowsFromQueryText()
+			b.refreshTableSupport("")
 			return queryBuilderResult{}
 		case "left":
 			if b.queryCursor > 0 {
@@ -237,6 +242,7 @@ func (b *queryBuilder) updateTable(msg tea.Msg) queryBuilderResult {
 				b.queryCursor--
 				b.queryText = string(r)
 				b.syncRowsFromQueryText()
+				b.refreshTableSupport("")
 			}
 			return queryBuilderResult{}
 		case "delete":
@@ -245,6 +251,7 @@ func (b *queryBuilder) updateTable(msg tea.Msg) queryBuilderResult {
 				r = append(r[:b.queryCursor], r[b.queryCursor+1:]...)
 				b.queryText = string(r)
 				b.syncRowsFromQueryText()
+				b.refreshTableSupport("")
 			}
 			return queryBuilderResult{}
 		case "ctrl+r", "ctrl+enter", "ctrl+j":
@@ -259,12 +266,14 @@ func (b *queryBuilder) updateTable(msg tea.Msg) queryBuilderResult {
 			b.queryCursor += len(insert)
 			b.queryText = string(r)
 			b.syncRowsFromQueryText()
+			b.refreshTableSupport("")
 		} else if keyMsg.Type == tea.KeySpace {
 			r := []rune(b.queryText)
 			r = append(r[:b.queryCursor], append([]rune{' '}, r[b.queryCursor:]...)...)
 			b.queryCursor++
 			b.queryText = string(r)
 			b.syncRowsFromQueryText()
+			b.refreshTableSupport("")
 		}
 		return queryBuilderResult{}
 	}
@@ -280,14 +289,13 @@ func (b *queryBuilder) updateTable(msg tea.Msg) queryBuilderResult {
 		b.jumpComponent(-1)
 		return queryBuilderResult{}
 	case "up", "k":
-		if b.row > -1 {
-			b.row--
-		}
+		b.moveRow(-1)
 	case "down", "j":
-		if b.row < maxRow {
-			b.row++
-		}
+		b.moveRow(1)
 	case "e", "enter":
+		if b.tableDisabled && b.row >= 0 && b.row <= len(b.rows) {
+			return queryBuilderResult{}
+		}
 		if b.row == -1 {
 			b.startGlobalForm()
 			return queryBuilderResult{Cmd: b.globalForm.Init()}
@@ -305,6 +313,9 @@ func (b *queryBuilder) updateTable(msg tea.Msg) queryBuilderResult {
 		b.startRowForm()
 		return queryBuilderResult{Cmd: b.rowForm.Init()}
 	case "d":
+		if b.tableDisabled {
+			return queryBuilderResult{}
+		}
 		if b.row >= 0 && b.row < len(b.rows) {
 			b.rows = append(b.rows[:b.row], b.rows[b.row+1:]...)
 			b.syncQueryTextFromRows()
@@ -449,16 +460,29 @@ func (b *queryBuilder) View(width int) string {
 	lines = append(lines, "----+------------------------+-----+-------------------------")
 	for i, row := range b.rows {
 		prefix := " "
-		if b.row == i {
+		if !b.tableDisabled && b.row == i {
 			prefix = ">"
 		}
-		lines = append(lines, fmt.Sprintf("%s%3d | %-22s | %-3s | %s", prefix, i+1, truncate(defaultText(strings.TrimSpace(row.Field), "name"), 22), truncate(defaultText(strings.TrimSpace(row.Operator), "="), 3), truncate(row.Value, max(20, width-40))))
+		line := fmt.Sprintf("%s%3d | %-22s | %-3s | %s", prefix, i+1, truncate(defaultText(strings.TrimSpace(row.Field), "name"), 22), truncate(defaultText(strings.TrimSpace(row.Operator), "="), 3), truncate(row.Value, max(20, width-40)))
+		if b.tableDisabled {
+			line = mutedStyle.Render(line)
+		}
+		lines = append(lines, line)
 	}
 	newPrefix := " "
-	if b.row == len(b.rows) {
+	if !b.tableDisabled && b.row == len(b.rows) {
 		newPrefix = ">"
 	}
-	lines = append(lines, fmt.Sprintf("%s -- | %-22s | %-3s | %s", newPrefix, "(new row)", "=", "press e or enter"))
+	newRowLine := fmt.Sprintf("%s -- | %-22s | %-3s | %s", newPrefix, "(new row)", "=", "press e or enter")
+	if b.tableDisabled {
+		newRowLine = mutedStyle.Render(newRowLine)
+	}
+	lines = append(lines, newRowLine)
+	if b.tableDisabled {
+		lines = append(lines, "")
+		lines = append(lines, summaryWarnStyle.Render("table mode disabled: "+b.tableReason))
+		lines = append(lines, summaryWarnStyle.Render("edit query text directly, then press enter"))
+	}
 	runPrefix := " "
 	if b.row == len(b.rows)+1 {
 		runPrefix = ">"
@@ -601,12 +625,7 @@ func (b *queryBuilder) buildRowForm(fieldOptions []huh.Option[string], opOptions
 			}
 			return fmt.Errorf("unsupported operator")
 		}),
-		huh.NewInput().Title("Value").Value(&b.rowValue).Validate(func(v string) error {
-			if strings.TrimSpace(v) == "" {
-				return fmt.Errorf("value is required")
-			}
-			return nil
-		}),
+		huh.NewInput().Title("Value").Value(&b.rowValue),
 	)
 
 	return huh.NewForm(
@@ -665,9 +684,6 @@ func (b *queryBuilder) validateRowFormValues() bool {
 	if resolvedField == "" {
 		return false
 	}
-	if strings.TrimSpace(b.rowValue) == "" {
-		return false
-	}
 	raw := strings.TrimSpace(b.rowOp)
 	for _, allowed := range b.operators {
 		if raw == allowed {
@@ -697,6 +713,7 @@ func (b *queryBuilder) applyRowFormValues() {
 		b.row = len(b.rows) - 1
 	}
 	b.syncQueryTextFromRows()
+	b.refreshTableSupport("")
 }
 
 func (b *queryBuilder) applyGlobalFormValues() {
@@ -712,8 +729,11 @@ func (b *queryBuilder) toClauses() []string {
 		field := strings.TrimSpace(row.Field)
 		op := strings.TrimSpace(row.Operator)
 		value := strings.TrimSpace(row.Value)
-		if field == "" || op == "" || value == "" {
+		if field == "" || op == "" {
 			continue
+		}
+		if value == "" {
+			value = `""`
 		}
 		clauses = append(clauses, field+op+value)
 	}
@@ -773,6 +793,45 @@ func (b *queryBuilder) syncRowsFromQueryText() {
 	if b.row > len(b.rows)+2 {
 		b.row = len(b.rows) + 2
 	}
+}
+
+func (b *queryBuilder) refreshTableSupport(knownQueryError string) {
+	reason := strings.TrimSpace(knownQueryError)
+	if reason != "" {
+		lower := strings.ToLower(reason)
+		if strings.Contains(lower, "syntax") || strings.Contains(lower, "parse") || strings.Contains(lower, "unexpected") || strings.Contains(lower, "invalid") {
+			b.tableDisabled = true
+			b.tableReason = reason
+			if b.row >= 0 && b.row <= len(b.rows) {
+				b.row = len(b.rows) + 2
+			}
+			return
+		}
+	}
+	q := strings.TrimSpace(b.queryText)
+	if q == "" {
+		b.tableDisabled = false
+		b.tableReason = ""
+		return
+	}
+	if strings.Contains(q, "||") || strings.Contains(q, "(") || strings.Contains(q, ")") {
+		b.tableDisabled = true
+		b.tableReason = "complex query (OR/grouping) is not supported in table mode"
+		if b.row >= 0 && b.row <= len(b.rows) {
+			b.row = len(b.rows) + 2
+		}
+		return
+	}
+	if strings.Count(q, "{") != strings.Count(q, "}") {
+		b.tableDisabled = true
+		b.tableReason = "unbalanced braces in query"
+		if b.row >= 0 && b.row <= len(b.rows) {
+			b.row = len(b.rows) + 2
+		}
+		return
+	}
+	b.tableDisabled = false
+	b.tableReason = ""
 }
 
 func (b *queryBuilder) selectedSince() time.Duration {
@@ -872,6 +931,23 @@ func (b *queryBuilder) componentForRow() int {
 }
 
 func (b *queryBuilder) jumpComponent(direction int) {
+	if b.tableDisabled {
+		allowed := []int{-1, len(b.rows) + 1, len(b.rows) + 2}
+		idx := 0
+		switch b.row {
+		case -1:
+			idx = 0
+		case len(b.rows) + 1:
+			idx = 1
+		case len(b.rows) + 2:
+			idx = 2
+		default:
+			idx = 2
+		}
+		next := (idx + direction + len(allowed)) % len(allowed)
+		b.row = allowed[next]
+		return
+	}
 	if b.row >= 0 && b.row <= len(b.rows) {
 		b.tableRow = b.row
 	}
@@ -892,6 +968,51 @@ func (b *queryBuilder) jumpComponent(direction int) {
 		b.row = len(b.rows) + 1
 	case 3:
 		b.row = len(b.rows) + 2
+	}
+}
+
+func (b *queryBuilder) moveRow(direction int) {
+	if direction == 0 {
+		return
+	}
+	if b.tableDisabled {
+		allowed := []int{-1, len(b.rows) + 1, len(b.rows) + 2}
+		idx := 0
+		switch b.row {
+		case -1:
+			idx = 0
+		case len(b.rows) + 1:
+			idx = 1
+		case len(b.rows) + 2:
+			idx = 2
+		default:
+			if direction > 0 {
+				idx = 1
+			} else {
+				idx = 0
+			}
+		}
+		next := idx + direction
+		if next < 0 {
+			next = 0
+		}
+		if next >= len(allowed) {
+			next = len(allowed) - 1
+		}
+		b.row = allowed[next]
+		return
+	}
+
+	maxRow := len(b.rows) + 2
+	b.row += direction
+	if b.row < -1 {
+		b.row = -1
+	}
+	if b.row > maxRow {
+		b.row = maxRow
+	}
+	if b.row >= 0 && b.row <= len(b.rows) {
+		b.tableRow = b.row
 	}
 }
 
