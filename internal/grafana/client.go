@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -24,6 +25,14 @@ type Client struct {
 	baseURL    string
 	token      string
 	httpClient *http.Client
+}
+
+type TraceSearchOptions struct {
+	StartAt    time.Time
+	EndAt      time.Time
+	HasStartAt bool
+	HasEndAt   bool
+	SPSS       int
 }
 
 func NewHTTPClient(timeout time.Duration) *http.Client {
@@ -75,8 +84,7 @@ func (c *Client) FetchTrace(ctx context.Context, env config.Environment, traceID
 	return trace, nil
 }
 
-func (c *Client) SearchTraces(ctx context.Context, env config.Environment, query string, limit int) ([]domain.TraceListItem, error) {
-	runlog.Debug("grafana search traces started", "environment", env.Name, "query", strings.TrimSpace(query), "limit", limit)
+func (c *Client) SearchTraces(ctx context.Context, env config.Environment, query string, limit int, opts TraceSearchOptions) ([]domain.TraceListItem, error) {
 	v := url.Values{}
 	if trimmed := strings.TrimSpace(query); trimmed != "" {
 		v.Set("q", trimmed)
@@ -85,15 +93,37 @@ func (c *Client) SearchTraces(ctx context.Context, env config.Environment, query
 		limit = 50
 	}
 	v.Set("limit", strconv.Itoa(limit))
+	if opts.HasStartAt {
+		v.Set("start", strconv.FormatInt(opts.StartAt.Unix(), 10))
+	}
+	if opts.HasEndAt {
+		v.Set("end", strconv.FormatInt(opts.EndAt.Unix(), 10))
+	}
+	if opts.HasStartAt || opts.HasEndAt || opts.SPSS > 0 {
+		spss := opts.SPSS
+		if spss <= 0 {
+			spss = 3
+		}
+		v.Set("spss", strconv.Itoa(spss))
+	}
+	runlog.Info(
+		"grafana search traces started",
+		"environment", env.Name,
+		"query", strings.TrimSpace(query),
+		"limit", limit,
+		"start_unix", unixSecondsOrZero(opts.StartAt, opts.HasStartAt),
+		"end_unix", unixSecondsOrZero(opts.EndAt, opts.HasEndAt),
+		"spss", v.Get("spss"),
+	)
 
 	u := fmt.Sprintf("%s/api/datasources/proxy/uid/%s/api/search?%s", c.baseURL, url.PathEscape(env.TempoDatasource), v.Encode())
 	body, statusCode, err := c.get(ctx, u)
 	if err != nil {
-		runlog.Warn("grafana search traces request failed", "environment", env.Name, "error", err)
+		runlog.Warn("grafana search traces request failed", "environment", env.Name, "error", err, "start_unix", unixSecondsOrZero(opts.StartAt, opts.HasStartAt), "end_unix", unixSecondsOrZero(opts.EndAt, opts.HasEndAt), "spss", v.Get("spss"))
 		return nil, err
 	}
 	if statusCode >= 400 {
-		runlog.Warn("grafana search traces bad status", "environment", env.Name, "status_code", statusCode)
+		runlog.Warn("grafana search traces bad status", "environment", env.Name, "status_code", statusCode, "start_unix", unixSecondsOrZero(opts.StartAt, opts.HasStartAt), "end_unix", unixSecondsOrZero(opts.EndAt, opts.HasEndAt), "spss", v.Get("spss"))
 		detail := extractErrorDetail(body)
 		if detail != "" {
 			return nil, fmt.Errorf("search traces failed with status %d: %s", statusCode, detail)
@@ -214,7 +244,11 @@ func (c *Client) get(ctx context.Context, requestURL string) ([]byte, int, error
 		requestPath = parsedURL.Path
 		queryLength = len(parsedURL.RawQuery)
 	}
-	runlog.Debug("grafana http request started", "method", http.MethodGet, "path", requestPath, "query_length", queryLength)
+	querySummary := ""
+	if parseErr == nil {
+		querySummary = summarizeURLQuery(parsedURL.Query())
+	}
+	runlog.Debug("grafana http request started", "method", http.MethodGet, "path", requestPath, "query_length", queryLength, "query", querySummary)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 	if err != nil {
 		runlog.Error("failed to build grafana request", "error", err)
@@ -225,7 +259,7 @@ func (c *Client) get(ctx context.Context, requestURL string) ([]byte, int, error
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		recordNetworkDuration(requestPath, startedAt)
-		runlog.Warn("grafana http request failed", "method", http.MethodGet, "path", requestPath, "duration_ms", time.Since(startedAt).Milliseconds(), "error", err)
+		runlog.Warn("grafana http request failed", "method", http.MethodGet, "path", requestPath, "query", querySummary, "duration_ms", time.Since(startedAt).Milliseconds(), "error", err)
 		return nil, 0, err
 	}
 	defer resp.Body.Close()
@@ -233,11 +267,11 @@ func (c *Client) get(ctx context.Context, requestURL string) ([]byte, int, error
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		recordNetworkDuration(requestPath, startedAt)
-		runlog.Warn("failed to read grafana response body", "method", http.MethodGet, "path", requestPath, "status_code", resp.StatusCode, "duration_ms", time.Since(startedAt).Milliseconds(), "error", err)
+		runlog.Warn("failed to read grafana response body", "method", http.MethodGet, "path", requestPath, "query", querySummary, "status_code", resp.StatusCode, "duration_ms", time.Since(startedAt).Milliseconds(), "error", err)
 		return nil, 0, err
 	}
 	recordNetworkDuration(requestPath, startedAt)
-	runlog.Debug("grafana http request completed", "method", http.MethodGet, "path", requestPath, "status_code", resp.StatusCode, "duration_ms", time.Since(startedAt).Milliseconds(), "response_bytes", len(body))
+	runlog.Debug("grafana http request completed", "method", http.MethodGet, "path", requestPath, "query", querySummary, "status_code", resp.StatusCode, "duration_ms", time.Since(startedAt).Milliseconds(), "response_bytes", len(body))
 
 	if resp.StatusCode >= 400 {
 		var e map[string]any
@@ -300,4 +334,36 @@ func extractErrorDetail(body []byte) string {
 		return trimmedBody[:300] + "..."
 	}
 	return trimmedBody
+}
+
+func summarizeURLQuery(values url.Values) string {
+	if len(values) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		vals := values[key]
+		if len(vals) == 0 {
+			parts = append(parts, key+"=")
+			continue
+		}
+		value := strings.Join(vals, ",")
+		if len(value) > 220 {
+			value = value[:220] + "..."
+		}
+		parts = append(parts, key+"="+value)
+	}
+	return strings.Join(parts, "&")
+}
+
+func unixSecondsOrZero(t time.Time, enabled bool) int64 {
+	if !enabled || t.IsZero() {
+		return 0
+	}
+	return t.Unix()
 }

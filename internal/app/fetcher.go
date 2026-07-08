@@ -24,6 +24,15 @@ type Fetcher struct {
 	client *grafana.Client
 }
 
+type TraceSearchWindow struct {
+	Since      time.Duration
+	StartAt    time.Time
+	EndAt      time.Time
+	HasStartAt bool
+	HasEndAt   bool
+	SPSS       int
+}
+
 type TraceLookupEvent struct {
 	Environment string
 	Stage       string
@@ -416,15 +425,43 @@ func (f *Fetcher) FetchTraceSessionInEnvironment(ctx context.Context, cfg config
 	}, nil
 }
 
-func (f *Fetcher) FetchTraceList(ctx context.Context, cfg config.Config, envName, query string, limit int) ([]domain.TraceListItem, error) {
+func (f *Fetcher) FetchTraceList(ctx context.Context, cfg config.Config, envName, query string, limit int, window TraceSearchWindow) ([]domain.TraceListItem, error) {
 	env, ok := findEnvironment(cfg, envName)
 	if !ok {
 		runlog.Warn("environment not found for browse", "environment", envName)
 		return nil, fmt.Errorf("%w: %s", ErrEnvironmentNotFound, envName)
 	}
-	runlog.Info("fetching trace list", "environment", env.Name, "query", strings.TrimSpace(query), "limit", limit)
 
-	items, err := f.client.SearchTraces(ctx, env, query, limit)
+	startAt, endAt, hasStartAt, hasEndAt := normalizeTraceSearchWindow(window, time.Now())
+	searchOpts := grafana.TraceSearchOptions{
+		StartAt:    startAt,
+		EndAt:      endAt,
+		HasStartAt: hasStartAt,
+		HasEndAt:   hasEndAt,
+		SPSS:       window.SPSS,
+	}
+	runlog.Info(
+		"fetching trace list",
+		"environment", env.Name,
+		"query", strings.TrimSpace(query),
+		"limit", limit,
+		"start_unix", traceSearchUnix(startAt, hasStartAt),
+		"end_unix", traceSearchUnix(endAt, hasEndAt),
+		"spss", searchOpts.SPSS,
+	)
+
+	canUseCache := window.HasStartAt && window.HasEndAt
+	if canUseCache {
+		cached, ok, cacheErr := loadTraceListCache(env.Name, query, limit, searchOpts.SPSS, startAt, endAt)
+		if cacheErr != nil {
+			runlog.Warn("trace list cache read failed", "environment", env.Name, "error", cacheErr)
+		} else if ok {
+			runlog.Info("trace list cache hit", "environment", env.Name, "query", strings.TrimSpace(query), "trace_count", len(cached), "start_unix", traceSearchUnix(startAt, hasStartAt), "end_unix", traceSearchUnix(endAt, hasEndAt))
+			return cached, nil
+		}
+	}
+
+	items, err := f.client.SearchTraces(ctx, env, query, limit, searchOpts)
 	if err != nil {
 		runlog.Error("failed searching traces", "environment", env.Name, "error", err)
 		return nil, err
@@ -467,8 +504,49 @@ func (f *Fetcher) FetchTraceList(ctx context.Context, cfg config.Config, envName
 	}
 
 	_ = g.Wait()
+	if canUseCache {
+		if err := saveTraceListCache(env.Name, query, limit, searchOpts.SPSS, startAt, endAt, enriched); err != nil {
+			runlog.Warn("trace list cache write failed", "environment", env.Name, "error", err)
+		} else {
+			runlog.Info("trace list cache stored", "environment", env.Name, "query", strings.TrimSpace(query), "trace_count", len(enriched), "start_unix", traceSearchUnix(startAt, hasStartAt), "end_unix", traceSearchUnix(endAt, hasEndAt))
+		}
+	}
 	runlog.Info("trace list enrichment completed", "environment", env.Name, "trace_count", len(enriched))
 	return enriched, nil
+}
+
+func normalizeTraceSearchWindow(window TraceSearchWindow, now time.Time) (time.Time, time.Time, bool, bool) {
+	startAt := window.StartAt
+	endAt := window.EndAt
+	hasStartAt := window.HasStartAt
+	hasEndAt := window.HasEndAt
+
+	since := window.Since
+	if since < 0 {
+		since = -since
+	}
+	if since > 0 {
+		if !hasEndAt {
+			endAt = now
+			hasEndAt = true
+		}
+		if !hasStartAt {
+			startAt = endAt.Add(-since)
+			hasStartAt = true
+		}
+	}
+
+	if hasStartAt && hasEndAt && endAt.Before(startAt) {
+		startAt, endAt = endAt, startAt
+	}
+	return startAt, endAt, hasStartAt, hasEndAt
+}
+
+func traceSearchUnix(value time.Time, enabled bool) int64 {
+	if !enabled || value.IsZero() {
+		return 0
+	}
+	return value.Unix()
 }
 
 func (f *Fetcher) FetchTraceQueryFields(ctx context.Context, cfg config.Config, envName string) ([]string, error) {
