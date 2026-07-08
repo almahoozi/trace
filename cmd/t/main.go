@@ -39,6 +39,8 @@ func main() {
 		configPath  string
 		forceFetch  bool
 		queryFlags  multiStringFlag
+		timeWindowRaw string
+		durationRaw string
 	)
 
 	flag.BoolVar(&showVersion, "v", false, "print version information and exit")
@@ -47,19 +49,39 @@ func main() {
 	flag.BoolVar(&forceFetch, "force", false, "force operations (trace fetch bypass cache, config import skip prompt)")
 	flag.Var(&queryFlags, "q", "query clause (repeatable); compiled into TraceQL when used with an environment")
 	flag.Var(&queryFlags, "query", "query clause (repeatable); compiled into TraceQL when used with an environment")
+	flag.StringVar(&timeWindowRaw, "t", "", "time window: <start>/<end> or <start> with -d")
+	flag.StringVar(&timeWindowRaw, "time", "", "time window: <start>/<end> or <start> with --duration")
+	flag.StringVar(&durationRaw, "d", "", "duration for -t <start> mode (Go duration, e.g. 1h10m)")
+	flag.StringVar(&durationRaw, "duration", "", "duration for --time <start> mode (Go duration, e.g. 1h10m)")
 	flag.StringVar(&configPath, "config", "", "config file path (defaults to platform config dir)")
 	flag.Parse()
 	args := flag.Args()
-	inlineQueryFlags, cleanedArgs, err := extractInlineQueryFlags(args)
+	inlineFlags, cleanedArgs, err := extractInlineFlags(args)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "invalid query flag usage: %v\n", err)
+		fmt.Fprintf(os.Stderr, "invalid flag usage: %v\n", err)
 		printUsage()
 		os.Exit(1)
 	}
 	args = cleanedArgs
 	queryClauses := append([]string{}, queryFlags.values...)
-	queryClauses = append(queryClauses, inlineQueryFlags...)
-	exportMessage := ""
+	queryClauses = append(queryClauses, inlineFlags.queryClauses...)
+
+	timeWindowRaw = strings.TrimSpace(timeWindowRaw)
+	durationRaw = strings.TrimSpace(durationRaw)
+	if inlineFlags.timeWindow != "" {
+		if timeWindowRaw != "" && !strings.EqualFold(strings.TrimSpace(timeWindowRaw), strings.TrimSpace(inlineFlags.timeWindow)) {
+			fmt.Fprintf(os.Stderr, "cannot combine different -t/--time values\n")
+			os.Exit(1)
+		}
+		timeWindowRaw = strings.TrimSpace(inlineFlags.timeWindow)
+	}
+	if inlineFlags.duration != "" {
+		if durationRaw != "" && !strings.EqualFold(strings.TrimSpace(durationRaw), strings.TrimSpace(inlineFlags.duration)) {
+			fmt.Fprintf(os.Stderr, "cannot combine different -d/--duration values\n")
+			os.Exit(1)
+		}
+		durationRaw = strings.TrimSpace(inlineFlags.duration)
+	}
 
 	if len(args) >= 1 && args[0] == "logs" {
 		if len(args) > 1 {
@@ -126,14 +148,6 @@ func main() {
 			os.Exit(1)
 		}
 		return
-	}
-	if len(args) >= 1 && args[0] == "version" {
-		if len(args) > 1 {
-			fmt.Fprintf(os.Stderr, "invalid command\n")
-			printUsage()
-			os.Exit(1)
-		}
-		showVersion = true
 	}
 
 	initRunLog(configPath)
@@ -203,7 +217,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 				os.Exit(1)
 			}
-			payload, err := config.ExportNonDefaultWithMessage(cfg, exportMessage)
+			payload, err := config.ExportNonDefault(cfg)
 			if err != nil {
 				runlog.Error("failed to export config", "error", err, "config_path", cfg.Path)
 				fmt.Fprintf(os.Stderr, "failed to export config: %v\n", err)
@@ -253,16 +267,8 @@ func main() {
 				fmt.Fprintf(os.Stderr, "failed to diff config patch: %v\n", err)
 				os.Exit(1)
 			}
-			message, err := config.ImportMessage(data)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "failed to parse import metadata: %v\n", err)
-				os.Exit(1)
-			}
 			if len(changes) == 0 {
 				fmt.Fprintf(os.Stdout, "no config changes in %s\n", inPath)
-				if message != "" {
-					fmt.Fprintln(os.Stdout, message)
-				}
 				return
 			}
 			if !forceFetch {
@@ -287,9 +293,6 @@ func main() {
 			}
 			runlog.Info("imported config patch", "config_path", updated.Path, "import_path", inPath, "bytes", len(data))
 			fmt.Fprintf(os.Stdout, "imported config patch from %s\n", inPath)
-			if message != "" {
-				fmt.Fprintln(os.Stdout, message)
-			}
 			return
 		}
 		if len(args) >= 2 && args[1] == "diff" {
@@ -411,30 +414,23 @@ func main() {
 
 	if !isExportMode && !forceFetch && mode.traceID != "" {
 		traceID := strings.TrimSpace(mode.traceID)
-		if snapshotPath, err := app.ResolveSnapshotOpenPath(traceID); err == nil {
-			session, err := app.LoadSessionSnapshot(snapshotPath)
-			if err == nil {
-				if mode.traceInEnvOnly && !strings.EqualFold(strings.TrimSpace(mode.environment), strings.TrimSpace(session.Environment)) {
-					runlog.Info("snapshot environment mismatch; skipping cache", "trace_id", traceID, "requested_environment", mode.environment, "snapshot_environment", session.Environment)
-				} else {
-					runlog.Info("loaded trace session from snapshot cache", "trace_id", traceID, "snapshot_path", snapshotPath)
-					program := tea.NewProgram(tui.NewModel(cfg, session, platform.OpenURL, defaultSnapshotSaver), tea.WithAltScreen())
-					if _, err := program.Run(); err != nil {
-						runlog.Error("trace tui failed", "error", err)
-						fmt.Fprintf(os.Stderr, "tui failed: %v\n", err)
-						os.Exit(1)
-					}
-					summary, err := app.RenderTraceSummaryWithColor(cfg, session, shouldColorizeStdout())
-					if err != nil {
-						runlog.Warn("trace summary render warning", "error", err)
-						fmt.Fprintf(os.Stderr, "trace summary warning: %v\n", err)
-					}
-					if strings.TrimSpace(summary) != "" {
-						fmt.Fprintln(os.Stdout, summary)
-					}
-					return
-				}
+		if session, snapshotPath, ok := loadSnapshotSession(traceID, mode.environment, mode.traceInEnvOnly); ok {
+			runlog.Info("loaded trace session from snapshot cache", "trace_id", traceID, "snapshot_path", snapshotPath)
+			program := tea.NewProgram(tui.NewModel(cfg, session, platform.OpenURL, defaultSnapshotSaver), tea.WithAltScreen())
+			if _, err := program.Run(); err != nil {
+				runlog.Error("trace tui failed", "error", err)
+				fmt.Fprintf(os.Stderr, "tui failed: %v\n", err)
+				os.Exit(1)
 			}
+			summary, err := app.RenderTraceSummaryWithColor(cfg, session, shouldColorizeStdout())
+			if err != nil {
+				runlog.Warn("trace summary render warning", "error", err)
+				fmt.Fprintf(os.Stderr, "trace summary warning: %v\n", err)
+			}
+			if strings.TrimSpace(summary) != "" {
+				fmt.Fprintln(os.Stdout, summary)
+			}
+			return
 		}
 	}
 
@@ -510,14 +506,18 @@ func main() {
 	if mode.isBrowse {
 		runlog.Info("browse mode started", "environment", mode.environment, "query", mode.query)
 		environmentNames := orderedEnvironmentNames(cfg.Environments)
-		queryFields := []string{}
-		fieldsCtx, fieldsCancel := context.WithTimeout(context.Background(), 3*time.Second)
-		if tags, tagsErr := fetcher.FetchTraceQueryFields(fieldsCtx, cfg, mode.environment); tagsErr == nil {
-			queryFields = tags
-		} else {
-			runlog.Debug("failed to fetch trace query fields", "environment", mode.environment, "error", tagsErr)
+		defaultBrowseLimit := 50
+		defaultBrowseSPSS := 3
+		defaultBrowseSince := parseDurationAbsOrDefault(cfg.Logs.Since, 60*time.Minute)
+		window := app.TraceSearchWindow{Since: defaultBrowseSince, SPSS: defaultBrowseSPSS}
+		if override, hasOverride, parseErr := parseBrowseWindowOverride(timeWindowRaw, durationRaw); parseErr != nil {
+			fmt.Fprintf(os.Stderr, "invalid time window flags: %v\n", parseErr)
+			os.Exit(1)
+		} else if hasOverride {
+			override.SPSS = defaultBrowseSPSS
+			window = override
 		}
-		fieldsCancel()
+		queryFields := []string{}
 
 		items := []domain.TraceListItem{}
 		if !mode.openQueryBuilder {
@@ -528,7 +528,7 @@ func main() {
 			status := startProgressStatus(fmt.Sprintf("%s traces in %s", statusLabel, mode.environment))
 			defer status.Stop()
 			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Grafana.TimeoutSeconds+10)*time.Second)
-			items, err = fetcher.FetchTraceList(ctx, cfg, mode.environment, mode.query, 50)
+			items, err = fetcher.FetchTraceList(ctx, cfg, mode.environment, mode.query, defaultBrowseLimit, window)
 			cancel()
 			status.Stop()
 			if err != nil {
@@ -545,10 +545,23 @@ func main() {
 				mode.environment,
 				mode.query,
 				mode.openQueryBuilder,
+				defaultBrowseLimit,
+				defaultBrowseSPSS,
+				window.Since,
+				window.StartAt,
+				window.EndAt,
+				window.HasStartAt,
+				window.HasEndAt,
 				environmentNames,
 				queryFields,
 				items,
 				func(ctx context.Context, environment, traceID string) (*domain.Session, error) {
+					if !forceFetch {
+						if session, snapshotPath, ok := loadSnapshotSession(traceID, environment, true); ok {
+							runlog.Info("loaded trace session from snapshot cache", "trace_id", traceID, "environment", environment, "snapshot_path", snapshotPath)
+							return session, nil
+						}
+					}
 					session, err := fetcher.FetchTraceSessionInEnvironment(ctx, cfg, environment, traceID)
 					if err != nil {
 						return nil, err
@@ -558,8 +571,20 @@ func main() {
 					}
 					return session, nil
 				},
-				func(ctx context.Context, environment, query string) ([]domain.TraceListItem, error) {
-					return fetcher.FetchTraceList(ctx, cfg, environment, query, 50)
+				func(ctx context.Context, environment, query string, limit, spss int, since time.Duration, startAt, endAt time.Time, hasStartAt, hasEndAt bool) ([]domain.TraceListItem, error) {
+					return fetcher.FetchTraceList(ctx, cfg, environment, query, limit, app.TraceSearchWindow{
+						Since:      since,
+						StartAt:    startAt,
+						EndAt:      endAt,
+						HasStartAt: hasStartAt,
+						HasEndAt:   hasEndAt,
+						SPSS:       spss,
+					})
+				},
+				func(ctx context.Context) ([]string, error) {
+					fieldsCtx, fieldsCancel := context.WithTimeout(ctx, 3*time.Second)
+					defer fieldsCancel()
+					return fetcher.FetchTraceQueryFields(fieldsCtx, cfg, mode.environment)
 				},
 				platform.OpenURL,
 			),
@@ -573,7 +598,13 @@ func main() {
 		}
 		browseModel, ok := finalModel.(tui.BrowseModel)
 		if ok {
-			if session := browseModel.LastSession(); session != nil {
+			sessions := browseModel.OpenedSessions()
+			if len(sessions) == 0 {
+				if session := browseModel.LastSession(); session != nil {
+					sessions = append(sessions, session)
+				}
+			}
+			for _, session := range sessions {
 				summary, err := app.RenderTraceSummaryWithColor(cfg, session, shouldColorizeStdout())
 				if err != nil {
 					runlog.Warn("trace summary render warning", "error", err)
@@ -836,12 +867,12 @@ func looksLikeTraceID(value string) bool {
 
 func printUsage() {
 	fmt.Fprintf(os.Stderr, "usage: %s [-v|--version] [--config path] <trace-id>\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "       %s version\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [-f|--force] [--config path] <trace-id>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [-f|--force] [--config path] <env> <trace-id>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] q|query\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] <env> q|query\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] <env> -q/--query <clause> [-q/--query <clause> ...]\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--config path] <env> [-q <clause> ...] [-t <start>/<end> | -t <start> -d <duration>]\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] <env> [query]\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] export <trace-id> [file]\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] open <file>\n", os.Args[0])
@@ -849,7 +880,7 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "       %s [--config path] caches clear\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config edit\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "       %s [--config path] config export [-m|--message <text>] [file]\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--config path] config export [file]\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config import <file>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config diff <file>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] logs\n", os.Args[0])
@@ -876,39 +907,89 @@ func (f *multiStringFlag) Set(value string) error {
 	return nil
 }
 
-func extractInlineQueryFlags(args []string) ([]string, []string, error) {
-	clauses := []string{}
+type inlineFlags struct {
+	queryClauses []string
+	timeWindow   string
+	duration     string
+}
+
+func extractInlineFlags(args []string) (inlineFlags, []string, error) {
+	flags := inlineFlags{}
 	cleaned := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
 		arg := strings.TrimSpace(args[i])
 		switch {
 		case arg == "-q" || arg == "--query":
 			if i+1 >= len(args) {
-				return nil, nil, fmt.Errorf("%s requires a value", arg)
+				return inlineFlags{}, nil, fmt.Errorf("%s requires a value", arg)
 			}
 			next := strings.TrimSpace(args[i+1])
 			if next == "" {
-				return nil, nil, fmt.Errorf("%s requires a non-empty value", arg)
+				return inlineFlags{}, nil, fmt.Errorf("%s requires a non-empty value", arg)
 			}
-			clauses = append(clauses, next)
+			flags.queryClauses = append(flags.queryClauses, next)
 			i++
 		case strings.HasPrefix(arg, "-q="):
 			value := strings.TrimSpace(strings.TrimPrefix(arg, "-q="))
 			if value == "" {
-				return nil, nil, fmt.Errorf("-q requires a non-empty value")
+				return inlineFlags{}, nil, fmt.Errorf("-q requires a non-empty value")
 			}
-			clauses = append(clauses, value)
+			flags.queryClauses = append(flags.queryClauses, value)
 		case strings.HasPrefix(arg, "--query="):
 			value := strings.TrimSpace(strings.TrimPrefix(arg, "--query="))
 			if value == "" {
-				return nil, nil, fmt.Errorf("--query requires a non-empty value")
+				return inlineFlags{}, nil, fmt.Errorf("--query requires a non-empty value")
 			}
-			clauses = append(clauses, value)
+			flags.queryClauses = append(flags.queryClauses, value)
+		case arg == "-t" || arg == "--time":
+			if i+1 >= len(args) {
+				return inlineFlags{}, nil, fmt.Errorf("%s requires a value", arg)
+			}
+			next := strings.TrimSpace(args[i+1])
+			if next == "" {
+				return inlineFlags{}, nil, fmt.Errorf("%s requires a non-empty value", arg)
+			}
+			flags.timeWindow = next
+			i++
+		case strings.HasPrefix(arg, "-t="):
+			value := strings.TrimSpace(strings.TrimPrefix(arg, "-t="))
+			if value == "" {
+				return inlineFlags{}, nil, fmt.Errorf("-t requires a non-empty value")
+			}
+			flags.timeWindow = value
+		case strings.HasPrefix(arg, "--time="):
+			value := strings.TrimSpace(strings.TrimPrefix(arg, "--time="))
+			if value == "" {
+				return inlineFlags{}, nil, fmt.Errorf("--time requires a non-empty value")
+			}
+			flags.timeWindow = value
+		case arg == "-d" || arg == "--duration":
+			if i+1 >= len(args) {
+				return inlineFlags{}, nil, fmt.Errorf("%s requires a value", arg)
+			}
+			next := strings.TrimSpace(args[i+1])
+			if next == "" {
+				return inlineFlags{}, nil, fmt.Errorf("%s requires a non-empty value", arg)
+			}
+			flags.duration = next
+			i++
+		case strings.HasPrefix(arg, "-d="):
+			value := strings.TrimSpace(strings.TrimPrefix(arg, "-d="))
+			if value == "" {
+				return inlineFlags{}, nil, fmt.Errorf("-d requires a non-empty value")
+			}
+			flags.duration = value
+		case strings.HasPrefix(arg, "--duration="):
+			value := strings.TrimSpace(strings.TrimPrefix(arg, "--duration="))
+			if value == "" {
+				return inlineFlags{}, nil, fmt.Errorf("--duration requires a non-empty value")
+			}
+			flags.duration = value
 		default:
 			cleaned = append(cleaned, args[i])
 		}
 	}
-	return clauses, cleaned, nil
+	return flags, cleaned, nil
 }
 
 func isQueryBuilderToken(value string) bool {
@@ -944,6 +1025,26 @@ func defaultSnapshotSaver(session *domain.Session) (string, error) {
 		return "", err
 	}
 	return path, nil
+}
+
+func loadSnapshotSession(traceID, requestedEnvironment string, requireEnvironmentMatch bool) (*domain.Session, string, bool) {
+	trimmedTraceID := strings.TrimSpace(traceID)
+	if trimmedTraceID == "" {
+		return nil, "", false
+	}
+	snapshotPath, err := app.ResolveSnapshotOpenPath(trimmedTraceID)
+	if err != nil {
+		return nil, "", false
+	}
+	session, err := app.LoadSessionSnapshot(snapshotPath)
+	if err != nil || session == nil {
+		return nil, "", false
+	}
+	if requireEnvironmentMatch && !strings.EqualFold(strings.TrimSpace(requestedEnvironment), strings.TrimSpace(session.Environment)) {
+		runlog.Info("snapshot environment mismatch; skipping cache", "trace_id", trimmedTraceID, "requested_environment", requestedEnvironment, "snapshot_environment", session.Environment)
+		return nil, "", false
+	}
+	return session, snapshotPath, true
 }
 
 var snapshotCleanupState struct {
@@ -1068,6 +1169,84 @@ func sinceWindow(since string, now time.Time) (time.Time, time.Time) {
 		start, end = end, start
 	}
 	return start, end
+}
+
+func parseDurationAbsOrDefault(raw string, fallback time.Duration) time.Duration {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(trimmed)
+	if err != nil {
+		return fallback
+	}
+	if d < 0 {
+		d = -d
+	}
+	if d == 0 {
+		return fallback
+	}
+	return d
+}
+
+func parseBrowseWindowOverride(timeRaw, durationRaw string) (app.TraceSearchWindow, bool, error) {
+	timeRaw = strings.TrimSpace(timeRaw)
+	durationRaw = strings.TrimSpace(durationRaw)
+	if timeRaw == "" && durationRaw == "" {
+		return app.TraceSearchWindow{}, false, nil
+	}
+	if timeRaw == "" && durationRaw != "" {
+		return app.TraceSearchWindow{}, false, fmt.Errorf("-d/--duration requires -t/--time")
+	}
+
+	window := app.TraceSearchWindow{Since: 0}
+	if strings.Contains(timeRaw, "/") {
+		parts := strings.SplitN(timeRaw, "/", 2)
+		if len(parts) != 2 {
+			return app.TraceSearchWindow{}, false, fmt.Errorf("invalid -t format")
+		}
+		startRaw := strings.TrimSpace(parts[0])
+		endRaw := strings.TrimSpace(parts[1])
+		if startRaw == "" || endRaw == "" {
+			return app.TraceSearchWindow{}, false, fmt.Errorf("both start and end are required in -t start/end")
+		}
+		startAt, err := time.Parse(time.RFC3339, startRaw)
+		if err != nil {
+			return app.TraceSearchWindow{}, false, fmt.Errorf("invalid start time %q: %w", startRaw, err)
+		}
+		endAt, err := time.Parse(time.RFC3339, endRaw)
+		if err != nil {
+			return app.TraceSearchWindow{}, false, fmt.Errorf("invalid end time %q: %w", endRaw, err)
+		}
+		window.StartAt = startAt.UTC()
+		window.EndAt = endAt.UTC()
+		window.HasStartAt = true
+		window.HasEndAt = true
+		if durationRaw != "" {
+			return app.TraceSearchWindow{}, false, fmt.Errorf("-d/--duration cannot be combined with -t start/end")
+		}
+		return window, true, nil
+	}
+
+	startAt, err := time.Parse(time.RFC3339, timeRaw)
+	if err != nil {
+		return app.TraceSearchWindow{}, false, fmt.Errorf("invalid time %q: %w", timeRaw, err)
+	}
+	if durationRaw == "" {
+		return app.TraceSearchWindow{}, false, fmt.Errorf("-t <start> requires -d/--duration")
+	}
+	d, err := time.ParseDuration(durationRaw)
+	if err != nil {
+		return app.TraceSearchWindow{}, false, fmt.Errorf("invalid duration %q: %w", durationRaw, err)
+	}
+	if d <= 0 {
+		return app.TraceSearchWindow{}, false, fmt.Errorf("duration must be > 0")
+	}
+	window.StartAt = startAt.UTC()
+	window.EndAt = startAt.Add(d).UTC()
+	window.HasStartAt = true
+	window.HasEndAt = true
+	return window, true, nil
 }
 
 func windowsOverlap(aStart, aEnd, bStart, bEnd time.Time) bool {

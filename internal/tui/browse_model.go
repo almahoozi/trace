@@ -13,7 +13,8 @@ import (
 )
 
 type fetchSessionFunc func(context.Context, string, string) (*domain.Session, error)
-type fetchListFunc func(context.Context, string, string) ([]domain.TraceListItem, error)
+type fetchListFunc func(context.Context, string, string, int, int, time.Duration, time.Time, time.Time, bool, bool) ([]domain.TraceListItem, error)
+type fetchQueryFieldsFunc func(context.Context) ([]string, error)
 
 type BrowseModel struct {
 	cfg          config.Config
@@ -26,29 +27,35 @@ type BrowseModel struct {
 	filtered     []domain.TraceListItem
 	fetchSession fetchSessionFunc
 	fetchList    fetchListFunc
+	loadQueryFields fetchQueryFieldsFunc
 	openURL      func(string) error
 
-	width         int
-	height        int
-	hOffset       int
-	cursor        int
-	loadingTrace  bool
-	loadingList   bool
-	searchRaw     string
-	search        *searchPrompt
-	searchMatch   *searchMatcher
-	queryBuilder  *queryBuilder
-	querySince    time.Duration
-	queryStartAt  time.Time
-	queryEndAt    time.Time
-	hasQueryStart bool
-	hasQueryEnd   bool
-	pendingGG     bool
-	status        string
+	width          int
+	height         int
+	hOffset        int
+	scrollTop      int
+	cursor         int
+	loadingTrace   bool
+	loadingList    bool
+	searchRaw      string
+	search         *searchPrompt
+	searchMatch    *searchMatcher
+	queryBuilder   *queryBuilder
+	queryLimit     int
+	querySPSS      int
+	querySince     time.Duration
+	queryStartAt   time.Time
+	queryEndAt     time.Time
+	hasQueryStart  bool
+	hasQueryEnd    bool
+	pendingGG      bool
+	status         string
+	lastQueryError string
 
 	configView  *ConfigModel
 	viewer      *Model
 	lastSession *domain.Session
+	openedSessions []*domain.Session
 }
 
 type browseLoadResultMsg struct {
@@ -63,7 +70,12 @@ type browseReloadResultMsg struct {
 	err   error
 }
 
-func NewBrowseModel(cfg config.Config, envName, query string, openQueryBuilder bool, environments []string, queryFields []string, items []domain.TraceListItem, fetchSession fetchSessionFunc, fetchList fetchListFunc, openURL func(string) error) BrowseModel {
+type queryFieldsLoadedMsg struct {
+	fields []string
+	err    error
+}
+
+func NewBrowseModel(cfg config.Config, envName, query string, openQueryBuilder bool, initialLimit, initialSPSS int, initialSince time.Duration, initialStartAt, initialEndAt time.Time, hasInitialStart, hasInitialEnd bool, environments []string, queryFields []string, items []domain.TraceListItem, fetchSession fetchSessionFunc, fetchList fetchListFunc, loadQueryFields fetchQueryFieldsFunc, openURL func(string) error) BrowseModel {
 	status := fmt.Sprintf("env=%s traces=%d", envName, len(items))
 	if strings.TrimSpace(query) != "" {
 		status = fmt.Sprintf("env=%s query=%q traces=%d", envName, query, len(items))
@@ -83,14 +95,21 @@ func NewBrowseModel(cfg config.Config, envName, query string, openQueryBuilder b
 		filtered:     items,
 		fetchSession: fetchSession,
 		fetchList:    fetchList,
+		loadQueryFields: loadQueryFields,
 		openURL:      openURL,
-		querySince:   parseBrowseSince(cfg.Logs.Since),
+		queryLimit:   max(1, initialLimit),
+		querySPSS:    max(1, initialSPSS),
+		querySince:   initialSince,
+		queryStartAt: initialStartAt,
+		queryEndAt:   initialEndAt,
+		hasQueryStart: hasInitialStart,
+		hasQueryEnd: hasInitialEnd,
 		status:       status,
 	}
 	b.items = filterTraceItemsByWindow(items, b.querySince, b.queryStartAt, b.queryEndAt, b.hasQueryStart, b.hasQueryEnd, time.Now())
 	b.filtered = b.items
 	if openQueryBuilder {
-		b.queryBuilder = newQueryBuilder(query, b.availableQueryFields(), b.environments, b.environment, 0, 0, b.querySince, b.queryStartAt, b.queryEndAt, b.hasQueryStart, b.hasQueryEnd, "")
+		b.queryBuilder = newQueryBuilder(query, b.availableQueryFields(), b.environments, b.environment, b.queryLimit, b.querySPSS, b.querySince, b.queryStartAt, b.queryEndAt, b.hasQueryStart, b.hasQueryEnd, b.lastQueryError)
 		b.queryBuilder.SetSize(b.width, b.height)
 		b.status = "query builder: edit clauses and press enter"
 	}
@@ -101,8 +120,28 @@ func (m BrowseModel) LastSession() *domain.Session {
 	return m.lastSession
 }
 
+func (m BrowseModel) OpenedSessions() []*domain.Session {
+	if len(m.openedSessions) == 0 {
+		return nil
+	}
+	out := make([]*domain.Session, 0, len(m.openedSessions))
+	for _, session := range m.openedSessions {
+		if session != nil {
+			out = append(out, session)
+		}
+	}
+	return out
+}
+
 func (m BrowseModel) Init() tea.Cmd {
-	return nil
+	if m.loadQueryFields == nil {
+		return nil
+	}
+	loader := m.loadQueryFields
+	return func() tea.Msg {
+		fields, err := loader(context.Background())
+		return queryFieldsLoadedMsg{fields: fields, err: err}
+	}
 }
 
 func (m BrowseModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -166,6 +205,16 @@ func (m BrowseModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.hOffset = min(m.hOffset, m.maxHorizontalOffset())
+		m.ensureCursorVisible(0)
+		return m, nil
+	case queryFieldsLoadedMsg:
+		m.loadQueryFields = nil
+		if msg.err != nil {
+			return m, nil
+		}
+		if len(msg.fields) > 0 {
+			m.queryFields = msg.fields
+		}
 		return m, nil
 	case browseLoadResultMsg:
 		m.loadingTrace = false
@@ -175,6 +224,9 @@ func (m BrowseModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.status = fmt.Sprintf("loaded trace %s", msg.traceID)
 		m.lastSession = msg.session
+		if msg.session != nil {
+			m.openedSessions = append(m.openedSessions, msg.session)
+		}
 		viewer := NewModel(m.cfg, msg.session, m.openURL, defaultSnapshotSaver)
 		if m.width > 0 && m.height > 0 {
 			updated, _ := viewer.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
@@ -187,9 +239,11 @@ func (m BrowseModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case browseReloadResultMsg:
 		m.loadingList = false
 		if msg.err != nil {
+			m.lastQueryError = msg.err.Error()
 			m.status = fmt.Sprintf("reload failed: %v", msg.err)
 			return m, nil
 		}
+		m.lastQueryError = ""
 		m.query = msg.query
 		m.items = filterTraceItemsByWindow(msg.items, m.querySince, m.queryStartAt, m.queryEndAt, m.hasQueryStart, m.hasQueryEnd, time.Now())
 		m.applySearchFilter()
@@ -210,7 +264,7 @@ func (m BrowseModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if key == ":" {
-			m.queryBuilder = newQueryBuilder(m.query, m.availableQueryFields(), m.environments, m.environment, 0, 0, m.querySince, m.queryStartAt, m.queryEndAt, m.hasQueryStart, m.hasQueryEnd, "")
+			m.queryBuilder = newQueryBuilder(m.query, m.availableQueryFields(), m.environments, m.environment, m.queryLimit, m.querySPSS, m.querySince, m.queryStartAt, m.queryEndAt, m.hasQueryStart, m.hasQueryEnd, m.lastQueryError)
 			m.queryBuilder.SetSize(m.width, m.height)
 			m.status = "query builder: edit clauses and press enter"
 			return m, nil
@@ -247,26 +301,32 @@ func (m BrowseModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.isMoveUp(key) && m.cursor > 0 {
 			m.cursor--
+			m.ensureCursorVisible(-1)
 			return m, nil
 		}
 		if m.isMoveDown(key) && m.cursor < len(m.filtered)-1 {
 			m.cursor++
+			m.ensureCursorVisible(1)
 			return m, nil
 		}
 		if m.isPageDown(key) && len(m.filtered) > 0 {
 			m.cursor = min(len(m.filtered)-1, m.cursor+m.listRows())
+			m.ensureCursorVisible(1)
 			return m, nil
 		}
 		if m.isPageUp(key) && len(m.filtered) > 0 {
 			m.cursor = max(0, m.cursor-m.listRows())
+			m.ensureCursorVisible(-1)
 			return m, nil
 		}
 		if m.isHalfPageDown(key) && len(m.filtered) > 0 {
 			m.cursor = min(len(m.filtered)-1, m.cursor+m.halfPageRows())
+			m.ensureCursorVisible(1)
 			return m, nil
 		}
 		if m.isHalfPageUp(key) && len(m.filtered) > 0 {
 			m.cursor = max(0, m.cursor-m.halfPageRows())
+			m.ensureCursorVisible(-1)
 			return m, nil
 		}
 		if !m.loadingTrace && !m.loadingList && strings.EqualFold(key, "enter") {
@@ -329,7 +389,7 @@ func (m BrowseModel) View() string {
 	b.WriteString("\n")
 
 	rows := m.listRows()
-	start, end := browseWindow(len(m.filtered), m.cursor, rows)
+	start, end := m.visibleWindow(rows)
 	for i := start; i < end; i++ {
 		item := m.filtered[i]
 		prefix := "  "
@@ -375,6 +435,72 @@ func (m BrowseModel) View() string {
 	}
 
 	return clampToHeight(b.String(), m.height)
+}
+
+func (m *BrowseModel) ensureCursorVisible(moveDir int) {
+	rows := m.listRows()
+	total := len(m.filtered)
+	if total <= 0 {
+		m.scrollTop = 0
+		return
+	}
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+	if m.cursor >= total {
+		m.cursor = total - 1
+	}
+	if rows <= 0 {
+		rows = 1
+	}
+	maxTop := max(0, total-rows)
+	if m.scrollTop < 0 {
+		m.scrollTop = 0
+	}
+	if m.scrollTop > maxTop {
+		m.scrollTop = maxTop
+	}
+
+	bottom := m.scrollTop + rows - 1
+	if moveDir > 0 {
+		if m.cursor > bottom {
+			m.scrollTop = min(maxTop, m.cursor-rows+1)
+		}
+		return
+	}
+	if moveDir < 0 {
+		threshold := m.scrollTop + 1
+		if m.cursor < threshold {
+			m.scrollTop = max(0, m.cursor-1)
+		}
+		return
+	}
+	if m.cursor < m.scrollTop {
+		m.scrollTop = m.cursor
+	}
+	if m.cursor > bottom {
+		m.scrollTop = min(maxTop, m.cursor-rows+1)
+	}
+}
+
+func (m BrowseModel) visibleWindow(rows int) (int, int) {
+	total := len(m.filtered)
+	if total <= 0 {
+		return 0, 0
+	}
+	if rows <= 0 {
+		rows = 1
+	}
+	start := m.scrollTop
+	maxTop := max(0, total-rows)
+	if start < 0 {
+		start = 0
+	}
+	if start > maxTop {
+		start = maxTop
+	}
+	end := min(total, start+rows)
+	return start, end
 }
 
 func (m BrowseModel) viewQueryBuilderOnly() string {
@@ -570,6 +696,7 @@ func (m *BrowseModel) applySearchFilter() {
 	if m.cursor >= len(m.filtered) {
 		m.cursor = max(0, len(m.filtered)-1)
 	}
+	m.ensureCursorVisible(0)
 }
 
 func (m BrowseModel) current() (domain.TraceListItem, bool) {
@@ -624,7 +751,7 @@ func (m BrowseModel) reloadListCmd(environment, query string) tea.Cmd {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(m.cfg.Grafana.TimeoutSeconds+10)*time.Second)
 		defer cancel()
-		items, err := m.fetchList(ctx, environment, query)
+		items, err := m.fetchList(ctx, environment, query, m.queryLimit, m.querySPSS, m.querySince, m.queryStartAt, m.queryEndAt, m.hasQueryStart, m.hasQueryEnd)
 		return browseReloadResultMsg{query: query, items: items, err: err}
 	}
 }
@@ -637,14 +764,9 @@ func (m BrowseModel) updateQueryBuilder(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if result.Quit {
 		return m, tea.Quit
 	}
-	m.querySince = result.Since
 	if env := strings.TrimSpace(result.Environment); env != "" {
 		m.environment = env
 	}
-	m.queryStartAt = result.StartAt
-	m.queryEndAt = result.EndAt
-	m.hasQueryStart = result.HasStartAt
-	m.hasQueryEnd = result.HasEndAt
 	if result.Cancel {
 		m.queryBuilder = nil
 		m.status = "query builder cancelled"
@@ -653,6 +775,13 @@ func (m BrowseModel) updateQueryBuilder(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if !result.Apply {
 		return m, result.Cmd
 	}
+	m.querySince = result.Since
+	m.queryLimit = max(1, result.Limit)
+	m.querySPSS = max(1, result.SPSS)
+	m.queryStartAt = result.StartAt
+	m.queryEndAt = result.EndAt
+	m.hasQueryStart = result.HasStartAt
+	m.hasQueryEnd = result.HasEndAt
 	m.queryBuilder = nil
 	m.loadingList = true
 	m.query = result.Query
