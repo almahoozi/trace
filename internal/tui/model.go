@@ -87,6 +87,10 @@ type Model struct {
 
 	searchPrompt *searchPrompt
 
+	visualMode   bool
+	visualScope  selectionScope
+	visualAnchor int
+
 	status string
 
 	programCreatedAt  time.Time
@@ -95,6 +99,15 @@ type Model struct {
 	onLogsReady       func(*domain.Session)
 	logsLoadErr       string
 }
+
+type selectionScope int
+
+const (
+	selectionScopeNone selectionScope = iota
+	selectionScopeTrace
+	selectionScopeLogs
+	selectionScopeValue
+)
 
 type logsLoadedMsg struct {
 	entries []domain.LogEntry
@@ -283,6 +296,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if (m.isAction("global", "back", key) || strings.EqualFold(key, "esc")) && m.disableLineHighlightMode() {
+			m.status = "line highlight mode disabled"
+			return m, nil
+		}
 
 		if key == "/" {
 			m.openSearchPrompt()
@@ -301,6 +318,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if m.handleSearchRepeatShortcut(key) {
+			return m, nil
+		}
+		if m.isVisualToggleKey(key) {
+			m.toggleLineHighlightMode()
+			return m, nil
+		}
+		if m.isYankKey(key) {
+			m.yankSelectionToClipboard()
 			return m, nil
 		}
 
@@ -964,6 +989,14 @@ func isSearchPrevKey(key string) bool {
 	return key == "N" || key == "shift+n"
 }
 
+func (m Model) isVisualToggleKey(key string) bool {
+	return key == "V" || key == "shift+v"
+}
+
+func (m Model) isYankKey(key string) bool {
+	return key == "y"
+}
+
 func isPageDownKey(key string) bool {
 	return keysMatch("pgdown", key) || keysMatch("ctrl+f", key)
 }
@@ -1123,14 +1156,14 @@ func (m Model) View() string {
 	if m.fullscreen {
 		innerHeight := max(1, m.height-headerHeight-2)
 		body := sectionStyle(true, m.width, innerHeight).Render(m.panelView(m.activePanel, innerHeight))
-		footer := mutedStyle.Render(m.status + " | / search | n/N next/prev | gg/G top/bottom | ctrl+f/b page | ctrl+d/u half-page | f fullscreen")
+		footer := mutedStyle.Render(m.status + " | / search | n/N next/prev | gg/G top/bottom | ctrl+f/b page | ctrl+d/u half-page | y yank | V highlight | f fullscreen")
 		if m.searchPrompt != nil {
 			footer += "\n" + mutedStyle.Render(m.searchPrompt.viewLine()) + "\n" + mutedStyle.Render(searchHint())
 		}
 		return clampToHeight(lipgloss.JoinVertical(lipgloss.Left, headerRendered, body, footer), m.height)
 	}
 
-	footer := mutedStyle.Render(m.status + " | / search | n/N next/prev | gg/G top/bottom | ctrl+f/b page | ctrl+d/u half-page | f fullscreen | c collapse | tab/shift+tab switch | F2 config | ? help")
+	footer := mutedStyle.Render(m.status + " | / search | n/N next/prev | gg/G top/bottom | ctrl+f/b page | ctrl+d/u half-page | y yank | V highlight | f fullscreen | c collapse | tab/shift+tab switch | F2 config | ? help")
 	if m.searchPrompt != nil {
 		footer += "\n" + mutedStyle.Render(m.searchPrompt.viewLine()) + "\n" + mutedStyle.Render(searchHint())
 	}
@@ -1444,7 +1477,7 @@ func (m Model) nextPanel(step int) panel {
 }
 
 func (m Model) layout(body string) string {
-	footer := mutedStyle.Render(m.status + " | / search | n/N next/prev | gg/G top/bottom | ctrl+f/b page | ctrl+d/u half-page | ? help | esc back")
+	footer := mutedStyle.Render(m.status + " | / search | n/N next/prev | gg/G top/bottom | ctrl+f/b page | ctrl+d/u half-page | y yank | V highlight | ? help | esc back")
 	if m.searchPrompt != nil {
 		footer += "\n" + mutedStyle.Render(m.searchPrompt.viewLine()) + "\n" + mutedStyle.Render(searchHint())
 	}
@@ -1502,10 +1535,11 @@ func (m Model) traceView(height int) string {
 		left = truncate(left, contentWidth)
 		bar := m.timelineBar(line, barWidth)
 		serviceStyle := m.colorForService(line.Service)
-		b.WriteString(serviceStyle.Render(left))
+		rowStyle := m.traceRowStyle(i)
+		b.WriteString(rowStyle.Render(serviceStyle.Render(left)))
 		b.WriteString("\n")
 		b.WriteString("    ")
-		b.WriteString(serviceStyle.Render(bar))
+		b.WriteString(rowStyle.Render(serviceStyle.Render(bar)))
 		b.WriteString("\n")
 	}
 	if end == len(m.traceLines) {
@@ -1557,7 +1591,12 @@ func (m Model) valueViewView() string {
 	b.WriteString(mutedStyle.Render("esc/enter back"))
 	b.WriteString("\n\n")
 	for i := start; i < end; i++ {
-		b.WriteString(m.valueView.lines[i])
+		prefix := "  "
+		if i == m.valueView.offset {
+			prefix = "> "
+		}
+		line := prefix + m.valueView.lines[i]
+		b.WriteString(m.valueRowStyle(i).Render(line))
 		b.WriteString("\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
@@ -2011,10 +2050,9 @@ func (m Model) logsView(height int) string {
 	for i := start; i < end; i++ {
 		entry := m.filteredLogs[i]
 		prefix := "  "
-		rowStyle := tableRowBandStyle(i)
+		rowStyle := m.logRowStyle(i)
 		if i == m.logCursor {
 			prefix = "> "
-			rowStyle = tableRowCursorStyle
 		}
 		b.WriteString(rowStyle.Render(prefix))
 		b.WriteString(m.renderLogRow(entry, cols, widths, rowStyle))
@@ -2347,7 +2385,7 @@ func (m Model) helpView() string {
 		}
 		b.WriteString("\n")
 	}
-	b.WriteString("Shortcuts are config-driven (config.json). esc/? close help; tab/shift+tab move sections; gg/G top/bottom; n/N next/prev search; ctrl+f/b page; ctrl+d/u half-page; / search.")
+	b.WriteString("Shortcuts are config-driven (config.json). esc/? close help; tab/shift+tab move sections; gg/G top/bottom; n/N next/prev search; ctrl+f/b page; ctrl+d/u half-page; / search; y yank; shift+v line highlight.")
 	b.WriteString(" Press F2 (or Cmd+, when terminal supports it) for config mode.")
 
 	return m.layout(b.String())
@@ -2473,6 +2511,294 @@ func (m Model) currentLog() (domain.LogEntry, bool) {
 		return domain.LogEntry{}, false
 	}
 	return m.filteredLogs[m.logCursor], true
+}
+
+func (m *Model) toggleLineHighlightMode() {
+	if m.valueView != nil {
+		m.toggleModelVisualMode(selectionScopeValue, m.valueView.offset, len(m.valueView.lines))
+		return
+	}
+	if m.jsonTree != nil {
+		enabled := m.jsonTree.ToggleVisualMode()
+		if enabled {
+			m.status = "line highlight mode enabled"
+		} else {
+			m.status = "line highlight mode disabled"
+		}
+		return
+	}
+	if m.activePanel == panelServiceMap {
+		if m.serviceMapTree == nil {
+			m.serviceMapTree = m.newServiceMapTree()
+		}
+		enabled := m.serviceMapTree.ToggleVisualMode()
+		if enabled {
+			m.status = "line highlight mode enabled"
+		} else {
+			m.status = "line highlight mode disabled"
+		}
+		return
+	}
+	if m.activePanel == panelTrace {
+		m.toggleModelVisualMode(selectionScopeTrace, m.traceCursor, len(m.traceLines))
+		return
+	}
+	m.toggleModelVisualMode(selectionScopeLogs, m.logCursor, len(m.filteredLogs))
+}
+
+func (m *Model) toggleModelVisualMode(scope selectionScope, cursor int, total int) {
+	if total == 0 {
+		m.status = "nothing to highlight"
+		return
+	}
+	if m.visualMode && m.visualScope == scope {
+		m.visualMode = false
+		m.visualScope = selectionScopeNone
+		m.visualAnchor = 0
+		m.status = "line highlight mode disabled"
+		return
+	}
+	m.visualMode = true
+	m.visualScope = scope
+	m.visualAnchor = max(0, min(cursor, total-1))
+	m.status = "line highlight mode enabled"
+}
+
+func (m *Model) yankSelectionToClipboard() {
+	lines, err := m.yankSelectionLines()
+	if err != nil {
+		m.status = err.Error()
+		return
+	}
+	for i := range lines {
+		lines[i] = strings.TrimRight(stripANSI(lines[i]), " ")
+	}
+	payload := strings.Join(lines, "\n")
+	if err := writeClipboardText(payload); err != nil {
+		m.status = "copy failed: " + err.Error()
+		return
+	}
+	m.disableLineHighlightMode()
+	if len(lines) == 1 {
+		m.status = "copied 1 line"
+		return
+	}
+	m.status = fmt.Sprintf("copied %d lines", len(lines))
+}
+
+func (m Model) yankSelectionLines() ([]string, error) {
+	if m.valueView != nil {
+		return m.selectedValueLines()
+	}
+	if m.jsonTree != nil {
+		return m.selectedTreeLines(m.jsonTree)
+	}
+	switch m.activePanel {
+	case panelTrace:
+		return m.selectedTraceLines()
+	case panelServiceMap:
+		if m.serviceMapTree == nil {
+			return nil, fmt.Errorf("nothing to copy")
+		}
+		return m.selectedTreeLines(m.serviceMapTree)
+	default:
+		return m.selectedLogLines()
+	}
+}
+
+func (m Model) selectedTraceLines() ([]string, error) {
+	if len(m.traceLines) == 0 {
+		return nil, fmt.Errorf("nothing to copy")
+	}
+	start, end := m.modelSelectionRange(selectionScopeTrace, m.traceCursor, len(m.traceLines))
+	lines := make([]string, 0, end-start+1)
+	depths := make([]int, 0, end-start+1)
+	for i := start; i <= end; i++ {
+		line := m.traceLines[i]
+		lines = append(lines, m.formatTraceCopyLine(line))
+		depths = append(depths, line.Depth)
+	}
+	return normalizeIndentedLines(lines, depths), nil
+}
+
+func (m Model) selectedLogLines() ([]string, error) {
+	if len(m.filteredLogs) == 0 {
+		return nil, fmt.Errorf("nothing to copy")
+	}
+	start, end := m.modelSelectionRange(selectionScopeLogs, m.logCursor, len(m.filteredLogs))
+	lines := make([]string, 0, end-start+1)
+	for i := start; i <= end; i++ {
+		lines = append(lines, m.formatLogCopyLine(m.filteredLogs[i]))
+	}
+	return lines, nil
+}
+
+func (m Model) selectedValueLines() ([]string, error) {
+	if m.valueView == nil || len(m.valueView.lines) == 0 {
+		return nil, fmt.Errorf("nothing to copy")
+	}
+	start, end := m.modelSelectionRange(selectionScopeValue, m.valueView.offset, len(m.valueView.lines))
+	lines := make([]string, 0, end-start+1)
+	for i := start; i <= end; i++ {
+		lines = append(lines, m.valueView.lines[i])
+	}
+	return lines, nil
+}
+
+func (m Model) selectedTreeLines(tree *JSONTree) ([]string, error) {
+	if tree == nil || len(tree.lines) == 0 {
+		return nil, fmt.Errorf("nothing to copy")
+	}
+	start, end := tree.selectionRange()
+	lines := make([]string, 0, end-start+1)
+	depths := make([]int, 0, end-start+1)
+	for i := start; i <= end; i++ {
+		line := tree.lines[i]
+		lines = append(lines, strings.Repeat("  ", line.Depth)+line.Label)
+		depths = append(depths, line.Depth)
+	}
+	return normalizeIndentedLines(lines, depths), nil
+}
+
+func (m Model) modelSelectionRange(scope selectionScope, cursor int, total int) (int, int) {
+	if total <= 0 {
+		return 0, 0
+	}
+	cursor = max(0, min(cursor, total-1))
+	if !m.visualMode || m.visualScope != scope {
+		return cursor, cursor
+	}
+	anchor := max(0, min(m.visualAnchor, total-1))
+	return min(anchor, cursor), max(anchor, cursor)
+}
+
+func (m Model) modelSelectionIncludes(scope selectionScope, index int, cursor int, total int) bool {
+	if !m.visualMode || m.visualScope != scope {
+		return false
+	}
+	if index < 0 || index >= total {
+		return false
+	}
+	start, end := m.modelSelectionRange(scope, cursor, total)
+	return index >= start && index <= end
+}
+
+func (m *Model) disableLineHighlightMode() bool {
+	disabled := false
+	if m.visualMode {
+		disabled = true
+		m.visualMode = false
+		m.visualScope = selectionScopeNone
+		m.visualAnchor = 0
+	}
+	if m.jsonTree != nil && m.jsonTree.DisableVisualMode() {
+		disabled = true
+	}
+	if m.serviceMapTree != nil && m.serviceMapTree.DisableVisualMode() {
+		disabled = true
+	}
+	return disabled
+}
+
+func (m Model) traceRowStyle(index int) lipgloss.Style {
+	selected := m.modelSelectionIncludes(selectionScopeTrace, index, m.traceCursor, len(m.traceLines))
+	if index == m.traceCursor && selected {
+		return tableRowCursorVisualStyle
+	}
+	if selected {
+		return tableRowVisualStyle
+	}
+	return lipgloss.NewStyle()
+}
+
+func (m Model) logRowStyle(index int) lipgloss.Style {
+	selected := m.modelSelectionIncludes(selectionScopeLogs, index, m.logCursor, len(m.filteredLogs))
+	if index == m.logCursor && selected {
+		return tableRowCursorVisualStyle
+	}
+	if index == m.logCursor {
+		return tableRowCursorStyle
+	}
+	if selected {
+		return tableRowVisualStyle
+	}
+	return tableRowBandStyle(index)
+}
+
+func (m Model) valueRowStyle(index int) lipgloss.Style {
+	if m.valueView == nil {
+		return lipgloss.NewStyle()
+	}
+	selected := m.modelSelectionIncludes(selectionScopeValue, index, m.valueView.offset, len(m.valueView.lines))
+	if index == m.valueView.offset && selected {
+		return tableRowCursorVisualStyle
+	}
+	if selected {
+		return tableRowVisualStyle
+	}
+	return lipgloss.NewStyle()
+}
+
+func (m Model) formatTraceCopyLine(line traceLine) string {
+	proxyTag := ""
+	if line.Proxy {
+		proxyTag = " [P]"
+	}
+	marker := ""
+	if line.Error {
+		marker += "!"
+	}
+	if line.LinkCount > 0 {
+		marker += "@"
+	}
+	if marker != "" {
+		marker += " "
+	}
+	durationInfo := formatDurationDisplay(line.Duration)
+	if line.HasKids {
+		durationInfo += " [" + formatDurationDisplay(line.XCost) + "]"
+	}
+	return strings.Repeat("  ", line.Depth) + fmt.Sprintf("- %s%s%s [%s] %s %s", marker, m.spanIcon(line.Kind), proxyTag, defaultDash(line.Service), line.Label, durationInfo)
+}
+
+func normalizeIndentedLines(lines []string, depths []int) []string {
+	if len(lines) == 0 {
+		return lines
+	}
+	if len(lines) == 1 {
+		lines[0] = strings.TrimLeft(lines[0], " \t")
+		return lines
+	}
+	if len(depths) != len(lines) {
+		return lines
+	}
+	base := depths[0]
+	for _, depth := range depths {
+		if depth < base {
+			base = depth
+		}
+	}
+	for i, depth := range depths {
+		normalized := max(0, depth-base)
+		lines[i] = strings.TrimLeft(lines[i], " \t")
+		if normalized > 0 {
+			lines[i] = strings.Repeat("  ", normalized) + lines[i]
+		}
+	}
+	return lines
+}
+
+func (m Model) formatLogCopyLine(entry domain.LogEntry) string {
+	cols := m.logColumns()
+	parts := make([]string, 0, len(cols))
+	for _, col := range cols {
+		parts = append(parts, m.logFieldValue(entry, col.Field))
+	}
+	return strings.Join(parts, " | ")
+}
+
+func stripANSI(s string) string {
+	return ansiEscapePattern.ReplaceAllString(s, "")
 }
 
 func (m Model) levelIndex(level string) int {
@@ -2958,13 +3284,11 @@ var (
 	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
 	mutedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 
-	tableRowBandStyleA  = lipgloss.NewStyle().Background(lipgloss.Color("234"))
-	tableRowBandStyleB  = lipgloss.NewStyle().Background(lipgloss.Color("235"))
-	tableRowCursorStyle = lipgloss.NewStyle().Background(lipgloss.Color("238"))
-	tableRowVisualStyle = lipgloss.NewStyle().Background(lipgloss.Color("236"))
-	tableRowCursorVisualStyle = lipgloss.NewStyle().
-		Background(lipgloss.Color("31")).
-		Foreground(lipgloss.Color("230"))
+	tableRowBandStyleA        = lipgloss.NewStyle().Background(lipgloss.Color("234"))
+	tableRowBandStyleB        = lipgloss.NewStyle().Background(lipgloss.Color("235"))
+	tableRowVisualStyle       = lipgloss.NewStyle().Background(lipgloss.Color("236"))
+	tableRowCursorStyle       = lipgloss.NewStyle().Background(lipgloss.Color("238"))
+	tableRowCursorVisualStyle = lipgloss.NewStyle().Background(lipgloss.Color("61"))
 
 	summaryBrightStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
 	summaryGrayStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
@@ -2973,6 +3297,8 @@ var (
 	summaryWarnStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
 	summaryErrorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
 )
+
+var ansiEscapePattern = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
 func tableRowBandStyle(index int) lipgloss.Style {
 	if index%2 == 0 {
