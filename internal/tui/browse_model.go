@@ -7,6 +7,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/almahoozi/trace/internal/config"
 	"github.com/almahoozi/trace/internal/domain"
@@ -15,20 +16,22 @@ import (
 type fetchSessionFunc func(context.Context, string, string) (*domain.Session, error)
 type fetchListFunc func(context.Context, string, string, int, int, time.Duration, time.Time, time.Time, bool, bool) ([]domain.TraceListItem, error)
 type fetchQueryFieldsFunc func(context.Context) ([]string, error)
+type sessionOpenedFunc func(*domain.Session) error
 
 type BrowseModel struct {
-	cfg          config.Config
-	loc          *time.Location
-	environment  string
-	environments []string
-	query        string
-	queryFields  []string
-	items        []domain.TraceListItem
-	filtered     []domain.TraceListItem
-	fetchSession fetchSessionFunc
-	fetchList    fetchListFunc
+	cfg             config.Config
+	loc             *time.Location
+	environment     string
+	environments    []string
+	query           string
+	queryFields     []string
+	items           []domain.TraceListItem
+	filtered        []domain.TraceListItem
+	fetchSession    fetchSessionFunc
+	fetchList       fetchListFunc
 	loadQueryFields fetchQueryFieldsFunc
-	openURL      func(string) error
+	onSessionOpened sessionOpenedFunc
+	openURL         func(string) error
 
 	width          int
 	height         int
@@ -37,6 +40,8 @@ type BrowseModel struct {
 	cursor         int
 	loadingTrace   bool
 	loadingList    bool
+	visualMode     bool
+	visualAnchor   int
 	searchRaw      string
 	search         *searchPrompt
 	searchMatch    *searchMatcher
@@ -52,9 +57,9 @@ type BrowseModel struct {
 	status         string
 	lastQueryError string
 
-	configView  *ConfigModel
-	viewer      *Model
-	lastSession *domain.Session
+	configView     *ConfigModel
+	viewer         *Model
+	lastSession    *domain.Session
 	openedSessions []*domain.Session
 }
 
@@ -75,7 +80,7 @@ type queryFieldsLoadedMsg struct {
 	err    error
 }
 
-func NewBrowseModel(cfg config.Config, envName, query string, openQueryBuilder bool, initialLimit, initialSPSS int, initialSince time.Duration, initialStartAt, initialEndAt time.Time, hasInitialStart, hasInitialEnd bool, environments []string, queryFields []string, items []domain.TraceListItem, fetchSession fetchSessionFunc, fetchList fetchListFunc, loadQueryFields fetchQueryFieldsFunc, openURL func(string) error) BrowseModel {
+func NewBrowseModel(cfg config.Config, envName, query string, openQueryBuilder bool, initialLimit, initialSPSS int, initialSince time.Duration, initialStartAt, initialEndAt time.Time, hasInitialStart, hasInitialEnd bool, environments []string, queryFields []string, items []domain.TraceListItem, fetchSession fetchSessionFunc, fetchList fetchListFunc, loadQueryFields fetchQueryFieldsFunc, onSessionOpened sessionOpenedFunc, openURL func(string) error) BrowseModel {
 	status := fmt.Sprintf("env=%s traces=%d", envName, len(items))
 	if strings.TrimSpace(query) != "" {
 		status = fmt.Sprintf("env=%s query=%q traces=%d", envName, query, len(items))
@@ -85,26 +90,27 @@ func NewBrowseModel(cfg config.Config, envName, query string, openQueryBuilder b
 		loc = cfgLoc
 	}
 	b := BrowseModel{
-		cfg:          cfg,
-		loc:          loc,
-		environment:  envName,
-		environments: append([]string{}, environments...),
-		query:        query,
-		queryFields:  queryFields,
-		items:        items,
-		filtered:     items,
-		fetchSession: fetchSession,
-		fetchList:    fetchList,
+		cfg:             cfg,
+		loc:             loc,
+		environment:     envName,
+		environments:    append([]string{}, environments...),
+		query:           query,
+		queryFields:     queryFields,
+		items:           items,
+		filtered:        items,
+		fetchSession:    fetchSession,
+		fetchList:       fetchList,
 		loadQueryFields: loadQueryFields,
-		openURL:      openURL,
-		queryLimit:   max(1, initialLimit),
-		querySPSS:    max(1, initialSPSS),
-		querySince:   initialSince,
-		queryStartAt: initialStartAt,
-		queryEndAt:   initialEndAt,
-		hasQueryStart: hasInitialStart,
-		hasQueryEnd: hasInitialEnd,
-		status:       status,
+		onSessionOpened: onSessionOpened,
+		openURL:         openURL,
+		queryLimit:      max(1, initialLimit),
+		querySPSS:       max(1, initialSPSS),
+		querySince:      initialSince,
+		queryStartAt:    initialStartAt,
+		queryEndAt:      initialEndAt,
+		hasQueryStart:   hasInitialStart,
+		hasQueryEnd:     hasInitialEnd,
+		status:          status,
 	}
 	b.items = filterTraceItemsByWindow(items, b.querySince, b.queryStartAt, b.queryEndAt, b.hasQueryStart, b.hasQueryEnd, time.Now())
 	b.filtered = b.items
@@ -226,6 +232,11 @@ func (m BrowseModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastSession = msg.session
 		if msg.session != nil {
 			m.openedSessions = append(m.openedSessions, msg.session)
+			if m.onSessionOpened != nil {
+				if err := m.onSessionOpened(msg.session); err != nil {
+					m.status = fmt.Sprintf("loaded trace %s (cache warning: %v)", msg.traceID, err)
+				}
+			}
 		}
 		viewer := NewModel(m.cfg, msg.session, m.openURL, defaultSnapshotSaver)
 		if m.width > 0 && m.height > 0 {
@@ -258,6 +269,10 @@ func (m BrowseModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.isGlobalAction("quit", key) {
 			return m, tea.Quit
 		}
+		if (m.isGlobalAction("back", key) || strings.EqualFold(key, "esc")) && m.disableLineHighlightMode() {
+			m.status = "line highlight mode disabled"
+			return m, nil
+		}
 		if key == "/" {
 			m.search = newSearchPrompt(m.searchRaw)
 			m.status = "search: type query and press enter"
@@ -279,6 +294,14 @@ func (m BrowseModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if m.handleSearchRepeatShortcut(key) {
+			return m, nil
+		}
+		if m.isVisualToggleKey(key) {
+			m.toggleLineHighlightMode()
+			return m, nil
+		}
+		if m.isYankKey(key) {
+			m.yankSelectionToClipboard()
 			return m, nil
 		}
 
@@ -393,10 +416,9 @@ func (m BrowseModel) View() string {
 	for i := start; i < end; i++ {
 		item := m.filtered[i]
 		prefix := "  "
-		rowStyle := tableRowBandStyle(i)
+		rowStyle := m.rowStyle(i)
 		if i == m.cursor {
 			prefix = "> "
-			rowStyle = tableRowCursorStyle
 		}
 		line := fmt.Sprintf("%s%-*s | %-*s | %-*s | %-*s | %-*s | %-*s",
 			prefix,
@@ -419,7 +441,7 @@ func (m BrowseModel) View() string {
 		}
 	}
 
-	footer := m.status + " | : query builder | / search | n/N next/prev | gg/G top/bottom | <-/-> or h/l scroll | enter open | F2 config | esc back from trace | ctrl+f/b page | ctrl+d/u half page | r reload | q quit"
+	footer := m.status + " | : query builder | / search | n/N next/prev | gg/G top/bottom | <-/-> or h/l scroll | enter open | y yank | shift+v line highlight | F2 config | esc back from trace | ctrl+f/b page | ctrl+d/u half page | r reload | q quit"
 	if m.loadingTrace {
 		footer = "loading trace..."
 	}
@@ -568,6 +590,14 @@ func (m BrowseModel) isHalfPageUp(pressed string) bool {
 	return keysMatch("ctrl+u", pressed)
 }
 
+func (m BrowseModel) isVisualToggleKey(key string) bool {
+	return key == "V" || key == "shift+v"
+}
+
+func (m BrowseModel) isYankKey(key string) bool {
+	return key == "y"
+}
+
 func (m *BrowseModel) consumeGGPrefix(key string) bool {
 	if m.pendingGG {
 		m.pendingGG = false
@@ -636,6 +666,125 @@ func (m *BrowseModel) handleSearchRepeatShortcut(key string) bool {
 		return true
 	}
 	return false
+}
+
+func (m *BrowseModel) toggleLineHighlightMode() {
+	if len(m.filtered) == 0 {
+		m.status = "nothing to highlight"
+		return
+	}
+	if m.visualMode {
+		m.visualMode = false
+		m.visualAnchor = 0
+		m.status = "line highlight mode disabled"
+		return
+	}
+	m.visualMode = true
+	m.visualAnchor = max(0, min(m.cursor, len(m.filtered)-1))
+	m.status = "line highlight mode enabled"
+}
+
+func (m *BrowseModel) disableLineHighlightMode() bool {
+	if !m.visualMode {
+		return false
+	}
+	m.visualMode = false
+	m.visualAnchor = 0
+	return true
+}
+
+func (m *BrowseModel) yankSelectionToClipboard() {
+	if len(m.filtered) == 0 {
+		m.status = "nothing to copy"
+		return
+	}
+
+	if !m.visualMode {
+		item, ok := m.current()
+		if !ok {
+			m.status = "nothing to copy"
+			return
+		}
+		payload := strings.TrimSpace(item.TraceID)
+		if payload == "" {
+			m.status = "nothing to copy"
+			return
+		}
+		if err := writeClipboardText(payload); err != nil {
+			m.status = "copy failed: " + err.Error()
+			return
+		}
+		m.status = "copied trace id"
+		return
+	}
+
+	start, end := m.selectionRange()
+	rows := make([]string, 0, end-start+1)
+	for i := start; i <= end; i++ {
+		rows = append(rows, m.formatCopyRow(m.filtered[i]))
+	}
+	payload := strings.Join(rows, "\n")
+	if err := writeClipboardText(payload); err != nil {
+		m.status = "copy failed: " + err.Error()
+		return
+	}
+	m.disableLineHighlightMode()
+	if len(rows) == 1 {
+		m.status = "copied 1 row"
+		return
+	}
+	m.status = fmt.Sprintf("copied %d rows", len(rows))
+}
+
+func (m BrowseModel) rowStyle(index int) lipgloss.Style {
+	selected := m.selectionIncludes(index)
+	if index == m.cursor && selected {
+		return tableRowCursorVisualStyle
+	}
+	if index == m.cursor {
+		return tableRowCursorStyle
+	}
+	if selected {
+		return tableRowVisualStyle
+	}
+	return tableRowBandStyle(index)
+}
+
+func (m BrowseModel) selectionIncludes(index int) bool {
+	if !m.visualMode {
+		return false
+	}
+	if index < 0 || index >= len(m.filtered) {
+		return false
+	}
+	start, end := m.selectionRange()
+	return index >= start && index <= end
+}
+
+func (m BrowseModel) selectionRange() (int, int) {
+	total := len(m.filtered)
+	if total <= 0 {
+		return 0, 0
+	}
+	cursor := max(0, min(m.cursor, total-1))
+	if !m.visualMode {
+		return cursor, cursor
+	}
+	anchor := max(0, min(m.visualAnchor, total-1))
+	return min(anchor, cursor), max(anchor, cursor)
+}
+
+func (m BrowseModel) formatCopyRow(item domain.TraceListItem) string {
+	return fmt.Sprintf(
+		"%s | %s | %s | %s | %d/%d | %s",
+		formatBrowseStartTime(item.StartTime, m.loc),
+		defaultDash(item.TraceID),
+		defaultDash(item.OperationName),
+		defaultDash(item.Service),
+		item.ErrorSpanCount,
+		item.SpanCount,
+		formatBrowseDuration(item.Duration),
+	)
 }
 
 func (m BrowseModel) updateSearchPrompt(keyMsg tea.KeyMsg) (tea.Model, tea.Cmd) {
