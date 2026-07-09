@@ -2,6 +2,8 @@ package tui
 
 import (
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,6 +16,8 @@ import (
 type queryBuilderResult struct {
 	Query       string
 	Environment string
+	Limit       int
+	SPSS        int
 	Since       time.Duration
 	StartAt     time.Time
 	EndAt       time.Time
@@ -26,22 +30,27 @@ type queryBuilderResult struct {
 }
 
 type queryBuilder struct {
-	rows         []queryRow
-	row          int
-	tableRow     int
-	queryText    string
-	queryCursor  int
-	queryEditing bool
-	width        int
-	height       int
-	fields       []string
-	operators    []string
-	environments []string
-	environment  string
-	timeframe    []timeframeOption
-	timeIdx      int
-	startRaw     string
-	endRaw       string
+	rows          []queryRow
+	row           int
+	tableRow      int
+	queryText     string
+	queryCursor   int
+	queryEditing  bool
+	tableDisabled bool
+	tableReason   string
+	width         int
+	height        int
+	fields        []string
+	operators     []string
+	environments  []string
+	environment   string
+	timeframe     []timeframeOption
+	timeIdx       int
+	limit         int
+	spss          int
+	startRaw      string
+	endRaw        string
+	timeMode      string
 
 	mode string
 
@@ -49,6 +58,7 @@ type queryBuilder struct {
 	rowForm          *huh.Form
 	rowField         string
 	rowOp            string
+	rowType          string
 	rowValue         string
 	rowCustom        string
 	rowFiltering     bool
@@ -56,24 +66,64 @@ type queryBuilder struct {
 
 	globalForm      *huh.Form
 	globalEnv       string
-	globalTimeframe string
+	globalTimeValue string
+	globalLimitRaw  string
+	globalSPSSRaw   string
 	globalStartRaw  string
 	globalEndRaw    string
 	globalFiltering bool
+
+	rangeFrom            dateTimeSegments
+	rangeTo              dateTimeSegments
+	rangeTZ              timezoneSegments
+	rangeDurationRaw     string
+	rangeDurationTouched bool
+	rangeFocus           int
+	rangeError           string
 }
 
 const customFieldOptionValue = "__custom_field__"
 
-func newQueryBuilder(query string, fields, environments []string, activeEnv string, activeSince time.Duration, startAt, endAt time.Time, hasStartAt, hasEndAt bool) *queryBuilder {
+var queryValueTypes = []string{
+	string(traceql.ValueTypeAuto),
+	string(traceql.ValueTypeString),
+	string(traceql.ValueTypeInt),
+	string(traceql.ValueTypeFloat),
+	string(traceql.ValueTypeBool),
+	string(traceql.ValueTypeDuration),
+	string(traceql.ValueTypeEnum),
+}
+
+const (
+	timeModeSince = "since"
+	timeModeRange = "time range"
+)
+
+type dateTimeSegments struct {
+	Day    string
+	Month  string
+	Year   string
+	Hour   string
+	Minute string
+	Second string
+}
+
+type timezoneSegments struct {
+	Kind   string
+	Hour   string
+	Minute string
+}
+
+func newQueryBuilder(query string, fields, environments []string, activeEnv string, activeLimit, activeSPSS int, activeSince time.Duration, startAt, endAt time.Time, hasStartAt, hasEndAt bool, knownQueryError string) *queryBuilder {
 	clauses := traceql.SplitClauses(query)
 	rows := make([]queryRow, 0, len(clauses))
 	for _, clause := range clauses {
 		field, op, value, ok := parseClause(clause)
 		if !ok {
-			rows = append(rows, queryRow{Field: "name", Operator: "=", Value: strings.TrimSpace(clause)})
+			rows = append(rows, queryRow{Field: "name", Operator: "=", Value: strings.TrimSpace(clause), Type: string(traceql.ValueTypeAuto)})
 			continue
 		}
-		rows = append(rows, queryRow{Field: field, Operator: op, Value: strings.TrimSpace(value)})
+		rows = append(rows, queryRow{Field: field, Operator: op, Value: strings.TrimSpace(value), Type: string(traceql.ValueTypeAuto)})
 	}
 
 	availableFields := append([]string{}, defaultQueryFields...)
@@ -135,7 +185,7 @@ func newQueryBuilder(query string, fields, environments []string, activeEnv stri
 		endRaw = endAt.Format(time.RFC3339)
 	}
 
-	return &queryBuilder{
+	b := &queryBuilder{
 		rows:         rows,
 		tableRow:     0,
 		fields:       availableFields,
@@ -144,11 +194,16 @@ func newQueryBuilder(query string, fields, environments []string, activeEnv stri
 		environment:  active,
 		timeframe:    timeframes,
 		timeIdx:      timeIdx,
+		limit:        max(1, activeLimit),
+		spss:         max(1, activeSPSS),
 		startRaw:     startRaw,
 		endRaw:       endRaw,
+		timeMode:     resolveTimeMode(hasStartAt, hasEndAt),
 		queryText:    strings.TrimSpace(query),
 		mode:         "table",
 	}
+	b.refreshTableSupport(strings.TrimSpace(knownQueryError))
+	return b
 }
 
 var defaultQueryFields = []string{
@@ -184,6 +239,8 @@ func (b *queryBuilder) Update(msg tea.Msg) queryBuilderResult {
 		return b.updateRowForm(msg)
 	case "global_form":
 		return b.updateGlobalForm(msg)
+	case "global_range_form":
+		return b.updateGlobalRangeForm(msg)
 	default:
 		return b.updateTable(msg)
 	}
@@ -213,6 +270,7 @@ func (b *queryBuilder) updateTable(msg tea.Msg) queryBuilderResult {
 		case "enter":
 			b.queryEditing = false
 			b.syncRowsFromQueryText()
+			b.refreshTableSupport("")
 			return queryBuilderResult{}
 		case "left":
 			if b.queryCursor > 0 {
@@ -237,6 +295,7 @@ func (b *queryBuilder) updateTable(msg tea.Msg) queryBuilderResult {
 				b.queryCursor--
 				b.queryText = string(r)
 				b.syncRowsFromQueryText()
+				b.refreshTableSupport("")
 			}
 			return queryBuilderResult{}
 		case "delete":
@@ -245,6 +304,7 @@ func (b *queryBuilder) updateTable(msg tea.Msg) queryBuilderResult {
 				r = append(r[:b.queryCursor], r[b.queryCursor+1:]...)
 				b.queryText = string(r)
 				b.syncRowsFromQueryText()
+				b.refreshTableSupport("")
 			}
 			return queryBuilderResult{}
 		case "ctrl+r", "ctrl+enter", "ctrl+j":
@@ -259,12 +319,14 @@ func (b *queryBuilder) updateTable(msg tea.Msg) queryBuilderResult {
 			b.queryCursor += len(insert)
 			b.queryText = string(r)
 			b.syncRowsFromQueryText()
+			b.refreshTableSupport("")
 		} else if keyMsg.Type == tea.KeySpace {
 			r := []rune(b.queryText)
 			r = append(r[:b.queryCursor], append([]rune{' '}, r[b.queryCursor:]...)...)
 			b.queryCursor++
 			b.queryText = string(r)
 			b.syncRowsFromQueryText()
+			b.refreshTableSupport("")
 		}
 		return queryBuilderResult{}
 	}
@@ -280,14 +342,13 @@ func (b *queryBuilder) updateTable(msg tea.Msg) queryBuilderResult {
 		b.jumpComponent(-1)
 		return queryBuilderResult{}
 	case "up", "k":
-		if b.row > -1 {
-			b.row--
-		}
+		b.moveRow(-1)
 	case "down", "j":
-		if b.row < maxRow {
-			b.row++
-		}
+		b.moveRow(1)
 	case "e", "enter":
+		if b.tableDisabled && b.row >= 0 && b.row <= len(b.rows) {
+			return queryBuilderResult{}
+		}
 		if b.row == -1 {
 			b.startGlobalForm()
 			return queryBuilderResult{Cmd: b.globalForm.Init()}
@@ -305,6 +366,9 @@ func (b *queryBuilder) updateTable(msg tea.Msg) queryBuilderResult {
 		b.startRowForm()
 		return queryBuilderResult{Cmd: b.rowForm.Init()}
 	case "d":
+		if b.tableDisabled {
+			return queryBuilderResult{}
+		}
 		if b.row >= 0 && b.row < len(b.rows) {
 			b.rows = append(b.rows[:b.row], b.rows[b.row+1:]...)
 			b.syncQueryTextFromRows()
@@ -395,8 +459,22 @@ func (b *queryBuilder) updateGlobalForm(msg tea.Msg) queryBuilderResult {
 			}
 			b.globalFiltering = false
 		}
+		if keyMsg.String() == "enter" && strings.EqualFold(strings.TrimSpace(b.globalTimeValue), "edit time range") {
+			title := focusedFieldTitle(b.globalForm)
+			if title == "Time value" {
+				b.applyGlobalBasics()
+				b.startGlobalRangeForm()
+				return queryBuilderResult{}
+			}
+		}
 		if keyMsg.String() == "ctrl+enter" || keyMsg.String() == "ctrl+j" {
-			b.applyGlobalFormValues()
+			b.applyGlobalBasics()
+			if b.timeMode == timeModeRange {
+				b.startGlobalRangeForm()
+				return queryBuilderResult{}
+			}
+			b.startRaw = ""
+			b.endRaw = ""
 			b.mode = "table"
 			b.globalForm = nil
 			b.globalFiltering = false
@@ -417,11 +495,135 @@ func (b *queryBuilder) updateGlobalForm(msg tea.Msg) queryBuilderResult {
 	if b.globalForm.State != huh.StateCompleted {
 		return result
 	}
-	b.applyGlobalFormValues()
+	b.applyGlobalBasics()
+	if b.timeMode == timeModeRange {
+		b.startGlobalRangeForm()
+		return result
+	}
+	b.startRaw = ""
+	b.endRaw = ""
 	b.mode = "table"
 	b.globalForm = nil
 	b.globalFiltering = false
 	return result
+}
+
+func (b *queryBuilder) updateGlobalRangeForm(msg tea.Msg) queryBuilderResult {
+	keyMsg, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return queryBuilderResult{}
+	}
+	b.rangeError = ""
+	switch keyMsg.String() {
+	case "esc":
+		b.mode = "global_form"
+		b.globalForm = b.buildGlobalForm()
+		return queryBuilderResult{Cmd: b.globalForm.Init()}
+	case "left", "shift+tab":
+		b.rangeFocus = (b.rangeFocus - 1 + rangeEditorFieldCount) % rangeEditorFieldCount
+		return queryBuilderResult{}
+	case "right", "tab":
+		b.rangeFocus = (b.rangeFocus + 1) % rangeEditorFieldCount
+		return queryBuilderResult{}
+	case "up":
+		switch {
+		case b.rangeFocus >= 0 && b.rangeFocus <= 5:
+			b.rangeFocus = rangeFocusDuration
+		case b.rangeFocus >= 6 && b.rangeFocus <= 11:
+			b.rangeFocus -= 6
+		case b.rangeFocus >= rangeFocusTZKind && b.rangeFocus <= rangeFocusTZMinute:
+			b.rangeFocus = 6
+		case b.rangeFocus == rangeFocusDuration:
+			b.rangeFocus = rangeFocusTZKind
+		}
+		return queryBuilderResult{}
+	case "down":
+		switch {
+		case b.rangeFocus >= 0 && b.rangeFocus <= 5:
+			b.rangeFocus += 6
+		case b.rangeFocus >= 6 && b.rangeFocus <= 11:
+			b.rangeFocus = rangeFocusTZKind
+		case b.rangeFocus >= rangeFocusTZKind && b.rangeFocus <= rangeFocusTZMinute:
+			b.rangeFocus = rangeFocusDuration
+		case b.rangeFocus == rangeFocusDuration:
+			b.rangeFocus = 0
+		}
+		return queryBuilderResult{}
+	case "backspace":
+		if b.rangeFocus == rangeFocusDuration {
+			if len(b.rangeDurationRaw) > 0 {
+				b.rangeDurationRaw = b.rangeDurationRaw[:len(b.rangeDurationRaw)-1]
+				b.rangeDurationTouched = true
+				b.refreshRangeToFromDuration()
+			}
+			return queryBuilderResult{}
+		}
+		if !b.popRangeSegmentValue(b.rangeFocus) {
+			prev := (b.rangeFocus - 1 + rangeEditorFieldCount) % rangeEditorFieldCount
+			if b.popRangeSegmentValue(prev) {
+				b.rangeFocus = prev
+			}
+		}
+		b.refreshRangeDerivedAfterEdit(b.rangeFocus)
+		return queryBuilderResult{}
+	case "delete":
+		if b.rangeFocus == rangeFocusDuration {
+			b.rangeDurationRaw = ""
+			b.rangeDurationTouched = true
+			b.refreshRangeToFromDuration()
+			return queryBuilderResult{}
+		}
+		if b.popRangeSegmentValue(b.rangeFocus) {
+			b.refreshRangeDerivedAfterEdit(b.rangeFocus)
+		}
+		return queryBuilderResult{}
+	case "+", "-", "z", "Z":
+		if b.rangeFocus == rangeFocusTZKind {
+			b.setRangeSegmentValue(b.rangeFocus, keyMsg.String())
+			b.refreshRangeDerivedAfterEdit(b.rangeFocus)
+			b.rangeFocus = (b.rangeFocus + 1) % rangeEditorFieldCount
+		}
+		return queryBuilderResult{}
+	case "enter", "ctrl+enter", "ctrl+j":
+		startInput, endInput, err := b.rangeInputsFromSegments()
+		if err != nil {
+			b.rangeError = err.Error()
+			return queryBuilderResult{}
+		}
+		b.globalStartRaw = startInput
+		b.globalEndRaw = endInput
+		b.applyGlobalFormValues()
+		b.mode = "table"
+		b.globalForm = nil
+		b.globalFiltering = false
+		return queryBuilderResult{}
+	}
+
+	if keyMsg.Type == tea.KeyRunes && len(keyMsg.Runes) == 1 {
+		r := keyMsg.Runes[0]
+		if b.rangeFocus == rangeFocusDuration {
+			if isDurationRune(r) {
+				if !b.rangeDurationTouched {
+					b.rangeDurationRaw = ""
+					b.rangeDurationTouched = true
+				}
+				b.rangeDurationRaw += string(r)
+				b.refreshRangeToFromDuration()
+			}
+			return queryBuilderResult{}
+		}
+		if r >= '0' && r <= '9' {
+			editedFocus := b.rangeFocus
+			if b.appendRangeSegmentValue(editedFocus, string(r)) {
+				if b.segmentLenByFocus(editedFocus) > 0 && len(b.getRangeSegmentValue(editedFocus)) >= b.segmentLenByFocus(editedFocus) {
+					b.rangeFocus = (b.rangeFocus + 1) % rangeEditorFieldCount
+				}
+			}
+			b.refreshRangeDerivedAfterEdit(editedFocus)
+		}
+	}
+
+	return queryBuilderResult{}
 }
 
 func (b *queryBuilder) View(width int) string {
@@ -438,6 +640,9 @@ func (b *queryBuilder) View(width int) string {
 	if b.mode == "global_form" && b.globalForm != nil {
 		return "query settings\n\n" + b.globalForm.View()
 	}
+	if b.mode == "global_range_form" {
+		return b.viewGlobalRangeForm()
+	}
 
 	var lines []string
 	lines = append(lines, mutedStyle.Render("up/down move | enter edit/open | d delete row | g settings | ctrl+enter or ctrl+r run | esc cancel"))
@@ -447,28 +652,43 @@ func (b *queryBuilder) View(width int) string {
 		globalPrefix = ">"
 	}
 	lines = append(lines, fmt.Sprintf(
-		"%s [global settings]: %s=%s %s=%s %s=%s %s=%s",
+		"%s [global settings]: %s=%s %s=%s %s=%s %s=%s %s=%s %s=%s",
 		globalPrefix,
 		mutedStyle.Render("env"), titleStyle.Render(b.environment),
-		mutedStyle.Render("timeframe"), titleStyle.Render(b.selectedTimeframeLabel()),
+		mutedStyle.Render("time"), titleStyle.Render(b.activeTimeSummary()),
+		mutedStyle.Render("limit"), titleStyle.Render(strconv.Itoa(b.limit)),
+		mutedStyle.Render("spss"), titleStyle.Render(strconv.Itoa(b.spss)),
 		mutedStyle.Render("start"), titleStyle.Render(defaultText(b.startRaw, "-")),
 		mutedStyle.Render("end"), titleStyle.Render(defaultText(b.endRaw, "-")),
 	))
 	lines = append(lines, "")
-	lines = append(lines, "idx | field                  | op  | value")
-	lines = append(lines, "----+------------------------+-----+-------------------------")
+	lines = append(lines, "idx | field                  | op  | type     | value")
+	lines = append(lines, "----+------------------------+-----+----------+-------------------")
 	for i, row := range b.rows {
 		prefix := " "
-		if b.row == i {
+		if !b.tableDisabled && b.row == i {
 			prefix = ">"
 		}
-		lines = append(lines, fmt.Sprintf("%s%3d | %-22s | %-3s | %s", prefix, i+1, truncate(defaultText(strings.TrimSpace(row.Field), "name"), 22), truncate(defaultText(strings.TrimSpace(row.Operator), "="), 3), truncate(row.Value, max(20, width-40))))
+		line := fmt.Sprintf("%s%3d | %-22s | %-3s | %-8s | %s", prefix, i+1, truncate(defaultText(strings.TrimSpace(row.Field), "name"), 22), truncate(defaultText(strings.TrimSpace(row.Operator), "="), 3), truncate(normalizeQueryValueType(row.Type), 8), truncate(row.Value, max(16, width-50)))
+		if b.tableDisabled {
+			line = mutedStyle.Render(line)
+		}
+		lines = append(lines, line)
 	}
 	newPrefix := " "
-	if b.row == len(b.rows) {
+	if !b.tableDisabled && b.row == len(b.rows) {
 		newPrefix = ">"
 	}
-	lines = append(lines, fmt.Sprintf("%s -- | %-22s | %-3s | %s", newPrefix, "(new row)", "=", "press e or enter"))
+	newRowLine := fmt.Sprintf("%s -- | %-22s | %-3s | %-8s | %s", newPrefix, "(new row)", "=", "auto", "press e or enter")
+	if b.tableDisabled {
+		newRowLine = mutedStyle.Render(newRowLine)
+	}
+	lines = append(lines, newRowLine)
+	if b.tableDisabled {
+		lines = append(lines, "")
+		lines = append(lines, summaryWarnStyle.Render("table mode disabled: "+b.tableReason))
+		lines = append(lines, summaryWarnStyle.Render("edit query text directly, then press enter"))
+	}
 	runPrefix := " "
 	if b.row == len(b.rows)+1 {
 		runPrefix = ">"
@@ -512,6 +732,7 @@ func (b *queryBuilder) startRowForm() {
 	}
 	b.rowField = defaultText(strings.TrimSpace(current.Field), "name")
 	b.rowOp = defaultText(strings.TrimSpace(current.Operator), "=")
+	b.rowType = normalizeQueryValueType(current.Type)
 	b.rowValue = strings.TrimSpace(current.Value)
 	b.rowCustom = ""
 
@@ -611,12 +832,13 @@ func (b *queryBuilder) buildRowForm(fieldOptions []huh.Option[string], opOptions
 			}
 			return fmt.Errorf("unsupported operator")
 		}),
-		huh.NewInput().Title("Value").Value(&b.rowValue).Validate(func(v string) error {
-			if strings.TrimSpace(v) == "" {
-				return fmt.Errorf("value is required")
+		huh.NewSelect[string]().Title("Value type").Description("auto keeps current behavior; enum keeps value unquoted").Filtering(false).Options(queryValueTypeOptions()...).Value(&b.rowType).Validate(func(v string) error {
+			if !isSupportedQueryValueType(v) {
+				return fmt.Errorf("unsupported value type")
 			}
 			return nil
 		}),
+		huh.NewInput().Title("Value").Value(&b.rowValue),
 	)
 
 	return huh.NewForm(
@@ -627,10 +849,19 @@ func (b *queryBuilder) buildRowForm(fieldOptions []huh.Option[string], opOptions
 func (b *queryBuilder) startGlobalForm() {
 	b.mode = "global_form"
 	b.globalEnv = b.environment
-	b.globalTimeframe = b.selectedTimeframeLabel()
-	b.globalStartRaw = b.startRaw
-	b.globalEndRaw = b.endRaw
+	b.globalTimeValue = b.selectedTimeframeLabel()
+	if b.timeMode == timeModeRange {
+		b.globalTimeValue = "edit time range"
+	}
+	b.globalLimitRaw = strconv.Itoa(max(1, b.limit))
+	b.globalSPSSRaw = strconv.Itoa(max(1, b.spss))
+	b.globalStartRaw = formatDateTimeInput(b.startRaw)
+	b.globalEndRaw = formatDateTimeInput(b.endRaw)
+	b.globalForm = b.buildGlobalForm()
+	b.globalFiltering = false
+}
 
+func (b *queryBuilder) buildGlobalForm() *huh.Form {
 	envOptions := make([]huh.Option[string], 0, len(b.environments))
 	for _, env := range b.environments {
 		envOptions = append(envOptions, huh.NewOption(env, env))
@@ -643,16 +874,33 @@ func (b *queryBuilder) startGlobalForm() {
 		}
 		timeOptions = append(timeOptions, huh.NewOption(label, tf.Label))
 	}
+	timeValueOptions := make([]huh.Option[string], 0, len(timeOptions)+1)
+	timeValueOptions = append(timeValueOptions, timeOptions...)
+	timeValueOptions = append(timeValueOptions, huh.NewOption("edit time range", "edit time range"))
 
-	b.globalForm = huh.NewForm(
-		huh.NewGroup(
-			huh.NewSelect[string]().Title("Environment").Description("press enter to choose environment").Filtering(true).Options(envOptions...).Value(&b.globalEnv),
-			huh.NewSelect[string]().Title("Timeframe").Filtering(false).Options(timeOptions...).Value(&b.globalTimeframe),
-			huh.NewInput().Title("Start time (RFC3339, optional)").Suggestions(commonDateSuggestions()).Placeholder("2026-07-01T00:00:00Z").Value(&b.globalStartRaw),
-			huh.NewInput().Title("End time (RFC3339, optional)").Suggestions(commonDateSuggestions()).Placeholder("2026-07-02T00:00:00Z").Value(&b.globalEndRaw),
-		),
+	fields := []huh.Field{
+		huh.NewSelect[string]().Title("Environment").Description("press enter to choose environment").Filtering(true).Options(envOptions...).Value(&b.globalEnv),
+		huh.NewSelect[string]().Title("Time value").Description(fmt.Sprintf("pick since preset or edit explicit range (%s -> %s)", defaultText(b.globalStartRaw, "not set"), defaultText(b.globalEndRaw, "not set"))).Filtering(false).Options(timeValueOptions...).Value(&b.globalTimeValue),
+	}
+
+	fields = append(fields,
+		huh.NewInput().Title("Limit").Description("max traces to request").Placeholder("50").Value(&b.globalLimitRaw).Validate(func(v string) error {
+			if _, err := parsePositiveInt(v); err != nil {
+				return err
+			}
+			return nil
+		}),
+		huh.NewInput().Title("SPSS").Description("spans per span set").Placeholder("3").Value(&b.globalSPSSRaw).Validate(func(v string) error {
+			if _, err := parsePositiveInt(v); err != nil {
+				return err
+			}
+			return nil
+		}),
+	)
+
+	return huh.NewForm(
+		huh.NewGroup(fields...),
 	).WithShowHelp(false).WithWidth(max(40, b.width-4)).WithHeight(max(10, b.height-6))
-	b.globalFiltering = false
 }
 
 func isFocusedFilterableSelect(form *huh.Form) bool {
@@ -667,15 +915,24 @@ func isFocusedFilterableSelect(form *huh.Form) bool {
 	}
 }
 
+func focusedFieldTitle(form *huh.Form) string {
+	if form == nil {
+		return ""
+	}
+	focused := form.GetFocusedField()
+	withTitle, ok := focused.(interface{ GetTitle() string })
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(withTitle.GetTitle())
+}
+
 func (b *queryBuilder) validateRowFormValues() bool {
 	resolvedField := strings.TrimSpace(b.rowField)
 	if resolvedField == customFieldOptionValue {
 		resolvedField = strings.TrimSpace(b.rowCustom)
 	}
 	if resolvedField == "" {
-		return false
-	}
-	if strings.TrimSpace(b.rowValue) == "" {
 		return false
 	}
 	raw := strings.TrimSpace(b.rowOp)
@@ -693,6 +950,7 @@ func (b *queryBuilder) applyRowFormValues() {
 		resolvedField = strings.TrimSpace(b.rowCustom)
 	}
 	row := queryRow{Field: resolvedField, Operator: strings.TrimSpace(b.rowOp), Value: strings.TrimSpace(b.rowValue)}
+	row.Type = normalizeQueryValueType(b.rowType)
 	if row.Field == "" {
 		row.Field = "name"
 	}
@@ -707,25 +965,70 @@ func (b *queryBuilder) applyRowFormValues() {
 		b.row = len(b.rows) - 1
 	}
 	b.syncQueryTextFromRows()
+	b.refreshTableSupport("")
 }
 
 func (b *queryBuilder) applyGlobalFormValues() {
-	b.environment = defaultText(strings.TrimSpace(b.globalEnv), b.environment)
-	b.setTimeframeByLabel(b.globalTimeframe)
-	b.startRaw = strings.TrimSpace(b.globalStartRaw)
-	b.endRaw = strings.TrimSpace(b.globalEndRaw)
+	b.applyGlobalBasics()
+	if b.timeMode == timeModeRange {
+		b.startRaw = parseDateTimeInputToRFC3339(b.globalStartRaw)
+		b.endRaw = parseDateTimeInputToRFC3339(b.globalEndRaw)
+		b.setTimeframeByLabel("all")
+		return
+	}
+	b.setTimeframeByLabel(b.globalTimeValue)
+	b.startRaw = ""
+	b.endRaw = ""
 }
 
-func (b *queryBuilder) toClauses() []string {
-	clauses := make([]string, 0, len(b.rows))
+func (b *queryBuilder) applyGlobalBasics() {
+	b.environment = defaultText(strings.TrimSpace(b.globalEnv), b.environment)
+	if strings.EqualFold(strings.TrimSpace(b.globalTimeValue), "edit time range") {
+		b.timeMode = timeModeRange
+	} else {
+		b.timeMode = timeModeSince
+	}
+	b.limit = parsePositiveIntOrFallback(b.globalLimitRaw, b.limit)
+	b.spss = parsePositiveIntOrFallback(b.globalSPSSRaw, b.spss)
+}
+
+func (b *queryBuilder) startGlobalRangeForm() {
+	fromTime, hasFrom := parseRFC3339WithZoneOptional(b.startRaw)
+	if !hasFrom {
+		fromTime = time.Now().UTC().Truncate(time.Second)
+	}
+	toTime, hasTo := parseRFC3339WithZoneOptional(b.endRaw)
+	if !hasTo {
+		toTime = fromTime.Add(time.Hour)
+	}
+	if toTime.Before(fromTime) || toTime.Equal(fromTime) {
+		toTime = fromTime.Add(time.Hour)
+	}
+	b.rangeFrom = segmentsFromTime(fromTime)
+	b.rangeTo = segmentsFromTime(toTime)
+	b.rangeTZ = timezoneFromTime(fromTime)
+	b.rangeDurationRaw = formatDurationInput(toTime.Sub(fromTime))
+	b.rangeDurationTouched = false
+	b.rangeFocus = 0
+	b.rangeError = ""
+	b.mode = "global_range_form"
+	b.globalForm = nil
+	b.globalFiltering = false
+}
+
+func (b *queryBuilder) toClauses() []traceql.TypedClause {
+	clauses := make([]traceql.TypedClause, 0, len(b.rows))
 	for _, row := range b.rows {
 		field := strings.TrimSpace(row.Field)
 		op := strings.TrimSpace(row.Operator)
 		value := strings.TrimSpace(row.Value)
-		if field == "" || op == "" || value == "" {
+		if field == "" || op == "" {
 			continue
 		}
-		clauses = append(clauses, field+op+value)
+		if value == "" {
+			value = `""`
+		}
+		clauses = append(clauses, traceql.TypedClause{Field: field, Op: op, Value: value, Type: traceql.ValueType(normalizeQueryValueType(row.Type))})
 	}
 	return clauses
 }
@@ -733,20 +1036,24 @@ func (b *queryBuilder) toClauses() []string {
 func (b *queryBuilder) snapshotResult() queryBuilderResult {
 	query := strings.TrimSpace(b.queryText)
 	if query == "" {
-		query = traceql.CompileClauses(b.toClauses())
+		query = traceql.CompileTypedClauses(b.toClauses())
 	}
 	res := queryBuilderResult{
 		Query:       query,
 		Environment: b.environment,
+		Limit:       b.limit,
+		SPSS:        b.spss,
 		Since:       b.selectedSince(),
 	}
-	if start, ok := parseRFC3339Optional(b.startRaw); ok {
-		res.StartAt = start
-		res.HasStartAt = true
-	}
-	if end, ok := parseRFC3339Optional(b.endRaw); ok {
-		res.EndAt = end
-		res.HasEndAt = true
+	if b.timeMode == timeModeRange {
+		if start, ok := parseRFC3339Optional(b.startRaw); ok {
+			res.StartAt = start
+			res.HasStartAt = true
+		}
+		if end, ok := parseRFC3339Optional(b.endRaw); ok {
+			res.EndAt = end
+			res.HasEndAt = true
+		}
 	}
 	return res
 }
@@ -756,15 +1063,175 @@ func parseRFC3339Optional(raw string) (time.Time, bool) {
 	if trimmed == "" {
 		return time.Time{}, false
 	}
+	if t, err := time.Parse(time.RFC3339, trimmed); err == nil {
+		return t.UTC(), true
+	}
+	localLayouts := []string{
+		"2006-01-02T15:04:05",
+		"2006-01-02T15:04:05.000",
+		"2006-01-02T15:04:05.000000",
+		"2006-01-02T15:04:05.000000000",
+	}
+	for _, layout := range localLayouts {
+		if t, err := time.ParseInLocation(layout, trimmed, time.Local); err == nil {
+			return t.UTC(), true
+		}
+	}
+	return time.Time{}, false
+}
+
+func resolveTimeMode(hasStartAt, hasEndAt bool) string {
+	if hasStartAt || hasEndAt {
+		return timeModeRange
+	}
+	return timeModeSince
+}
+
+func normalizeTimeMode(raw string) string {
+	if strings.EqualFold(strings.TrimSpace(raw), timeModeRange) {
+		return timeModeRange
+	}
+	return timeModeSince
+}
+
+var dateTimeInputPattern = regexp.MustCompile(`^\s*(\d{2})\s*/\s*(\d{2})\s*/\s*(\d{4})\s+(\d{2})\s*:\s*(\d{2})\s*:\s*(\d{2})\s*(?:(Z|z)|([+-])\s*(\d{2}):(\d{2}))\s*$`)
+
+func formatDateTimeInput(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
 	t, err := time.Parse(time.RFC3339, trimmed)
 	if err != nil {
-		return time.Time{}, false
+		t2, ok := parseRFC3339Optional(trimmed)
+		if !ok {
+			return ""
+		}
+		t = t2
 	}
-	return t, true
+	_, offsetSeconds := t.Zone()
+	if offsetSeconds == 0 {
+		return fmt.Sprintf("%02d / %02d / %04d  %02d : %02d : %02d  Z", t.Day(), int(t.Month()), t.Year(), t.Hour(), t.Minute(), t.Second())
+	}
+	sign := "+"
+	if offsetSeconds < 0 {
+		sign = "-"
+		offsetSeconds = -offsetSeconds
+	}
+	offsetHour := offsetSeconds / 3600
+	offsetMin := (offsetSeconds % 3600) / 60
+	return fmt.Sprintf("%02d / %02d / %04d  %02d : %02d : %02d  %s %02d:%02d", t.Day(), int(t.Month()), t.Year(), t.Hour(), t.Minute(), t.Second(), sign, offsetHour, offsetMin)
+}
+
+func validateDateTimeInput(raw string) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil
+	}
+	_, err := parseDateTimeInput(raw)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func parseDateTimeInputToRFC3339(raw string) string {
+	t, err := parseDateTimeInput(raw)
+	if err != nil {
+		return ""
+	}
+	return t.Format(time.RFC3339)
+}
+
+func parseDateTimeInput(raw string) (time.Time, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return time.Time{}, fmt.Errorf("empty value")
+	}
+	matches := dateTimeInputPattern.FindStringSubmatch(trimmed)
+	if len(matches) != 11 {
+		return time.Time{}, fmt.Errorf("use DD / MM / YYYY  HH : mm : ss  + 00:00 (or Z)")
+	}
+
+	day, _ := strconv.Atoi(matches[1])
+	month, _ := strconv.Atoi(matches[2])
+	year, _ := strconv.Atoi(matches[3])
+	hour, _ := strconv.Atoi(matches[4])
+	minute, _ := strconv.Atoi(matches[5])
+	second, _ := strconv.Atoi(matches[6])
+	offset := 0
+	if strings.TrimSpace(matches[7]) == "" {
+		sign := matches[8]
+		offsetHour, _ := strconv.Atoi(matches[9])
+		offsetMin, _ := strconv.Atoi(matches[10])
+
+		if offsetHour > 14 {
+			return time.Time{}, fmt.Errorf("timezone hour must be 00..14")
+		}
+		if offsetMin > 59 {
+			return time.Time{}, fmt.Errorf("timezone minutes must be 00..59")
+		}
+		if offsetHour == 14 && offsetMin != 0 {
+			return time.Time{}, fmt.Errorf("timezone 14 requires minutes 00")
+		}
+
+		offset = offsetHour*3600 + offsetMin*60
+		if sign == "-" {
+			offset = -offset
+		}
+	}
+
+	if month < 1 || month > 12 {
+		return time.Time{}, fmt.Errorf("month must be 01..12")
+	}
+	if day < 1 || day > 31 {
+		return time.Time{}, fmt.Errorf("day must be 01..31")
+	}
+	if hour > 23 {
+		return time.Time{}, fmt.Errorf("hour must be 00..23")
+	}
+	if minute > 59 {
+		return time.Time{}, fmt.Errorf("minute must be 00..59")
+	}
+	if second > 59 {
+		return time.Time{}, fmt.Errorf("second must be 00..59")
+	}
+	zone := time.FixedZone("input", offset)
+	t := time.Date(year, time.Month(month), day, hour, minute, second, 0, zone)
+	if t.Year() != year || int(t.Month()) != month || t.Day() != day {
+		return time.Time{}, fmt.Errorf("invalid calendar date")
+	}
+	return t, nil
+}
+
+func parsePositiveInt(raw string) (int, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return 0, fmt.Errorf("value is required")
+	}
+	value, err := strconv.Atoi(trimmed)
+	if err != nil {
+		return 0, fmt.Errorf("must be a whole number")
+	}
+	if value <= 0 {
+		return 0, fmt.Errorf("must be greater than zero")
+	}
+	return value, nil
+}
+
+func parsePositiveIntOrFallback(raw string, fallback int) int {
+	value, err := parsePositiveInt(raw)
+	if err != nil {
+		if fallback <= 0 {
+			return 1
+		}
+		return fallback
+	}
+	return value
 }
 
 func (b *queryBuilder) syncQueryTextFromRows() {
-	b.queryText = traceql.CompileClauses(b.toClauses())
+	b.queryText = traceql.CompileTypedClauses(b.toClauses())
 	b.queryCursor = len([]rune(b.queryText))
 }
 
@@ -774,10 +1241,10 @@ func (b *queryBuilder) syncRowsFromQueryText() {
 	for _, clause := range clauses {
 		field, op, value, ok := parseClause(clause)
 		if !ok {
-			rows = append(rows, queryRow{Field: "name", Operator: "=", Value: strings.TrimSpace(clause)})
+			rows = append(rows, queryRow{Field: "name", Operator: "=", Value: strings.TrimSpace(clause), Type: string(traceql.ValueTypeAuto)})
 			continue
 		}
-		rows = append(rows, queryRow{Field: field, Operator: op, Value: strings.TrimSpace(value)})
+		rows = append(rows, queryRow{Field: field, Operator: op, Value: strings.TrimSpace(value), Type: string(traceql.ValueTypeAuto)})
 	}
 	b.rows = rows
 	if b.row > len(b.rows)+2 {
@@ -785,7 +1252,49 @@ func (b *queryBuilder) syncRowsFromQueryText() {
 	}
 }
 
+func (b *queryBuilder) refreshTableSupport(knownQueryError string) {
+	reason := strings.TrimSpace(knownQueryError)
+	if reason != "" {
+		lower := strings.ToLower(reason)
+		if strings.Contains(lower, "syntax") || strings.Contains(lower, "parse") || strings.Contains(lower, "unexpected") || strings.Contains(lower, "invalid") {
+			b.tableDisabled = true
+			b.tableReason = reason
+			if b.row >= 0 && b.row <= len(b.rows) {
+				b.row = len(b.rows) + 2
+			}
+			return
+		}
+	}
+	q := strings.TrimSpace(b.queryText)
+	if q == "" {
+		b.tableDisabled = false
+		b.tableReason = ""
+		return
+	}
+	if strings.Contains(q, "||") || strings.Contains(q, "(") || strings.Contains(q, ")") {
+		b.tableDisabled = true
+		b.tableReason = "complex query (OR/grouping) is not supported in table mode"
+		if b.row >= 0 && b.row <= len(b.rows) {
+			b.row = len(b.rows) + 2
+		}
+		return
+	}
+	if strings.Count(q, "{") != strings.Count(q, "}") {
+		b.tableDisabled = true
+		b.tableReason = "unbalanced braces in query"
+		if b.row >= 0 && b.row <= len(b.rows) {
+			b.row = len(b.rows) + 2
+		}
+		return
+	}
+	b.tableDisabled = false
+	b.tableReason = ""
+}
+
 func (b *queryBuilder) selectedSince() time.Duration {
+	if b.timeMode == timeModeRange {
+		return 0
+	}
 	if len(b.timeframe) == 0 {
 		return 0
 	}
@@ -796,6 +1305,13 @@ func (b *queryBuilder) selectedSince() time.Duration {
 		b.timeIdx = len(b.timeframe) - 1
 	}
 	return b.timeframe[b.timeIdx].Since
+}
+
+func (b *queryBuilder) activeTimeSummary() string {
+	if b.timeMode == timeModeRange {
+		return "range"
+	}
+	return b.selectedTimeframeLabel()
 }
 
 func (b *queryBuilder) selectedTimeframeLabel() string {
@@ -833,6 +1349,511 @@ func defaultText(value, fallback string) string {
 		return fallback
 	}
 	return trimmed
+}
+
+const (
+	rangeFocusTZKind      = 12
+	rangeFocusTZHour      = 13
+	rangeFocusTZMinute    = 14
+	rangeFocusDuration    = 15
+	rangeEditorFieldCount = 16
+)
+
+func (b *queryBuilder) viewGlobalRangeForm() string {
+	var lines []string
+	lines = append(lines, "query settings: time range")
+	lines = append(lines, "")
+	lines = append(lines, mutedStyle.Render("single-line segmented editor | left/right/tab move | up/down switch from/to | enter apply | esc back"))
+	lines = append(lines, "")
+	lines = append(lines, fmt.Sprintf("From %s", b.renderSegmentsLine(b.rangeFrom, 0)))
+	lines = append(lines, fmt.Sprintf("To   %s", b.renderSegmentsLine(b.rangeTo, 6)))
+	lines = append(lines, fmt.Sprintf("TZ   %s", b.renderTimezoneLine()))
+	lines = append(lines, fmt.Sprintf("Dur  %s", b.renderDurationField()))
+	if strings.TrimSpace(b.rangeError) != "" {
+		lines = append(lines, "")
+		lines = append(lines, summaryWarnStyle.Render(b.rangeError))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (b *queryBuilder) renderSegmentsLine(s dateTimeSegments, focusBase int) string {
+	parts := []string{
+		b.renderSegmentToken(s.Day, "DD", focusBase+0), " / ",
+		b.renderSegmentToken(s.Month, "MM", focusBase+1), " / ",
+		b.renderSegmentToken(s.Year, "YYYY", focusBase+2), "  ",
+		b.renderSegmentToken(s.Hour, "HH", focusBase+3), " : ",
+		b.renderSegmentToken(s.Minute, "mm", focusBase+4), " : ",
+		b.renderSegmentToken(s.Second, "ss", focusBase+5),
+	}
+	return strings.Join(parts, "")
+}
+
+func (b *queryBuilder) renderTimezoneLine() string {
+	kindPlaceholder := "+/-/Z"
+	kind := b.rangeTZ.Kind
+	if strings.TrimSpace(kind) == "" {
+		kind = "+"
+	}
+	line := b.renderSegmentToken(kind, kindPlaceholder, rangeFocusTZKind)
+	line += " " + b.renderSegmentToken(b.rangeTZ.Hour, "00", rangeFocusTZHour)
+	line += ":" + b.renderSegmentToken(b.rangeTZ.Minute, "00", rangeFocusTZMinute)
+	line += mutedStyle.Render("  (set Z for UTC)")
+	return line
+}
+
+func (b *queryBuilder) renderDurationField() string {
+	value := b.rangeDurationRaw
+	if strings.TrimSpace(value) == "" {
+		value = "1h"
+	}
+	token := "[" + value + "]"
+	if b.rangeFocus == rangeFocusDuration {
+		return titleStyle.Render(token) + mutedStyle.Render("  (from + duration => to)")
+	}
+	return token + mutedStyle.Render("  (from + duration => to)")
+}
+
+func (b *queryBuilder) renderSegmentToken(value, placeholder string, idx int) string {
+	display := value
+	if strings.TrimSpace(display) == "" {
+		display = placeholder
+	}
+	token := "[" + display + "]"
+	if b.rangeFocus == idx {
+		return titleStyle.Render(token)
+	}
+	if strings.TrimSpace(value) == "" {
+		return mutedStyle.Render(token)
+	}
+	return token
+}
+
+func (b *queryBuilder) rangeSegmentIndex(focus int) int {
+	if focus >= 0 && focus <= 5 {
+		return focus
+	}
+	if focus >= 6 && focus <= 11 {
+		return focus - 6
+	}
+	if focus == rangeFocusTZKind {
+		return 6
+	}
+	if focus == rangeFocusTZHour {
+		return 7
+	}
+	if focus == rangeFocusTZMinute {
+		return 8
+	}
+	return -1
+}
+
+func (b *queryBuilder) segmentLenByFocus(focus int) int {
+	switch b.rangeSegmentIndex(focus) {
+	case 0, 1, 3, 4, 5, 7, 8:
+		return 2
+	case 2:
+		return 4
+	case 6:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func (b *queryBuilder) getRangeSegmentValue(focus int) string {
+	if focus >= 0 && focus <= 5 {
+		return getDateSegmentValue(&b.rangeFrom, focus)
+	}
+	if focus >= 6 && focus <= 11 {
+		return getDateSegmentValue(&b.rangeTo, focus-6)
+	}
+	switch focus {
+	case rangeFocusTZKind:
+		return defaultText(b.rangeTZ.Kind, "+")
+	case rangeFocusTZHour:
+		return b.rangeTZ.Hour
+	case rangeFocusTZMinute:
+		return b.rangeTZ.Minute
+	default:
+		return ""
+	}
+}
+
+func (b *queryBuilder) setRangeSegmentValue(focus int, value string) {
+	if focus >= 0 && focus <= 5 {
+		setDateSegmentValue(&b.rangeFrom, focus, value)
+		return
+	}
+	if focus >= 6 && focus <= 11 {
+		setDateSegmentValue(&b.rangeTo, focus-6, value)
+		return
+	}
+	switch focus {
+	case rangeFocusTZKind:
+		switch strings.ToUpper(strings.TrimSpace(value)) {
+		case "Z":
+			b.rangeTZ.Kind = "Z"
+			b.rangeTZ.Hour = "00"
+			b.rangeTZ.Minute = "00"
+		case "-":
+			b.rangeTZ.Kind = "-"
+		default:
+			b.rangeTZ.Kind = "+"
+		}
+	case rangeFocusTZHour:
+		b.rangeTZ.Hour = value
+	case rangeFocusTZMinute:
+		b.rangeTZ.Minute = value
+	}
+}
+
+func getDateSegmentValue(seg *dateTimeSegments, idx int) string {
+	switch idx {
+	case 0:
+		return seg.Day
+	case 1:
+		return seg.Month
+	case 2:
+		return seg.Year
+	case 3:
+		return seg.Hour
+	case 4:
+		return seg.Minute
+	case 5:
+		return seg.Second
+	default:
+		return ""
+	}
+}
+
+func setDateSegmentValue(seg *dateTimeSegments, idx int, value string) {
+	switch idx {
+	case 0:
+		seg.Day = value
+	case 1:
+		seg.Month = value
+	case 2:
+		seg.Year = value
+	case 3:
+		seg.Hour = value
+	case 4:
+		seg.Minute = value
+	case 5:
+		seg.Second = value
+	}
+}
+
+func (b *queryBuilder) appendRangeSegmentValue(focus int, digit string) bool {
+	if focus == rangeFocusTZKind || focus == rangeFocusDuration {
+		return false
+	}
+	current := b.getRangeSegmentValue(focus)
+	maxLen := b.segmentLenByFocus(focus)
+	if maxLen <= 0 {
+		return false
+	}
+	if len(current) >= maxLen {
+		current = ""
+	}
+	b.setRangeSegmentValue(focus, current+digit)
+	return true
+}
+
+func (b *queryBuilder) popRangeSegmentValue(focus int) bool {
+	if focus == rangeFocusTZKind || focus == rangeFocusDuration {
+		return false
+	}
+	current := b.getRangeSegmentValue(focus)
+	if current == "" {
+		return false
+	}
+	b.setRangeSegmentValue(focus, current[:len(current)-1])
+	return true
+}
+
+func (b *queryBuilder) rangeInputsFromSegments() (string, string, error) {
+	fromTime, tzNorm, err := buildTimeFromSegments(b.rangeFrom, b.rangeTZ, time.Now().UTC())
+	if err != nil {
+		return "", "", fmt.Errorf("from: %w", err)
+	}
+	toTime, _, err := buildTimeFromSegments(b.rangeTo, tzNorm, fromTime.Add(time.Hour))
+	if err != nil {
+		return "", "", fmt.Errorf("to: %w", err)
+	}
+	if !toTime.After(fromTime) {
+		return "", "", fmt.Errorf("to must be after from")
+	}
+	b.rangeTZ = tzNorm
+	b.rangeFrom = segmentsFromTime(fromTime)
+	b.rangeTo = segmentsFromTime(toTime)
+	b.rangeDurationRaw = formatDurationInput(toTime.Sub(fromTime))
+	return formatTimeWithTimezone(fromTime, tzNorm), formatTimeWithTimezone(toTime, tzNorm), nil
+}
+
+func (b *queryBuilder) refreshRangeDerivedAfterEdit(focus int) {
+	if focus >= 6 && focus <= 11 {
+		b.refreshDurationFromRange()
+		return
+	}
+	b.refreshRangeToFromDuration()
+}
+
+func (b *queryBuilder) refreshRangeToFromDuration() {
+	fromTime, tzNorm, err := buildTimeFromSegments(b.rangeFrom, b.rangeTZ, time.Now().UTC())
+	if err != nil {
+		return
+	}
+	b.rangeTZ = tzNorm
+	trimmed := strings.TrimSpace(b.rangeDurationRaw)
+	duration := time.Hour
+	if trimmed == "" {
+		if !b.rangeDurationTouched {
+			b.rangeDurationRaw = "1h"
+		} else {
+			return
+		}
+	} else {
+		parsed, ok := parseDurationFlexible(trimmed)
+		if !ok {
+			return
+		}
+		duration = parsed
+	}
+	toTime := fromTime.Add(duration)
+	b.rangeTo = segmentsFromTime(toTime)
+}
+
+func (b *queryBuilder) refreshDurationFromRange() {
+	fromTime, tzNorm, err := buildTimeFromSegments(b.rangeFrom, b.rangeTZ, time.Now().UTC())
+	if err != nil {
+		return
+	}
+	toTime, _, err := buildTimeFromSegments(b.rangeTo, tzNorm, fromTime.Add(time.Hour))
+	if err != nil {
+		return
+	}
+	if !toTime.After(fromTime) {
+		return
+	}
+	b.rangeTZ = tzNorm
+	b.rangeDurationRaw = formatDurationInput(toTime.Sub(fromTime))
+}
+
+func buildTimeFromSegments(seg dateTimeSegments, tz timezoneSegments, fallback time.Time) (time.Time, timezoneSegments, error) {
+	normTZ, zone, err := normalizeTimezoneSegments(tz)
+	if err != nil {
+		return time.Time{}, timezoneSegments{}, err
+	}
+	fallbackInZone := fallback.In(zone)
+	day, dayNorm, err := normalizeSegmentNumber(seg.Day, 2, fallbackInZone.Day())
+	if err != nil {
+		return time.Time{}, timezoneSegments{}, fmt.Errorf("day must be 01..31")
+	}
+	month, monthNorm, err := normalizeSegmentNumber(seg.Month, 2, int(fallbackInZone.Month()))
+	if err != nil {
+		return time.Time{}, timezoneSegments{}, fmt.Errorf("month must be 01..12")
+	}
+	year, yearNorm, err := normalizeSegmentNumber(seg.Year, 4, fallbackInZone.Year())
+	if err != nil {
+		return time.Time{}, timezoneSegments{}, fmt.Errorf("invalid year")
+	}
+	hour, hourNorm, err := normalizeSegmentNumber(seg.Hour, 2, fallbackInZone.Hour())
+	if err != nil {
+		return time.Time{}, timezoneSegments{}, fmt.Errorf("hour must be 00..23")
+	}
+	minute, minuteNorm, err := normalizeSegmentNumber(seg.Minute, 2, fallbackInZone.Minute())
+	if err != nil {
+		return time.Time{}, timezoneSegments{}, fmt.Errorf("minute must be 00..59")
+	}
+	second, secondNorm, err := normalizeSegmentNumber(seg.Second, 2, fallbackInZone.Second())
+	if err != nil {
+		return time.Time{}, timezoneSegments{}, fmt.Errorf("second must be 00..59")
+	}
+
+	seg.Day = dayNorm
+	seg.Month = monthNorm
+	seg.Year = yearNorm
+	seg.Hour = hourNorm
+	seg.Minute = minuteNorm
+	seg.Second = secondNorm
+
+	if month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59 || year < 1 {
+		return time.Time{}, timezoneSegments{}, fmt.Errorf("invalid date/time values")
+	}
+
+	t := time.Date(year, time.Month(month), day, hour, minute, second, 0, zone)
+	if t.Year() != year || int(t.Month()) != month || t.Day() != day {
+		return time.Time{}, timezoneSegments{}, fmt.Errorf("invalid calendar date")
+	}
+	return t, normTZ, nil
+}
+
+func normalizeTimezoneSegments(tz timezoneSegments) (timezoneSegments, *time.Location, error) {
+	kind := strings.ToUpper(strings.TrimSpace(tz.Kind))
+	if kind == "" {
+		kind = "+"
+	}
+	if kind == "Z" {
+		norm := timezoneSegments{Kind: "Z", Hour: "00", Minute: "00"}
+		return norm, time.UTC, nil
+	}
+	if kind != "+" && kind != "-" {
+		kind = "+"
+	}
+	hour, hourNorm, err := normalizeSegmentNumber(tz.Hour, 2, 0)
+	if err != nil {
+		return timezoneSegments{}, nil, fmt.Errorf("timezone hour must be 00..14")
+	}
+	minute, minuteNorm, err := normalizeSegmentNumber(tz.Minute, 2, 0)
+	if err != nil {
+		return timezoneSegments{}, nil, fmt.Errorf("timezone minutes must be 00..59")
+	}
+	if hour > 14 {
+		return timezoneSegments{}, nil, fmt.Errorf("timezone hour must be 00..14")
+	}
+	if minute > 59 {
+		return timezoneSegments{}, nil, fmt.Errorf("timezone minutes must be 00..59")
+	}
+	if hour == 14 && minute != 0 {
+		return timezoneSegments{}, nil, fmt.Errorf("timezone 14 requires minutes 00")
+	}
+	offset := hour*3600 + minute*60
+	if kind == "-" {
+		offset = -offset
+	}
+	norm := timezoneSegments{Kind: kind, Hour: hourNorm, Minute: minuteNorm}
+	return norm, time.FixedZone("input", offset), nil
+}
+
+func normalizeSegmentNumber(raw string, width int, fallback int) (int, string, error) {
+	digits := digitsOnly(raw)
+	if digits == "" {
+		digits = fmt.Sprintf("%0*d", width, fallback)
+	}
+	if len(digits) > width {
+		digits = digits[len(digits)-width:]
+	}
+	if len(digits) < width {
+		digits = strings.Repeat("0", width-len(digits)) + digits
+	}
+	value, err := strconv.Atoi(digits)
+	if err != nil {
+		return 0, "", err
+	}
+	return value, digits, nil
+}
+
+func digitsOnly(raw string) string {
+	var b strings.Builder
+	for _, r := range raw {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func segmentsFromTime(t time.Time) dateTimeSegments {
+	return dateTimeSegments{
+		Day:    fmt.Sprintf("%02d", t.Day()),
+		Month:  fmt.Sprintf("%02d", int(t.Month())),
+		Year:   fmt.Sprintf("%04d", t.Year()),
+		Hour:   fmt.Sprintf("%02d", t.Hour()),
+		Minute: fmt.Sprintf("%02d", t.Minute()),
+		Second: fmt.Sprintf("%02d", t.Second()),
+	}
+}
+
+func timezoneFromTime(t time.Time) timezoneSegments {
+	_, offsetSeconds := t.Zone()
+	if offsetSeconds == 0 {
+		return timezoneSegments{Kind: "Z", Hour: "00", Minute: "00"}
+	}
+	kind := "+"
+	if offsetSeconds < 0 {
+		kind = "-"
+		offsetSeconds = -offsetSeconds
+	}
+	return timezoneSegments{Kind: kind, Hour: fmt.Sprintf("%02d", offsetSeconds/3600), Minute: fmt.Sprintf("%02d", (offsetSeconds%3600)/60)}
+}
+
+func formatTimeWithTimezone(t time.Time, tz timezoneSegments) string {
+	kind := strings.ToUpper(strings.TrimSpace(tz.Kind))
+	if kind == "Z" {
+		return fmt.Sprintf("%02d / %02d / %04d  %02d : %02d : %02d  Z", t.Day(), int(t.Month()), t.Year(), t.Hour(), t.Minute(), t.Second())
+	}
+	if kind != "+" && kind != "-" {
+		kind = "+"
+	}
+	h := defaultText(tz.Hour, "00")
+	m := defaultText(tz.Minute, "00")
+	return fmt.Sprintf("%02d / %02d / %04d  %02d : %02d : %02d  %s %s:%s", t.Day(), int(t.Month()), t.Year(), t.Hour(), t.Minute(), t.Second(), kind, h, m)
+}
+
+func parseDurationOrDefault(raw string, fallback time.Duration) time.Duration {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(trimmed)
+	if err != nil || d <= 0 {
+		return fallback
+	}
+	return d
+}
+
+func parseDurationFlexible(raw string) (time.Duration, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return 0, false
+	}
+	if d, err := time.ParseDuration(trimmed); err == nil && d > 0 {
+		return d, true
+	}
+	if digits := digitsOnly(trimmed); digits != "" && digits == trimmed {
+		hours, err := strconv.Atoi(digits)
+		if err == nil && hours > 0 {
+			return time.Duration(hours) * time.Hour, true
+		}
+	}
+	return 0, false
+}
+
+func isDurationRune(r rune) bool {
+	if r >= '0' && r <= '9' {
+		return true
+	}
+	switch r {
+	case 'h', 'm', 's', 'u', 'n', '.', 'H', 'M', 'S', 'U', 'N', 'µ':
+		return true
+	default:
+		return false
+	}
+}
+
+func formatDurationInput(d time.Duration) string {
+	if d <= 0 {
+		return "1h"
+	}
+	if d%(time.Hour) == 0 {
+		return fmt.Sprintf("%dh", int(d/time.Hour))
+	}
+	if d%(time.Minute) == 0 {
+		return fmt.Sprintf("%dm", int(d/time.Minute))
+	}
+	return d.Truncate(time.Second).String()
+}
+
+func parseRFC3339WithZoneOptional(raw string) (time.Time, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339, trimmed)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
 }
 
 func commonDateSuggestions() []string {
@@ -888,6 +1909,23 @@ func (b *queryBuilder) componentForRow() int {
 }
 
 func (b *queryBuilder) jumpComponent(direction int) {
+	if b.tableDisabled {
+		allowed := []int{-1, len(b.rows) + 1, len(b.rows) + 2}
+		idx := 0
+		switch b.row {
+		case -1:
+			idx = 0
+		case len(b.rows) + 1:
+			idx = 1
+		case len(b.rows) + 2:
+			idx = 2
+		default:
+			idx = 2
+		}
+		next := (idx + direction + len(allowed)) % len(allowed)
+		b.row = allowed[next]
+		return
+	}
 	if b.row >= 0 && b.row <= len(b.rows) {
 		b.tableRow = b.row
 	}
@@ -911,10 +1949,97 @@ func (b *queryBuilder) jumpComponent(direction int) {
 	}
 }
 
+func (b *queryBuilder) moveRow(direction int) {
+	if direction == 0 {
+		return
+	}
+	if b.tableDisabled {
+		allowed := []int{-1, len(b.rows) + 1, len(b.rows) + 2}
+		idx := 0
+		switch b.row {
+		case -1:
+			idx = 0
+		case len(b.rows) + 1:
+			idx = 1
+		case len(b.rows) + 2:
+			idx = 2
+		default:
+			if direction > 0 {
+				idx = 1
+			} else {
+				idx = 0
+			}
+		}
+		next := idx + direction
+		if next < 0 {
+			next = 0
+		}
+		if next >= len(allowed) {
+			next = len(allowed) - 1
+		}
+		b.row = allowed[next]
+		return
+	}
+
+	maxRow := len(b.rows) + 2
+	b.row += direction
+	if b.row < -1 {
+		b.row = -1
+	}
+	if b.row > maxRow {
+		b.row = maxRow
+	}
+	if b.row >= 0 && b.row <= len(b.rows) {
+		b.tableRow = b.row
+	}
+}
+
 type queryRow struct {
 	Field    string
 	Operator string
+	Type     string
 	Value    string
+}
+
+func queryValueTypeOptions() []huh.Option[string] {
+	options := make([]huh.Option[string], 0, len(queryValueTypes))
+	for _, valueType := range queryValueTypes {
+		description := ""
+		switch valueType {
+		case string(traceql.ValueTypeAuto):
+			description = "existing smart quoting"
+		case string(traceql.ValueTypeString):
+			description = "always quoted"
+		case string(traceql.ValueTypeEnum):
+			description = "left unquoted"
+		}
+		label := valueType
+		if description != "" {
+			label = fmt.Sprintf("%s - %s", valueType, description)
+		}
+		options = append(options, huh.NewOption(label, valueType))
+	}
+	return options
+}
+
+func isSupportedQueryValueType(raw string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(raw))
+	for _, valueType := range queryValueTypes {
+		if normalized == valueType {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeQueryValueType(raw string) string {
+	trimmed := strings.ToLower(strings.TrimSpace(raw))
+	for _, valueType := range queryValueTypes {
+		if trimmed == valueType {
+			return valueType
+		}
+	}
+	return string(traceql.ValueTypeAuto)
 }
 
 type timeframeOption struct {
