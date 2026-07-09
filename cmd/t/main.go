@@ -41,6 +41,10 @@ func main() {
 		queryFlags    multiStringFlag
 		timeWindowRaw string
 		durationRaw   string
+		outputPath    string
+		outputStdout  bool
+		outputFormat  string
+		outputView    string
 	)
 
 	flag.BoolVar(&showVersion, "v", false, "print version information and exit")
@@ -53,6 +57,11 @@ func main() {
 	flag.StringVar(&timeWindowRaw, "time", "", "time window: <start>/<end> or <start> with --duration")
 	flag.StringVar(&durationRaw, "d", "", "duration for -t <start> mode (Go duration, e.g. 1h10m)")
 	flag.StringVar(&durationRaw, "duration", "", "duration for --time <start> mode (Go duration, e.g. 1h10m)")
+	flag.StringVar(&outputPath, "o", "", "output file path (use '-' for stdout); bypasses TUI")
+	flag.StringVar(&outputPath, "output", "", "output file path (use '-' for stdout); bypasses TUI")
+	flag.BoolVar(&outputStdout, "stdout", false, "write output to stdout and bypass TUI")
+	flag.StringVar(&outputFormat, "format", "json", "output format: json|text|html|image")
+	flag.StringVar(&outputView, "view", "", "output view: trace|service-map|logs|all")
 	flag.StringVar(&configPath, "config", "", "config file path (defaults to platform config dir)")
 	flag.Parse()
 	args := flag.Args()
@@ -65,6 +74,7 @@ func main() {
 	args = cleanedArgs
 	queryClauses := append([]string{}, queryFlags.values...)
 	queryClauses = append(queryClauses, inlineFlags.queryClauses...)
+	exportMessage := strings.TrimSpace(inlineFlags.message)
 
 	timeWindowRaw = strings.TrimSpace(timeWindowRaw)
 	durationRaw = strings.TrimSpace(durationRaw)
@@ -81,6 +91,36 @@ func main() {
 			os.Exit(1)
 		}
 		durationRaw = strings.TrimSpace(inlineFlags.duration)
+	}
+	if inlineFlags.outputPath != "" {
+		if outputPath != "" && !strings.EqualFold(strings.TrimSpace(outputPath), strings.TrimSpace(inlineFlags.outputPath)) {
+			fmt.Fprintf(os.Stderr, "cannot combine different -o/--output values\n")
+			os.Exit(1)
+		}
+		outputPath = strings.TrimSpace(inlineFlags.outputPath)
+	}
+	if inlineFlags.outputStdout {
+		outputStdout = true
+	}
+	if inlineFlags.outputFormat != "" {
+		if outputFormat != "" && !strings.EqualFold(strings.TrimSpace(outputFormat), strings.TrimSpace(inlineFlags.outputFormat)) {
+			fmt.Fprintf(os.Stderr, "cannot combine different --format values\n")
+			os.Exit(1)
+		}
+		outputFormat = strings.TrimSpace(inlineFlags.outputFormat)
+	}
+	if inlineFlags.outputView != "" {
+		if outputView != "" && !strings.EqualFold(strings.TrimSpace(outputView), strings.TrimSpace(inlineFlags.outputView)) {
+			fmt.Fprintf(os.Stderr, "cannot combine different --view values\n")
+			os.Exit(1)
+		}
+		outputView = strings.TrimSpace(inlineFlags.outputView)
+	}
+
+	outputOpts, err := parseOutputOptions(outputPath, outputStdout, outputFormat, outputView)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid output flags: %v\n", err)
+		os.Exit(1)
 	}
 
 	if len(args) >= 1 && args[0] == "logs" {
@@ -148,6 +188,14 @@ func main() {
 			os.Exit(1)
 		}
 		return
+	}
+	if len(args) >= 1 && args[0] == "version" {
+		if len(args) > 1 {
+			fmt.Fprintf(os.Stderr, "invalid command\n")
+			printUsage()
+			os.Exit(1)
+		}
+		showVersion = true
 	}
 
 	initRunLog(configPath)
@@ -217,7 +265,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 				os.Exit(1)
 			}
-			payload, err := config.ExportNonDefault(cfg)
+			payload, err := config.ExportNonDefaultWithMessage(cfg, exportMessage)
 			if err != nil {
 				runlog.Error("failed to export config", "error", err, "config_path", cfg.Path)
 				fmt.Fprintf(os.Stderr, "failed to export config: %v\n", err)
@@ -267,8 +315,16 @@ func main() {
 				fmt.Fprintf(os.Stderr, "failed to diff config patch: %v\n", err)
 				os.Exit(1)
 			}
+			message, err := config.ImportMessage(data)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to parse import metadata: %v\n", err)
+				os.Exit(1)
+			}
 			if len(changes) == 0 {
 				fmt.Fprintf(os.Stdout, "no config changes in %s\n", inPath)
+				if message != "" {
+					fmt.Fprintln(os.Stdout, message)
+				}
 				return
 			}
 			if !forceFetch {
@@ -293,6 +349,9 @@ func main() {
 			}
 			runlog.Info("imported config patch", "config_path", updated.Path, "import_path", inPath, "bytes", len(data))
 			fmt.Fprintf(os.Stdout, "imported config patch from %s\n", inPath)
+			if message != "" {
+				fmt.Fprintln(os.Stdout, message)
+			}
 			return
 		}
 		if len(args) >= 2 && args[1] == "diff" {
@@ -370,6 +429,13 @@ func main() {
 			fmt.Fprintf(os.Stderr, "failed to load snapshot: %v\n", err)
 			os.Exit(1)
 		}
+		if outputOpts.enabled {
+			if err := writeSessionOutput(session, outputOpts); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to render output: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		}
 		program := tea.NewProgram(tui.NewModel(cfg, session, platform.OpenURL, defaultSnapshotSaver), tea.WithAltScreen())
 		if _, err := program.Run(); err != nil {
 			runlog.Error("trace tui failed for snapshot", "error", err)
@@ -411,11 +477,28 @@ func main() {
 		}
 		runlog.Info("mode resolved", "browse", mode.isBrowse, "environment", mode.environment, "trace_id", mode.traceID, "query", mode.query, "trace_in_env_only", mode.traceInEnvOnly)
 	}
+	if outputOpts.enabled && !isExportMode {
+		if mode.isBrowse {
+			fmt.Fprintf(os.Stderr, "output mode only supports trace sessions, not browse/query mode\n")
+			os.Exit(1)
+		}
+		if strings.TrimSpace(mode.traceID) == "" {
+			fmt.Fprintf(os.Stderr, "output mode requires a trace id\n")
+			os.Exit(1)
+		}
+	}
 
 	if !isExportMode && !forceFetch && mode.traceID != "" {
 		traceID := strings.TrimSpace(mode.traceID)
 		if session, snapshotPath, ok := loadSnapshotSession(traceID, mode.environment, mode.traceInEnvOnly); ok {
 			runlog.Info("loaded trace session from snapshot cache", "trace_id", traceID, "snapshot_path", snapshotPath)
+			if outputOpts.enabled {
+				if err := writeSessionOutput(session, outputOpts); err != nil {
+					fmt.Fprintf(os.Stderr, "failed to render output: %v\n", err)
+					os.Exit(1)
+				}
+				return
+			}
 			program := tea.NewProgram(tui.NewModel(cfg, session, platform.OpenURL, defaultSnapshotSaver), tea.WithAltScreen())
 			if _, err := program.Run(); err != nil {
 				runlog.Error("trace tui failed", "error", err)
@@ -624,6 +707,34 @@ func main() {
 
 	traceID := mode.traceID
 	runlog.Info("trace mode started", "trace_id", traceID, "environment", mode.environment, "trace_in_env_only", mode.traceInEnvOnly)
+	if outputOpts.enabled {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Grafana.TimeoutSeconds+10)*time.Second)
+		defer cancel()
+
+		var session *domain.Session
+		if mode.traceInEnvOnly {
+			session, err = fetcher.FetchTraceSessionInEnvironment(ctx, cfg, mode.environment, traceID)
+		} else {
+			session, err = fetcher.FetchTraceSession(ctx, cfg, traceID)
+		}
+		if err != nil {
+			if errors.Is(err, app.ErrTraceNotFound) {
+				if mode.traceInEnvOnly {
+					fmt.Fprintf(os.Stderr, "trace %q not found in environment %q\n", traceID, mode.environment)
+				} else {
+					fmt.Fprintf(os.Stderr, "trace %q not found in configured environments\n", traceID)
+				}
+				os.Exit(2)
+			}
+			fmt.Fprintf(os.Stderr, "failed to fetch trace session: %v\n", err)
+			os.Exit(1)
+		}
+		if err := writeSessionOutput(session, outputOpts); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to render output: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Grafana.TimeoutSeconds+10)*time.Second)
 	status := startProgressStatus("searching trace")
@@ -788,6 +899,113 @@ type cliMode struct {
 	traceInEnvOnly   bool
 }
 
+type outputOptions struct {
+	enabled  bool
+	toStdout bool
+	path     string
+	format   app.OutputFormat
+	view     app.OutputView
+}
+
+func parseOutputOptions(path string, toStdout bool, formatRaw, viewRaw string) (outputOptions, error) {
+	path = strings.TrimSpace(path)
+	formatRaw = strings.ToLower(strings.TrimSpace(formatRaw))
+	viewRaw = strings.ToLower(strings.TrimSpace(viewRaw))
+
+	if formatRaw == "" {
+		formatRaw = string(app.OutputFormatJSON)
+	}
+
+	format := app.OutputFormat(formatRaw)
+	switch format {
+	case app.OutputFormatJSON, app.OutputFormatText, app.OutputFormatHTML, app.OutputFormatImage:
+	default:
+		return outputOptions{}, fmt.Errorf("unsupported format %q", formatRaw)
+	}
+
+	view := app.OutputViewAll
+	if viewRaw != "" {
+		view = app.OutputView(viewRaw)
+	}
+	if viewRaw == "" {
+		if format == app.OutputFormatJSON {
+			view = app.OutputViewAll
+		} else {
+			view = app.OutputViewTrace
+		}
+	}
+
+	switch view {
+	case app.OutputViewAll, app.OutputViewTrace, app.OutputViewServiceMap, app.OutputViewLogs:
+	default:
+		return outputOptions{}, fmt.Errorf("unsupported view %q", viewRaw)
+	}
+
+	if path != "" && toStdout {
+		return outputOptions{}, fmt.Errorf("cannot combine --output with --stdout")
+	}
+	enabled := path != "" || toStdout
+	return outputOptions{
+		enabled:  enabled,
+		toStdout: toStdout || path == "-",
+		path:     path,
+		format:   format,
+		view:     view,
+	}, nil
+}
+
+func writeSessionOutput(session *domain.Session, opts outputOptions) error {
+	if !opts.enabled {
+		return nil
+	}
+
+	var (
+		payload []byte
+		err     error
+	)
+
+	switch opts.format {
+	case app.OutputFormatJSON:
+		payload, err = app.MarshalSessionOutputJSON(session, opts.view)
+	case app.OutputFormatText:
+		var text string
+		text, err = app.RenderSessionOutputText(session, opts.view)
+		payload = []byte(ensureTrailingNewline(text))
+	case app.OutputFormatHTML:
+		var text string
+		text, err = app.RenderSessionOutputHTML(session, opts.view)
+		payload = []byte(ensureTrailingNewline(text))
+	case app.OutputFormatImage:
+		payload, err = app.RenderSessionOutputImage(session, opts.view)
+	default:
+		return fmt.Errorf("unsupported format %q", opts.format)
+	}
+	if err != nil {
+		return err
+	}
+
+	if opts.toStdout || opts.path == "" {
+		_, err = os.Stdout.Write(payload)
+		return err
+	}
+
+	outPath := filepath.Clean(opts.path)
+	if outPath == "" {
+		return fmt.Errorf("invalid output path")
+	}
+	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(outPath, payload, 0o644)
+}
+
+func ensureTrailingNewline(value string) string {
+	if strings.HasSuffix(value, "\n") {
+		return value
+	}
+	return value + "\n"
+}
+
 func resolveMode(args []string, cfg config.Config, queryClauses []string) (cliMode, error) {
 	if len(args) == 0 {
 		return cliMode{}, fmt.Errorf("missing command arguments")
@@ -870,9 +1088,10 @@ func looksLikeTraceID(value string) bool {
 }
 
 func printUsage() {
-	fmt.Fprintf(os.Stderr, "usage: %s [-v|--version] [--config path] <trace-id>\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "       %s [-f|--force] [--config path] <trace-id>\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "       %s [-f|--force] [--config path] <env> <trace-id>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "usage: %s [-v|--version] [--config path] [--output file|--stdout] [--format json|text|html|image] [--view trace|service-map|logs|all] <trace-id>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s version\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [-f|--force] [--config path] [--output file|--stdout] [--format json|text|html|image] [--view trace|service-map|logs|all] <trace-id>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [-f|--force] [--config path] [--output file|--stdout] [--format json|text|html|image] [--view trace|service-map|logs|all] <env> <trace-id>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] q|query\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] <env> q|query\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] <env> -q/--query <clause> [-q/--query <clause> ...]\n", os.Args[0])
@@ -884,7 +1103,7 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "       %s [--config path] caches clear\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config edit\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "       %s [--config path] config export [file]\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--config path] config export [-m|--message <text>] [file]\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config import <file>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config diff <file>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] logs\n", os.Args[0])
@@ -915,6 +1134,11 @@ type inlineFlags struct {
 	queryClauses []string
 	timeWindow   string
 	duration     string
+	message      string
+	outputPath   string
+	outputStdout bool
+	outputFormat string
+	outputView   string
 }
 
 func extractInlineFlags(args []string) (inlineFlags, []string, error) {
@@ -989,6 +1213,84 @@ func extractInlineFlags(args []string) (inlineFlags, []string, error) {
 				return inlineFlags{}, nil, fmt.Errorf("--duration requires a non-empty value")
 			}
 			flags.duration = value
+		case arg == "-m" || arg == "--message":
+			if i+1 >= len(args) {
+				return inlineFlags{}, nil, fmt.Errorf("%s requires a value", arg)
+			}
+			next := strings.TrimSpace(args[i+1])
+			if next == "" {
+				return inlineFlags{}, nil, fmt.Errorf("%s requires a non-empty value", arg)
+			}
+			flags.message = next
+			i++
+		case strings.HasPrefix(arg, "-m="):
+			value := strings.TrimSpace(strings.TrimPrefix(arg, "-m="))
+			if value == "" {
+				return inlineFlags{}, nil, fmt.Errorf("-m requires a non-empty value")
+			}
+			flags.message = value
+		case strings.HasPrefix(arg, "--message="):
+			value := strings.TrimSpace(strings.TrimPrefix(arg, "--message="))
+			if value == "" {
+				return inlineFlags{}, nil, fmt.Errorf("--message requires a non-empty value")
+			}
+			flags.message = value
+		case arg == "-o" || arg == "--output":
+			if i+1 >= len(args) {
+				return inlineFlags{}, nil, fmt.Errorf("%s requires a value", arg)
+			}
+			next := strings.TrimSpace(args[i+1])
+			if next == "" {
+				return inlineFlags{}, nil, fmt.Errorf("%s requires a non-empty value", arg)
+			}
+			flags.outputPath = next
+			i++
+		case strings.HasPrefix(arg, "-o="):
+			value := strings.TrimSpace(strings.TrimPrefix(arg, "-o="))
+			if value == "" {
+				return inlineFlags{}, nil, fmt.Errorf("-o requires a non-empty value")
+			}
+			flags.outputPath = value
+		case strings.HasPrefix(arg, "--output="):
+			value := strings.TrimSpace(strings.TrimPrefix(arg, "--output="))
+			if value == "" {
+				return inlineFlags{}, nil, fmt.Errorf("--output requires a non-empty value")
+			}
+			flags.outputPath = value
+		case arg == "--stdout":
+			flags.outputStdout = true
+		case arg == "--format":
+			if i+1 >= len(args) {
+				return inlineFlags{}, nil, fmt.Errorf("%s requires a value", arg)
+			}
+			next := strings.TrimSpace(args[i+1])
+			if next == "" {
+				return inlineFlags{}, nil, fmt.Errorf("%s requires a non-empty value", arg)
+			}
+			flags.outputFormat = next
+			i++
+		case strings.HasPrefix(arg, "--format="):
+			value := strings.TrimSpace(strings.TrimPrefix(arg, "--format="))
+			if value == "" {
+				return inlineFlags{}, nil, fmt.Errorf("--format requires a non-empty value")
+			}
+			flags.outputFormat = value
+		case arg == "--view":
+			if i+1 >= len(args) {
+				return inlineFlags{}, nil, fmt.Errorf("%s requires a value", arg)
+			}
+			next := strings.TrimSpace(args[i+1])
+			if next == "" {
+				return inlineFlags{}, nil, fmt.Errorf("%s requires a non-empty value", arg)
+			}
+			flags.outputView = next
+			i++
+		case strings.HasPrefix(arg, "--view="):
+			value := strings.TrimSpace(strings.TrimPrefix(arg, "--view="))
+			if value == "" {
+				return inlineFlags{}, nil, fmt.Errorf("--view requires a non-empty value")
+			}
+			flags.outputView = value
 		default:
 			cleaned = append(cleaned, args[i])
 		}
