@@ -60,7 +60,8 @@ func main() {
 	flag.StringVar(&outputPath, "o", "", "output file path (use '-' for stdout); bypasses TUI")
 	flag.StringVar(&outputPath, "output", "", "output file path (use '-' for stdout); bypasses TUI")
 	flag.BoolVar(&outputStdout, "stdout", false, "write output to stdout and bypass TUI")
-	flag.StringVar(&outputFormat, "format", "json", "output format: json|text|html|image")
+	flag.StringVar(&outputFormat, "fmt", "json", "output format alias for --format")
+	flag.StringVar(&outputFormat, "format", "json", "output format: json|text|txt|html|image|img|svg")
 	flag.StringVar(&outputView, "view", "", "output view: trace|service-map|logs|all")
 	flag.StringVar(&configPath, "config", "", "config file path (defaults to platform config dir)")
 	flag.Parse()
@@ -116,6 +117,9 @@ func main() {
 		}
 		outputView = strings.TrimSpace(inlineFlags.outputView)
 	}
+
+	formatProvided := inlineFlags.outputFormat != "" || hasFlagWithValue(os.Args[1:], "--format")
+	viewProvided := inlineFlags.outputView != "" || hasFlagWithValue(os.Args[1:], "--view")
 
 	outputOpts, err := parseOutputOptions(outputPath, outputStdout, outputFormat, outputView)
 	if err != nil {
@@ -429,6 +433,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "failed to load snapshot: %v\n", err)
 			os.Exit(1)
 		}
+		outputOpts = applyImplicitOutputMode(outputOpts, cliMode{traceID: session.Trace.TraceID}, formatProvided, viewProvided, term.IsTerminal(int(os.Stdout.Fd())))
 		if outputOpts.enabled {
 			if err := writeSessionOutput(session, outputOpts); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to render output: %v\n", err)
@@ -477,6 +482,7 @@ func main() {
 		}
 		runlog.Info("mode resolved", "browse", mode.isBrowse, "environment", mode.environment, "trace_id", mode.traceID, "query", mode.query, "trace_in_env_only", mode.traceInEnvOnly)
 	}
+	outputOpts = applyImplicitOutputMode(outputOpts, mode, formatProvided, viewProvided, term.IsTerminal(int(os.Stdout.Fd())))
 	if outputOpts.enabled && !isExportMode {
 		if mode.isBrowse {
 			fmt.Fprintf(os.Stderr, "output mode only supports trace sessions, not browse/query mode\n")
@@ -729,6 +735,9 @@ func main() {
 			fmt.Fprintf(os.Stderr, "failed to fetch trace session: %v\n", err)
 			os.Exit(1)
 		}
+		if saveErr := saveTraceSessionSnapshots(session, traceID); saveErr != nil {
+			runlog.Warn("snapshot save after output fetch failed", "error", saveErr, "trace_id", traceID)
+		}
 		if err := writeSessionOutput(session, outputOpts); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to render output: %v\n", err)
 			os.Exit(1)
@@ -788,6 +797,9 @@ func main() {
 				spanCount = session.Trace.SpanCount
 			}
 			runlog.Info("trace session fetched", "trace_id", traceID, "environment", session.Environment, "span_count", spanCount)
+			if saveErr := saveTraceSessionSnapshots(session, traceID); saveErr != nil {
+				runlog.Warn("snapshot save after trace fetch failed", "error", saveErr, "trace_id", traceID)
+			}
 
 			cancel()
 			status.Stop()
@@ -860,6 +872,9 @@ func main() {
 		spanCount = session.Trace.SpanCount
 	}
 	runlog.Info("trace session fetched", "trace_id", traceID, "environment", session.Environment, "span_count", spanCount)
+	if saveErr := saveTraceSessionSnapshots(session, traceID); saveErr != nil {
+		runlog.Warn("snapshot save after trace fetch failed", "error", saveErr, "trace_id", traceID)
+	}
 
 	logsPadding := 30 * time.Second
 	logsLoader := func(ctx context.Context) ([]domain.LogEntry, error) {
@@ -911,6 +926,14 @@ func parseOutputOptions(path string, toStdout bool, formatRaw, viewRaw string) (
 	path = strings.TrimSpace(path)
 	formatRaw = strings.ToLower(strings.TrimSpace(formatRaw))
 	viewRaw = strings.ToLower(strings.TrimSpace(viewRaw))
+	viewRaw = strings.ReplaceAll(viewRaw, "_", "-")
+
+	switch formatRaw {
+	case "txt":
+		formatRaw = string(app.OutputFormatText)
+	case "img":
+		formatRaw = string(app.OutputFormatImage)
+	}
 
 	if formatRaw == "" {
 		formatRaw = string(app.OutputFormatJSON)
@@ -918,7 +941,7 @@ func parseOutputOptions(path string, toStdout bool, formatRaw, viewRaw string) (
 
 	format := app.OutputFormat(formatRaw)
 	switch format {
-	case app.OutputFormatJSON, app.OutputFormatText, app.OutputFormatHTML, app.OutputFormatImage:
+	case app.OutputFormatJSON, app.OutputFormatText, app.OutputFormatHTML, app.OutputFormatImage, app.OutputFormatSVG:
 	default:
 		return outputOptions{}, fmt.Errorf("unsupported format %q", formatRaw)
 	}
@@ -928,7 +951,7 @@ func parseOutputOptions(path string, toStdout bool, formatRaw, viewRaw string) (
 		view = app.OutputView(viewRaw)
 	}
 	if viewRaw == "" {
-		if format == app.OutputFormatJSON {
+		if format == app.OutputFormatJSON || format == app.OutputFormatHTML {
 			view = app.OutputViewAll
 		} else {
 			view = app.OutputViewTrace
@@ -954,6 +977,39 @@ func parseOutputOptions(path string, toStdout bool, formatRaw, viewRaw string) (
 	}, nil
 }
 
+func applyImplicitOutputMode(opts outputOptions, mode cliMode, formatProvided, viewProvided, stdoutIsTTY bool) outputOptions {
+	if opts.enabled || mode.isBrowse || strings.TrimSpace(mode.traceID) == "" {
+		return opts
+	}
+
+	if formatProvided {
+		opts.enabled = true
+		opts.toStdout = false
+		opts.path = defaultOutputPathForTrace(mode.traceID, opts.format)
+		return opts
+	}
+
+	if !stdoutIsTTY {
+		opts.enabled = true
+		opts.toStdout = true
+		opts.path = "-"
+		opts.format = app.OutputFormatText
+		if !viewProvided {
+			opts.view = app.OutputViewTrace
+		}
+	}
+
+	return opts
+}
+
+func defaultOutputPathForTrace(traceID string, format app.OutputFormat) string {
+	trimmedTraceID := strings.TrimSpace(traceID)
+	if trimmedTraceID == "" {
+		trimmedTraceID = "trace"
+	}
+	return trimmedTraceID + "." + app.OutputFormatExtension(format)
+}
+
 func writeSessionOutput(session *domain.Session, opts outputOptions) error {
 	if !opts.enabled {
 		return nil
@@ -977,6 +1033,8 @@ func writeSessionOutput(session *domain.Session, opts outputOptions) error {
 		payload = []byte(ensureTrailingNewline(text))
 	case app.OutputFormatImage:
 		payload, err = app.RenderSessionOutputImage(session, opts.view)
+	case app.OutputFormatSVG:
+		payload, err = app.RenderSessionOutputSVG(session, opts.view)
 	default:
 		return fmt.Errorf("unsupported format %q", opts.format)
 	}
@@ -1004,6 +1062,16 @@ func ensureTrailingNewline(value string) string {
 		return value
 	}
 	return value + "\n"
+}
+
+func hasFlagWithValue(args []string, flagName string) bool {
+	for _, arg := range args {
+		trimmed := strings.TrimSpace(arg)
+		if trimmed == flagName || strings.HasPrefix(trimmed, flagName+"=") {
+			return true
+		}
+	}
+	return false
 }
 
 func resolveMode(args []string, cfg config.Config, queryClauses []string) (cliMode, error) {
@@ -1088,10 +1156,10 @@ func looksLikeTraceID(value string) bool {
 }
 
 func printUsage() {
-	fmt.Fprintf(os.Stderr, "usage: %s [-v|--version] [--config path] [--output file|--stdout] [--format json|text|html|image] [--view trace|service-map|logs|all] <trace-id>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "usage: %s [-v|--version] [--config path] [--output file|--stdout] [--format json|text|txt|html|image|img|svg] [--view trace|service-map|logs|all] <trace-id>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s version\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "       %s [-f|--force] [--config path] [--output file|--stdout] [--format json|text|html|image] [--view trace|service-map|logs|all] <trace-id>\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "       %s [-f|--force] [--config path] [--output file|--stdout] [--format json|text|html|image] [--view trace|service-map|logs|all] <env> <trace-id>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [-f|--force] [--config path] [--output file|--stdout] [--format json|text|txt|html|image|img|svg] [--view trace|service-map|logs|all] <trace-id>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [-f|--force] [--config path] [--output file|--stdout] [--format json|text|txt|html|image|img|svg] [--view trace|service-map|logs|all] <env> <trace-id>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] q|query\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] <env> q|query\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] <env> -q/--query <clause> [-q/--query <clause> ...]\n", os.Args[0])
@@ -1269,10 +1337,26 @@ func extractInlineFlags(args []string) (inlineFlags, []string, error) {
 			}
 			flags.outputFormat = next
 			i++
+		case arg == "-fmt":
+			if i+1 >= len(args) {
+				return inlineFlags{}, nil, fmt.Errorf("%s requires a value", arg)
+			}
+			next := strings.TrimSpace(args[i+1])
+			if next == "" {
+				return inlineFlags{}, nil, fmt.Errorf("%s requires a non-empty value", arg)
+			}
+			flags.outputFormat = next
+			i++
 		case strings.HasPrefix(arg, "--format="):
 			value := strings.TrimSpace(strings.TrimPrefix(arg, "--format="))
 			if value == "" {
 				return inlineFlags{}, nil, fmt.Errorf("--format requires a non-empty value")
+			}
+			flags.outputFormat = value
+		case strings.HasPrefix(arg, "-fmt="):
+			value := strings.TrimSpace(strings.TrimPrefix(arg, "-fmt="))
+			if value == "" {
+				return inlineFlags{}, nil, fmt.Errorf("-fmt requires a non-empty value")
 			}
 			flags.outputFormat = value
 		case arg == "--view":
@@ -1333,12 +1417,17 @@ func defaultSnapshotSaver(session *domain.Session) (string, error) {
 	return path, nil
 }
 
+func saveTraceSessionSnapshots(session *domain.Session, _ string) error {
+	_, err := defaultSnapshotSaver(session)
+	return err
+}
+
 func loadSnapshotSession(traceID, requestedEnvironment string, requireEnvironmentMatch bool) (*domain.Session, string, bool) {
 	trimmedTraceID := strings.TrimSpace(traceID)
 	if trimmedTraceID == "" {
 		return nil, "", false
 	}
-	snapshotPath, err := app.ResolveSnapshotOpenPath(trimmedTraceID)
+	snapshotPath, err := app.DefaultSnapshotPath(trimmedTraceID)
 	if err != nil {
 		return nil, "", false
 	}
@@ -1502,7 +1591,17 @@ func parseBrowseWindowOverride(timeRaw, durationRaw string) (app.TraceSearchWind
 		return app.TraceSearchWindow{}, false, nil
 	}
 	if timeRaw == "" && durationRaw != "" {
-		return app.TraceSearchWindow{}, false, fmt.Errorf("-d/--duration requires -t/--time")
+		d, err := time.ParseDuration(durationRaw)
+		if err != nil {
+			return app.TraceSearchWindow{}, false, fmt.Errorf("invalid duration %q: %w", durationRaw, err)
+		}
+		if d == 0 {
+			return app.TraceSearchWindow{}, false, fmt.Errorf("duration must be != 0")
+		}
+		if d < 0 {
+			d = -d
+		}
+		return app.TraceSearchWindow{Since: d}, true, nil
 	}
 
 	window := app.TraceSearchWindow{Since: 0}
