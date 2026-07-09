@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 )
 
 type ImportChange struct {
@@ -13,7 +14,13 @@ type ImportChange struct {
 	To   any
 }
 
+const importMessageKey = "message"
+
 func ExportNonDefault(cfg Config) ([]byte, error) {
+	return ExportNonDefaultWithMessage(cfg, "")
+}
+
+func ExportNonDefaultWithMessage(cfg Config, message string) ([]byte, error) {
 	current, err := configToJSONMap(cfg)
 	if err != nil {
 		return nil, err
@@ -24,12 +31,20 @@ func ExportNonDefault(cfg Config) ([]byte, error) {
 	}
 
 	patchAny, ok := diffAny(defaults, current)
-	if !ok {
-		return []byte("{}\n"), nil
+	patch := map[string]any{}
+	if ok {
+		var patchOK bool
+		patch, patchOK = patchAny.(map[string]any)
+		if !patchOK {
+			return nil, fmt.Errorf("export patch is not an object")
+		}
 	}
-	patch, ok := patchAny.(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("export patch is not an object")
+
+	if trimmed := strings.TrimSpace(message); trimmed != "" {
+		patch[importMessageKey] = trimmed
+	}
+	if len(patch) == 0 {
+		return []byte("{}\n"), nil
 	}
 
 	buf, err := json.MarshalIndent(patch, "", "  ")
@@ -40,7 +55,7 @@ func ExportNonDefault(cfg Config) ([]byte, error) {
 }
 
 func ApplyImport(cfg Config, data []byte) (Config, error) {
-	overlay, err := parseOverlay(data)
+	overlay, _, err := parseOverlay(data)
 	if err != nil {
 		return Config{}, err
 	}
@@ -67,7 +82,7 @@ func ApplyImport(cfg Config, data []byte) (Config, error) {
 }
 
 func DiffImport(cfg Config, data []byte) ([]ImportChange, error) {
-	overlay, err := parseOverlay(data)
+	overlay, _, err := parseOverlay(data)
 	if err != nil {
 		return nil, err
 	}
@@ -81,15 +96,35 @@ func DiffImport(cfg Config, data []byte) ([]ImportChange, error) {
 	return changes, nil
 }
 
-func parseOverlay(data []byte) (map[string]any, error) {
+func ImportMessage(data []byte) (string, error) {
+	_, message, err := parseOverlay(data)
+	if err != nil {
+		return "", err
+	}
+	return message, nil
+}
+
+func parseOverlay(data []byte) (map[string]any, string, error) {
 	var overlay map[string]any
 	if err := json.Unmarshal(data, &overlay); err != nil {
-		return nil, fmt.Errorf("invalid import json: %w", err)
+		return nil, "", fmt.Errorf("invalid import json: %w", err)
 	}
 	if overlay == nil {
 		overlay = map[string]any{}
 	}
-	return overlay, nil
+	message := ""
+	if raw, ok := overlay[importMessageKey]; ok {
+		switch value := raw.(type) {
+		case string:
+			message = strings.TrimSpace(value)
+		case nil:
+			message = ""
+		default:
+			return nil, "", fmt.Errorf("invalid import json: %q must be a string", importMessageKey)
+		}
+		delete(overlay, importMessageKey)
+	}
+	return overlay, message, nil
 }
 
 func configToJSONMap(cfg Config) (map[string]any, error) {

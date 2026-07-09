@@ -65,6 +65,7 @@ func main() {
 	args = cleanedArgs
 	queryClauses := append([]string{}, queryFlags.values...)
 	queryClauses = append(queryClauses, inlineFlags.queryClauses...)
+	exportMessage := strings.TrimSpace(inlineFlags.message)
 
 	timeWindowRaw = strings.TrimSpace(timeWindowRaw)
 	durationRaw = strings.TrimSpace(durationRaw)
@@ -225,7 +226,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 				os.Exit(1)
 			}
-			payload, err := config.ExportNonDefault(cfg)
+			payload, err := config.ExportNonDefaultWithMessage(cfg, exportMessage)
 			if err != nil {
 				runlog.Error("failed to export config", "error", err, "config_path", cfg.Path)
 				fmt.Fprintf(os.Stderr, "failed to export config: %v\n", err)
@@ -275,8 +276,16 @@ func main() {
 				fmt.Fprintf(os.Stderr, "failed to diff config patch: %v\n", err)
 				os.Exit(1)
 			}
+			message, err := config.ImportMessage(data)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to parse import metadata: %v\n", err)
+				os.Exit(1)
+			}
 			if len(changes) == 0 {
 				fmt.Fprintf(os.Stdout, "no config changes in %s\n", inPath)
+				if message != "" {
+					fmt.Fprintln(os.Stdout, message)
+				}
 				return
 			}
 			if !forceFetch {
@@ -301,6 +310,9 @@ func main() {
 			}
 			runlog.Info("imported config patch", "config_path", updated.Path, "import_path", inPath, "bytes", len(data))
 			fmt.Fprintf(os.Stdout, "imported config patch from %s\n", inPath)
+			if message != "" {
+				fmt.Fprintln(os.Stdout, message)
+			}
 			return
 		}
 		if len(args) >= 2 && args[1] == "diff" {
@@ -893,7 +905,7 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "       %s [--config path] caches clear\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config edit\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "       %s [--config path] config export [file]\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--config path] config export [-m|--message <text>] [file]\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config import <file>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config diff <file>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] logs\n", os.Args[0])
@@ -924,6 +936,7 @@ type inlineFlags struct {
 	queryClauses []string
 	timeWindow   string
 	duration     string
+	message      string
 }
 
 func extractInlineFlags(args []string) (inlineFlags, []string, error) {
@@ -998,6 +1011,28 @@ func extractInlineFlags(args []string) (inlineFlags, []string, error) {
 				return inlineFlags{}, nil, fmt.Errorf("--duration requires a non-empty value")
 			}
 			flags.duration = value
+		case arg == "-m" || arg == "--message":
+			if i+1 >= len(args) {
+				return inlineFlags{}, nil, fmt.Errorf("%s requires a value", arg)
+			}
+			next := strings.TrimSpace(args[i+1])
+			if next == "" {
+				return inlineFlags{}, nil, fmt.Errorf("%s requires a non-empty value", arg)
+			}
+			flags.message = next
+			i++
+		case strings.HasPrefix(arg, "-m="):
+			value := strings.TrimSpace(strings.TrimPrefix(arg, "-m="))
+			if value == "" {
+				return inlineFlags{}, nil, fmt.Errorf("-m requires a non-empty value")
+			}
+			flags.message = value
+		case strings.HasPrefix(arg, "--message="):
+			value := strings.TrimSpace(strings.TrimPrefix(arg, "--message="))
+			if value == "" {
+				return inlineFlags{}, nil, fmt.Errorf("--message requires a non-empty value")
+			}
+			flags.message = value
 		default:
 			cleaned = append(cleaned, args[i])
 		}
