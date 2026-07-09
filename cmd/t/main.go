@@ -35,12 +35,12 @@ const upgradeInstallTarget = "github.com/almahoozi/trace/cmd/t@latest"
 
 func main() {
 	var (
-		showVersion bool
-		configPath  string
-		forceFetch  bool
-		queryFlags  multiStringFlag
+		showVersion   bool
+		configPath    string
+		forceFetch    bool
+		queryFlags    multiStringFlag
 		timeWindowRaw string
-		durationRaw string
+		durationRaw   string
 	)
 
 	flag.BoolVar(&showVersion, "v", false, "print version information and exit")
@@ -566,9 +566,6 @@ func main() {
 					if err != nil {
 						return nil, err
 					}
-					if err := autoExportSnapshotOnOpen(cleanupCtx, cfg, session); err != nil {
-						runlog.Warn("auto-export snapshot failed", "error", err, "trace_id", traceID)
-					}
 					return session, nil
 				},
 				func(ctx context.Context, environment, query string, limit, spss int, since time.Duration, startAt, endAt time.Time, hasStartAt, hasEndAt bool) ([]domain.TraceListItem, error) {
@@ -585,6 +582,13 @@ func main() {
 					fieldsCtx, fieldsCancel := context.WithTimeout(ctx, 3*time.Second)
 					defer fieldsCancel()
 					return fetcher.FetchTraceQueryFields(fieldsCtx, cfg, mode.environment)
+				},
+				func(session *domain.Session) error {
+					if err := autoExportSnapshotOnOpen(cleanupCtx, cfg, session); err != nil {
+						runlog.Warn("auto-export snapshot failed", "error", err)
+						return err
+					}
+					return nil
 				},
 				platform.OpenURL,
 			),
