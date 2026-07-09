@@ -24,6 +24,8 @@ type JSONTree struct {
 	cursor    int
 	scrollTop int
 	viewRows  int
+	visual    bool
+	anchor    int
 }
 
 type RootEntry struct {
@@ -134,6 +136,54 @@ func (j *JSONTree) Toggle() {
 	j.ensureCursorVisible(0, j.visibleRows())
 }
 
+func (j *JSONTree) ToggleVisualMode() bool {
+	if len(j.lines) == 0 {
+		j.visual = false
+		j.anchor = 0
+		return false
+	}
+	if j.visual {
+		j.visual = false
+		j.anchor = 0
+		return false
+	}
+	j.visual = true
+	j.anchor = max(0, min(j.cursor, len(j.lines)-1))
+	return true
+}
+
+func (j *JSONTree) DisableVisualMode() bool {
+	if !j.visual {
+		return false
+	}
+	j.visual = false
+	j.anchor = 0
+	return true
+}
+
+func (j *JSONTree) selectionRange() (int, int) {
+	if len(j.lines) == 0 {
+		return 0, 0
+	}
+	cursor := max(0, min(j.cursor, len(j.lines)-1))
+	if !j.visual {
+		return cursor, cursor
+	}
+	anchor := max(0, min(j.anchor, len(j.lines)-1))
+	return min(anchor, cursor), max(anchor, cursor)
+}
+
+func (j *JSONTree) selectionIncludes(index int) bool {
+	if !j.visual {
+		return false
+	}
+	if index < 0 || index >= len(j.lines) {
+		return false
+	}
+	start, end := j.selectionRange()
+	return index >= start && index <= end
+}
+
 func (j *JSONTree) CurrentScalar() (string, any, bool) {
 	if len(j.lines) == 0 || j.cursor < 0 || j.cursor >= len(j.lines) {
 		return "", nil, false
@@ -223,11 +273,14 @@ func (j *JSONTree) View(height int) string {
 				toggle = "[+]"
 			}
 		}
-		b.WriteString(prefix)
-		b.WriteString(indent)
-		b.WriteString(toggle)
-		b.WriteString(" ")
-		b.WriteString(line.Label)
+		rendered := prefix + indent + toggle + " " + line.Label
+		if i == j.cursor && j.selectionIncludes(i) {
+			b.WriteString(tableRowCursorVisualStyle.Render(rendered))
+		} else if j.selectionIncludes(i) {
+			b.WriteString(tableRowVisualStyle.Render(rendered))
+		} else {
+			b.WriteString(rendered)
+		}
 		b.WriteString("\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
