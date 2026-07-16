@@ -1615,11 +1615,11 @@ func parseBrowseWindowOverride(timeRaw, durationRaw string) (app.TraceSearchWind
 		if startRaw == "" || endRaw == "" {
 			return app.TraceSearchWindow{}, false, fmt.Errorf("both start and end are required in -t start/end")
 		}
-		startAt, err := time.Parse(time.RFC3339, startRaw)
+		startAt, err := parseBrowseWindowTimeValue(startRaw, false)
 		if err != nil {
 			return app.TraceSearchWindow{}, false, fmt.Errorf("invalid start time %q: %w", startRaw, err)
 		}
-		endAt, err := time.Parse(time.RFC3339, endRaw)
+		endAt, err := parseBrowseWindowTimeValue(endRaw, true)
 		if err != nil {
 			return app.TraceSearchWindow{}, false, fmt.Errorf("invalid end time %q: %w", endRaw, err)
 		}
@@ -1633,7 +1633,7 @@ func parseBrowseWindowOverride(timeRaw, durationRaw string) (app.TraceSearchWind
 		return window, true, nil
 	}
 
-	startAt, err := time.Parse(time.RFC3339, timeRaw)
+	startAt, err := parseBrowseWindowTimeValue(timeRaw, false)
 	if err != nil {
 		return app.TraceSearchWindow{}, false, fmt.Errorf("invalid time %q: %w", timeRaw, err)
 	}
@@ -1644,14 +1644,60 @@ func parseBrowseWindowOverride(timeRaw, durationRaw string) (app.TraceSearchWind
 	if err != nil {
 		return app.TraceSearchWindow{}, false, fmt.Errorf("invalid duration %q: %w", durationRaw, err)
 	}
-	if d <= 0 {
-		return app.TraceSearchWindow{}, false, fmt.Errorf("duration must be > 0")
+	if d == 0 {
+		return app.TraceSearchWindow{}, false, fmt.Errorf("duration must be != 0")
 	}
-	window.StartAt = startAt.UTC()
-	window.EndAt = startAt.Add(d).UTC()
+	start := startAt
+	end := startAt.Add(d)
+	if d < 0 {
+		start = startAt.Add(d)
+		end = startAt
+	}
+	if end.Before(start) {
+		start, end = end, start
+	}
+	window.StartAt = start.UTC()
+	window.EndAt = end.UTC()
 	window.HasStartAt = true
 	window.HasEndAt = true
 	return window, true, nil
+}
+
+func parseBrowseWindowTimeValue(raw string, useEndOfDayForDate bool) (time.Time, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return time.Time{}, fmt.Errorf("empty time value")
+	}
+	if t, err := time.Parse(time.RFC3339, trimmed); err == nil {
+		return t, nil
+	}
+
+	localLayouts := []string{
+		"2006-01-02T15:04:05",
+		"2006-01-02T15:04:05.000",
+		"2006-01-02T15:04:05.000000",
+		"2006-01-02T15:04:05.000000000",
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04:05.000",
+		"2006-01-02 15:04:05.000000",
+		"2006-01-02 15:04:05.000000000",
+		"2006-01-02T15:04",
+		"2006-01-02 15:04",
+	}
+	for _, layout := range localLayouts {
+		if t, err := time.ParseInLocation(layout, trimmed, time.Local); err == nil {
+			return t, nil
+		}
+	}
+
+	if t, err := time.ParseInLocation("2006-01-02", trimmed, time.Local); err == nil {
+		if useEndOfDayForDate {
+			return time.Date(t.Year(), t.Month(), t.Day(), 23, 59, 59, 0, t.Location()), nil
+		}
+		return t, nil
+	}
+
+	return time.Time{}, fmt.Errorf("expected RFC3339, local date-time, or YYYY-MM-DD")
 }
 
 func windowsOverlap(aStart, aEnd, bStart, bEnd time.Time) bool {
