@@ -155,3 +155,22 @@ func TestYankSelectionToClipboard_AutoExitsHighlightMode(t *testing.T) {
 		t.Fatalf("expected tree highlight mode to be disabled after yank")
 	}
 }
+
+func TestTraceQueryWindowAround_UsesTenMinutesBeforeAndAfter(t *testing.T) {
+	now := time.Date(2026, time.July, 14, 15, 33, 21, 987654321, time.UTC)
+	start, end := traceQueryWindowAround(now)
+
+	expectedBase := time.Date(2026, time.July, 14, 15, 33, 21, 0, time.UTC)
+	expectedStart := expectedBase.Add(-10 * time.Minute)
+	expectedEnd := expectedBase.Add(10 * time.Minute)
+
+	if !start.Equal(expectedStart) {
+		t.Fatalf("expected start %s, got %s", expectedStart, start)
+	}
+	if !end.Equal(expectedEnd) {
+		t.Fatalf("expected end %s, got %s", expectedEnd, end)
+	}
+	if !start.Before(end) {
+		t.Fatalf("expected start before end: start=%s end=%s", start, end)
+	}
+}
