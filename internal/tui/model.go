@@ -418,6 +418,11 @@ func (m Model) updateJSON(key string) (tea.Model, tea.Cmd) {
 		}
 		m.jsonTree.Toggle()
 	}
+	if m.isAction("json", "copy_query", key) {
+		if m.copyCurrentJSONScalarAsQuery() {
+			return m, nil
+		}
+	}
 	return m, nil
 }
 
@@ -1286,7 +1291,7 @@ func (m Model) View() string {
 		return clampToHeight(m.layout(m.valueViewView()), m.height)
 	}
 	if m.jsonTree != nil {
-		return clampToHeight(m.layout(m.jsonTree.View(m.height-3)), m.height)
+		return clampToHeight(m.layout(m.jsonTree.View(m.height-3, m.width-2)), m.height)
 	}
 
 	headerLine1 := m.summaryHeaderLine()
@@ -1707,7 +1712,7 @@ func (m Model) serviceMapView(height int) string {
 	if m.serviceMapTree == nil || len(m.serviceMapTree.lines) == 0 {
 		return "Service map\n(no rows)"
 	}
-	return m.serviceMapTree.View(height)
+	return m.serviceMapTree.View(height, m.width-2)
 }
 
 func newValueView(title string, value any, width int) *valueView {
@@ -2509,6 +2514,7 @@ func (m Model) helpView() string {
 		"open_external":     "Open external URL",
 		"level_up":          "Increase min level",
 		"level_down":        "Decrease min level",
+		"copy_query":        "Copy query command from value",
 	}
 
 	var b strings.Builder
@@ -2656,6 +2662,115 @@ func (m Model) currentLog() (domain.LogEntry, bool) {
 		return domain.LogEntry{}, false
 	}
 	return m.filteredLogs[m.logCursor], true
+}
+
+func (m *Model) copyCurrentJSONScalarAsQuery() bool {
+	if m == nil {
+		return false
+	}
+	if m.jsonTree == nil {
+		m.status = "query copy unavailable"
+		return false
+	}
+	line, ok := m.jsonTree.CurrentLine()
+	if !ok || line.Collapsable {
+		m.status = "query copy works on scalar values only"
+		return false
+	}
+	field := sanitizeQueryField(line)
+	if field == "" {
+		m.status = "query copy requires an attribute-like key"
+		return false
+	}
+	command := m.buildQueryCommandFromJSONScalar(field, line.Value)
+	if strings.TrimSpace(command) == "" {
+		m.status = "failed to build query command"
+		return false
+	}
+	if err := writeClipboardText(command); err != nil {
+		m.status = "copy failed: " + err.Error()
+		return false
+	}
+	m.status = "copied query command"
+	return true
+}
+
+func sanitizeQueryField(line jsonLine) string {
+	field := strings.TrimSpace(line.Key)
+	if field == "" || strings.HasPrefix(field, "[") || strings.Contains(field, " ") {
+		field = lastPathToken(line.Path)
+	}
+	field = strings.TrimSpace(field)
+	if field == "" || strings.HasPrefix(field, "[") || strings.Contains(field, " ") {
+		return ""
+	}
+	return field
+}
+
+func lastPathToken(path string) string {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return ""
+	}
+	if idx := strings.LastIndex(trimmed, "."); idx >= 0 && idx < len(trimmed)-1 {
+		return trimmed[idx+1:]
+	}
+	return trimmed
+}
+
+func (m Model) buildQueryCommandFromJSONScalar(field string, value any) string {
+	field = strings.TrimSpace(field)
+	if field == "" {
+		return ""
+	}
+	clause := field + "=" + formatTraceQLValue(value)
+	start, end := m.traceQueryWindow()
+	window := start.UTC().Format(time.RFC3339) + "/" + end.UTC().Format(time.RFC3339)
+	parts := []string{"t"}
+	if env := strings.TrimSpace(m.session.Environment); env != "" {
+		parts = append(parts, shellSingleQuote(env))
+	}
+	parts = append(parts, "-q", shellSingleQuote(clause), "-t", shellSingleQuote(window))
+	return strings.Join(parts, " ")
+}
+
+func (m Model) traceQueryWindow() (time.Time, time.Time) {
+	now := time.Now().UTC().Truncate(time.Second)
+	start, end := traceQueryWindowAround(now)
+	return start, end
+}
+
+func traceQueryWindowAround(now time.Time) (time.Time, time.Time) {
+	base := now.UTC().Truncate(time.Second)
+	start := base.Add(-10 * time.Minute)
+	end := base.Add(10 * time.Minute)
+	return start, end
+}
+
+func formatTraceQLValue(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return strconv.Quote("")
+	case string:
+		return strconv.Quote(typed)
+	case bool:
+		if typed {
+			return "true"
+		}
+		return "false"
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
+		return fmt.Sprint(typed)
+	default:
+		return strconv.Quote(fmt.Sprint(typed))
+	}
+}
+
+func shellSingleQuote(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(trimmed, "'", "'\\''") + "'"
 }
 
 func (m *Model) toggleLineHighlightMode() {

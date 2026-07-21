@@ -195,6 +195,13 @@ func (j *JSONTree) CurrentScalar() (string, any, bool) {
 	return line.Key, line.Value, true
 }
 
+func (j *JSONTree) CurrentLine() (jsonLine, bool) {
+	if len(j.lines) == 0 || j.cursor < 0 || j.cursor >= len(j.lines) {
+		return jsonLine{}, false
+	}
+	return j.lines[j.cursor], true
+}
+
 func (j *JSONTree) SearchNext(matcher *searchMatcher) bool {
 	if matcher == nil || len(j.lines) == 0 {
 		return false
@@ -243,7 +250,7 @@ func (j *JSONTree) SearchPrev(matcher *searchMatcher) bool {
 	return false
 }
 
-func (j *JSONTree) View(height int) string {
+func (j *JSONTree) View(height, width int) string {
 	if len(j.lines) == 0 {
 		return j.title + "\n(empty)"
 	}
@@ -260,9 +267,9 @@ func (j *JSONTree) View(height int) string {
 	b.WriteString("\n")
 	for i := start; i < end; i++ {
 		line := j.lines[i]
-		prefix := "  "
+		cursorPrefix := "  "
 		if i == j.cursor {
-			prefix = "> "
+			cursorPrefix = "> "
 		}
 		indent := strings.Repeat("  ", line.Depth)
 		toggle := "  "
@@ -273,15 +280,28 @@ func (j *JSONTree) View(height int) string {
 				toggle = "[+]"
 			}
 		}
-		rendered := prefix + indent + toggle + " " + line.Label
-		if i == j.cursor && j.selectionIncludes(i) {
-			b.WriteString(tableRowCursorVisualStyle.Render(rendered))
-		} else if j.selectionIncludes(i) {
-			b.WriteString(tableRowVisualStyle.Render(rendered))
-		} else {
-			b.WriteString(rendered)
+		basePrefix := cursorPrefix + indent + toggle + " "
+		available := max(1, width-len([]rune(basePrefix)))
+		parts := wrapText(line.Label, available)
+		if len(parts) == 0 {
+			parts = []string{""}
 		}
-		b.WriteString("\n")
+		continuationPrefix := strings.Repeat(" ", len([]rune(basePrefix)))
+		for idx, part := range parts {
+			linePrefix := basePrefix
+			if idx > 0 {
+				linePrefix = continuationPrefix
+			}
+			rendered := linePrefix + part
+			if i == j.cursor && j.selectionIncludes(i) {
+				b.WriteString(tableRowCursorVisualStyle.Render(rendered))
+			} else if j.selectionIncludes(i) {
+				b.WriteString(tableRowVisualStyle.Render(rendered))
+			} else {
+				b.WriteString(rendered)
+			}
+			b.WriteString("\n")
+		}
 	}
 	return strings.TrimRight(b.String(), "\n")
 }
