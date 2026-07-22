@@ -45,12 +45,14 @@ func main() {
 		outputStdout  bool
 		outputFormat  string
 		outputView    string
+		assumeYes     bool
+		themeNameFlag string
 	)
 
 	flag.BoolVar(&showVersion, "v", false, "print version information and exit")
 	flag.BoolVar(&showVersion, "version", false, "print version information and exit")
-	flag.BoolVar(&forceFetch, "f", false, "force operations (trace fetch bypass cache, config import skip prompt)")
-	flag.BoolVar(&forceFetch, "force", false, "force operations (trace fetch bypass cache, config import skip prompt)")
+	flag.BoolVar(&forceFetch, "f", false, "force operations (trace fetch bypass cache, config/theme import skip prompts)")
+	flag.BoolVar(&forceFetch, "force", false, "force operations (trace fetch bypass cache, config/theme import skip prompts)")
 	flag.Var(&queryFlags, "q", "query clause (repeatable); compiled into TraceQL when used with an environment")
 	flag.Var(&queryFlags, "query", "query clause (repeatable); compiled into TraceQL when used with an environment")
 	flag.StringVar(&timeWindowRaw, "t", "", "time window: <start>/<end> or <start> with -d")
@@ -63,6 +65,10 @@ func main() {
 	flag.StringVar(&outputFormat, "fmt", "json", "output format alias for --format")
 	flag.StringVar(&outputFormat, "format", "json", "output format: json|text|txt|html|image|img|svg")
 	flag.StringVar(&outputView, "view", "", "output view: trace|service-map|logs|all")
+	flag.BoolVar(&assumeYes, "y", false, "assume yes for interactive prompts in supported commands")
+	flag.BoolVar(&assumeYes, "yes", false, "assume yes for interactive prompts in supported commands")
+	flag.StringVar(&themeNameFlag, "n", "", "theme name for theme import")
+	flag.StringVar(&themeNameFlag, "name", "", "theme name for theme import")
 	flag.StringVar(&configPath, "config", "", "config file path (defaults to platform config dir)")
 	flag.Parse()
 	args := flag.Args()
@@ -116,6 +122,19 @@ func main() {
 			os.Exit(1)
 		}
 		outputView = strings.TrimSpace(inlineFlags.outputView)
+	}
+	if inlineFlags.force {
+		forceFetch = true
+	}
+	if inlineFlags.assumeYes {
+		assumeYes = true
+	}
+	if inlineFlags.themeName != "" {
+		if themeNameFlag != "" && !strings.EqualFold(strings.TrimSpace(themeNameFlag), strings.TrimSpace(inlineFlags.themeName)) {
+			fmt.Fprintf(os.Stderr, "cannot combine different -n/--name values\n")
+			os.Exit(1)
+		}
+		themeNameFlag = inlineFlags.themeName
 	}
 
 	formatProvided := inlineFlags.outputFormat != "" || hasFlagWithValue(os.Args[1:], "--format")
@@ -211,6 +230,14 @@ func main() {
 	if showVersion {
 		runlog.Info("printing version information")
 		printBuildInfo()
+		return
+	}
+
+	if len(args) >= 1 && args[0] == "theme" {
+		if err := handleThemeCommand(configPath, args, forceFetch, assumeYes, themeNameFlag); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -1174,6 +1201,12 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config export [-m|--message <text>] [file]\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config import <file>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config diff <file>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--config path] theme\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--config path] theme list\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--config path] theme set <name>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--config path] theme rm <name>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--config path] theme export <file>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [-f|--force] [-y|--yes] [-n|--name <name>] [--config path] theme import <file>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] logs\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s upgrade\n", os.Args[0])
 }
@@ -1207,6 +1240,9 @@ type inlineFlags struct {
 	outputStdout bool
 	outputFormat string
 	outputView   string
+	force        bool
+	assumeYes    bool
+	themeName    string
 }
 
 func extractInlineFlags(args []string) (inlineFlags, []string, error) {
@@ -1327,6 +1363,32 @@ func extractInlineFlags(args []string) (inlineFlags, []string, error) {
 			flags.outputPath = value
 		case arg == "--stdout":
 			flags.outputStdout = true
+		case arg == "-f" || arg == "--force":
+			flags.force = true
+		case arg == "-y" || arg == "--yes":
+			flags.assumeYes = true
+		case arg == "-n" || arg == "--name":
+			if i+1 >= len(args) {
+				return inlineFlags{}, nil, fmt.Errorf("%s requires a value", arg)
+			}
+			next := strings.TrimSpace(args[i+1])
+			if next == "" {
+				return inlineFlags{}, nil, fmt.Errorf("%s requires a non-empty value", arg)
+			}
+			flags.themeName = next
+			i++
+		case strings.HasPrefix(arg, "-n="):
+			value := strings.TrimSpace(strings.TrimPrefix(arg, "-n="))
+			if value == "" {
+				return inlineFlags{}, nil, fmt.Errorf("-n requires a non-empty value")
+			}
+			flags.themeName = value
+		case strings.HasPrefix(arg, "--name="):
+			value := strings.TrimSpace(strings.TrimPrefix(arg, "--name="))
+			if value == "" {
+				return inlineFlags{}, nil, fmt.Errorf("--name requires a non-empty value")
+			}
+			flags.themeName = value
 		case arg == "--format":
 			if i+1 >= len(args) {
 				return inlineFlags{}, nil, fmt.Errorf("%s requires a value", arg)
@@ -1852,6 +1914,197 @@ func printBuildInfo() {
 		return
 	}
 	fmt.Fprintln(os.Stdout, version)
+}
+
+var themeNamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+func handleThemeCommand(configPath string, args []string, force bool, assumeYes bool, themeNameFlag string) error {
+	if len(args) > 3 {
+		return fmt.Errorf("invalid command")
+	}
+
+	subcommand := ""
+	if len(args) >= 2 {
+		subcommand = strings.ToLower(strings.TrimSpace(args[1]))
+	}
+
+	if subcommand != "" && subcommand != "list" && subcommand != "set" && subcommand != "rm" && subcommand != "export" && subcommand != "import" {
+		return fmt.Errorf("invalid command")
+	}
+
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return fmt.Errorf("failed to load config: %w", err)
+	}
+
+	switch subcommand {
+	case "", "list":
+		if subcommand == "list" && len(args) != 2 {
+			return fmt.Errorf("invalid command")
+		}
+		if subcommand == "" && len(args) != 1 {
+			return fmt.Errorf("invalid command")
+		}
+		resolved := cfg.ResolveTheme()
+		source := "config"
+		if resolved.FromEnv {
+			source = config.ThemeEnvVar
+		}
+		fmt.Fprintf(os.Stdout, "active theme: %s (source: %s)\n", resolved.Name, source)
+		if strings.TrimSpace(cfg.Theme) != "" {
+			fmt.Fprintf(os.Stdout, "configured theme: %s\n", strings.TrimSpace(cfg.Theme))
+		}
+		names := cfg.ThemeNames()
+		if len(names) == 0 {
+			fmt.Fprintln(os.Stdout, "available themes: (none)")
+			return nil
+		}
+		fmt.Fprintln(os.Stdout, "available themes:")
+		for _, name := range names {
+			marker := " "
+			if strings.EqualFold(name, resolved.Name) {
+				marker = "*"
+			}
+			fmt.Fprintf(os.Stdout, "  %s %s\n", marker, name)
+		}
+		return nil
+	case "set":
+		if len(args) != 3 {
+			return fmt.Errorf("theme set requires a theme name")
+		}
+		requested := strings.TrimSpace(args[2])
+		if requested == "" {
+			return fmt.Errorf("theme set requires a non-empty theme name")
+		}
+		canonical, _, ok := cfg.LookupTheme(requested)
+		if !ok {
+			return fmt.Errorf("unknown theme %q", requested)
+		}
+		cfg.Theme = canonical
+		if err := config.Save(cfg); err != nil {
+			return fmt.Errorf("failed to save config: %w", err)
+		}
+		fmt.Fprintf(os.Stdout, "set default theme to %s\n", canonical)
+		if envTheme, ok := os.LookupEnv(config.ThemeEnvVar); ok && strings.TrimSpace(envTheme) != "" {
+			fmt.Fprintf(os.Stdout, "note: %s=%s currently overrides configured theme\n", config.ThemeEnvVar, strings.TrimSpace(envTheme))
+		}
+		return nil
+	case "rm":
+		if len(args) != 3 {
+			return fmt.Errorf("theme rm requires a theme name")
+		}
+		requested := strings.TrimSpace(args[2])
+		if requested == "" {
+			return fmt.Errorf("theme rm requires a non-empty theme name")
+		}
+		canonical, _, ok := cfg.LookupTheme(requested)
+		if !ok {
+			return fmt.Errorf("unknown theme %q", requested)
+		}
+		if config.IsBuiltInTheme(canonical) {
+			return fmt.Errorf("cannot remove built-in theme %q", canonical)
+		}
+		if cfg.Themes != nil {
+			delete(cfg.Themes, canonical)
+		}
+		if strings.EqualFold(strings.TrimSpace(cfg.Theme), canonical) {
+			cfg.Theme = "dark"
+		}
+		if err := config.Save(cfg); err != nil {
+			return fmt.Errorf("failed to save config: %w", err)
+		}
+		fmt.Fprintf(os.Stdout, "removed theme %s\n", canonical)
+		return nil
+	case "export":
+		if len(args) != 3 {
+			return fmt.Errorf("theme export requires a file path")
+		}
+		outPath := filepath.Clean(strings.TrimSpace(args[2]))
+		if outPath == "" {
+			return fmt.Errorf("invalid export path")
+		}
+		resolved := cfg.ResolveTheme()
+		payload, err := json.MarshalIndent(resolved.Palette, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to encode theme: %w", err)
+		}
+		if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+			return fmt.Errorf("failed to prepare export directory: %w", err)
+		}
+		if err := os.WriteFile(outPath, append(payload, '\n'), 0o644); err != nil {
+			return fmt.Errorf("failed to write export file: %w", err)
+		}
+		fmt.Fprintf(os.Stdout, "exported theme %s to %s\n", resolved.Name, outPath)
+		return nil
+	case "import":
+		if len(args) != 3 {
+			return fmt.Errorf("theme import requires a file path")
+		}
+		inPath := filepath.Clean(strings.TrimSpace(args[2]))
+		if inPath == "" {
+			return fmt.Errorf("invalid import path")
+		}
+		name := strings.TrimSpace(themeNameFlag)
+		if name == "" {
+			name = inferThemeNameFromPath(inPath)
+		}
+		if !themeNamePattern.MatchString(name) {
+			return fmt.Errorf("invalid theme name %q (allowed: letters, numbers, '.', '-', '_')", name)
+		}
+		data, err := os.ReadFile(inPath)
+		if err != nil {
+			return fmt.Errorf("failed to read import file: %w", err)
+		}
+		var imported config.ThemePalette
+		if err := json.Unmarshal(data, &imported); err != nil {
+			return fmt.Errorf("invalid theme json: %w", err)
+		}
+		imported = config.NormalizeThemePalette(imported)
+		if len(imported.Colors) == 0 && len(imported.ServicePalette) == 0 {
+			return fmt.Errorf("invalid theme: empty palette")
+		}
+
+		targetName := name
+		if existingName, _, exists := cfg.LookupTheme(name); exists {
+			targetName = existingName
+			if !force {
+				fmt.Fprintf(os.Stderr, "theme %q already exists\n", existingName)
+				if !promptYesNo("Overwrite existing theme? [y/N]: ") {
+					fmt.Fprintln(os.Stderr, "import cancelled")
+					return nil
+				}
+			}
+		}
+
+		cfg = cfg.SetTheme(targetName, imported)
+		setTheme := assumeYes
+		if !setTheme {
+			setTheme = promptYesNo("Set imported theme as active theme? [y/N]: ")
+		}
+		if setTheme {
+			cfg.Theme = targetName
+		}
+		if err := config.Save(cfg); err != nil {
+			return fmt.Errorf("failed to save config: %w", err)
+		}
+		fmt.Fprintf(os.Stdout, "imported theme %s from %s\n", targetName, inPath)
+		if setTheme {
+			fmt.Fprintf(os.Stdout, "set active theme to %s\n", targetName)
+		}
+		return nil
+	default:
+		return fmt.Errorf("invalid command")
+	}
+}
+
+func inferThemeNameFromPath(path string) string {
+	base := strings.TrimSpace(filepath.Base(path))
+	if base == "" {
+		return ""
+	}
+	ext := filepath.Ext(base)
+	name := strings.TrimSpace(strings.TrimSuffix(base, ext))
+	return name
 }
 
 func promptYesNo(prompt string) bool {

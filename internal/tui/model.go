@@ -52,6 +52,7 @@ type logColumn struct {
 
 type Model struct {
 	cfg          config.Config
+	theme        config.ResolvedTheme
 	session      *domain.Session
 	openURL      func(string) error
 	saveSnapshot func(*domain.Session) (string, error)
@@ -133,6 +134,7 @@ func NewModelWithDeferredLogs(cfg config.Config, session *domain.Session, openUR
 func newModel(cfg config.Config, session *domain.Session, openURL func(string) error, saveSnapshot func(*domain.Session) (string, error), loadLogs func(context.Context) ([]domain.LogEntry, error), onLogsReady func(*domain.Session)) Model {
 	m := Model{
 		cfg:              cfg,
+		theme:            cfg.ResolveTheme(),
 		session:          session,
 		openURL:          openURL,
 		saveSnapshot:     saveSnapshot,
@@ -147,6 +149,7 @@ func newModel(cfg config.Config, session *domain.Session, openURL func(string) e
 		loadLogs:         loadLogs,
 		onLogsReady:      onLogsReady,
 	}
+	applyThemeStyles(m.theme)
 	if loc, err := cfg.DisplayLocation(); err == nil {
 		m.loc = loc
 	}
@@ -1164,9 +1167,9 @@ func (m Model) panelInnerHeight(target panel) int {
 		return max(1, m.height-headerHeight-2)
 	}
 
-	footer := mutedStyle.Render(m.status + " | / search | n/N next/prev | gg/G top/bottom | ctrl+f/b page | ctrl+d/u half-page | f fullscreen | c collapse | tab/shift+tab switch | F2 config | ? help")
+	footer := m.mutedStyle().Render(m.status + " | / search | n/N next/prev | gg/G top/bottom | ctrl+f/b page | ctrl+d/u half-page | f fullscreen | c collapse | tab/shift+tab switch | F2 config | ? help")
 	if m.searchPrompt != nil {
-		footer += "\n" + mutedStyle.Render(m.searchPrompt.viewLine()) + "\n" + mutedStyle.Render(searchHint())
+		footer += "\n" + m.mutedStyle().Render(m.searchPrompt.viewLine()) + "\n" + m.mutedStyle().Render(searchHint())
 	}
 	footerHeight := max(1, lipgloss.Height(footer))
 	sectionCount := 3
@@ -1310,17 +1313,17 @@ func (m Model) View() string {
 
 	if m.fullscreen {
 		innerHeight := max(1, m.height-headerHeight-2)
-		body := sectionStyle(true, m.width, innerHeight).Render(m.panelView(m.activePanel, innerHeight))
-		footer := mutedStyle.Render(m.status + " | / search | n/N next/prev | gg/G top/bottom | ctrl+f/b page | ctrl+d/u half-page | y yank | V highlight | f fullscreen")
+		body := m.sectionStyle(true, m.width, innerHeight).Render(m.panelView(m.activePanel, innerHeight))
+		footer := m.mutedStyle().Render(m.status + " | / search | n/N next/prev | gg/G top/bottom | ctrl+f/b page | ctrl+d/u half-page | y yank | V highlight | f fullscreen")
 		if m.searchPrompt != nil {
-			footer += "\n" + mutedStyle.Render(m.searchPrompt.viewLine()) + "\n" + mutedStyle.Render(searchHint())
+			footer += "\n" + m.mutedStyle().Render(m.searchPrompt.viewLine()) + "\n" + m.mutedStyle().Render(searchHint())
 		}
 		return clampToHeight(lipgloss.JoinVertical(lipgloss.Left, headerRendered, body, footer), m.height)
 	}
 
-	footer := mutedStyle.Render(m.status + " | / search | n/N next/prev | gg/G top/bottom | ctrl+f/b page | ctrl+d/u half-page | y yank | V highlight | f fullscreen | c collapse | tab/shift+tab switch | F2 config | ? help")
+	footer := m.mutedStyle().Render(m.status + " | / search | n/N next/prev | gg/G top/bottom | ctrl+f/b page | ctrl+d/u half-page | y yank | V highlight | f fullscreen | c collapse | tab/shift+tab switch | F2 config | ? help")
 	if m.searchPrompt != nil {
-		footer += "\n" + mutedStyle.Render(m.searchPrompt.viewLine()) + "\n" + mutedStyle.Render(searchHint())
+		footer += "\n" + m.mutedStyle().Render(m.searchPrompt.viewLine()) + "\n" + m.mutedStyle().Render(searchHint())
 	}
 	footerHeight := max(1, lipgloss.Height(footer))
 	sectionCount := 3
@@ -1386,10 +1389,10 @@ func (m Model) View() string {
 	var rendered []string
 	for _, p := range order {
 		if m.collapsed[p] {
-			rendered = append(rendered, sectionStyle(m.activePanel == p, m.width, max(1, innerHeights[p])).Render(panelTitle(p)+" (collapsed)"))
+			rendered = append(rendered, m.sectionStyle(m.activePanel == p, m.width, max(1, innerHeights[p])).Render(panelTitle(p)+" (collapsed)"))
 			continue
 		}
-		rendered = append(rendered, sectionStyle(m.activePanel == p, m.width, max(1, innerHeights[p])).Render(m.panelView(p, max(1, innerHeights[p]))))
+		rendered = append(rendered, m.sectionStyle(m.activePanel == p, m.width, max(1, innerHeights[p])).Render(m.panelView(p, max(1, innerHeights[p]))))
 	}
 
 	return clampToHeight(lipgloss.JoinVertical(lipgloss.Left, append([]string{headerRendered}, append(rendered, footer)...)...), m.height)
@@ -1401,61 +1404,61 @@ func (m Model) summaryHeaderLine() string {
 		return "[unknown]"
 	}
 	parts := []string{
-		summaryBrightStyle.Render("[") + summaryGrayStyle.Render(m.session.Environment) + summaryBrightStyle.Render("]"),
+		m.summaryBrightStyle().Render("[") + m.summaryGrayStyle().Render(m.session.Environment) + m.summaryBrightStyle().Render("]"),
 	}
 	if trace.TraceID != "" {
-		parts = append(parts, summaryBrightStyle.Render(trace.TraceID))
+		parts = append(parts, m.summaryBrightStyle().Render(trace.TraceID))
 	}
 	if trace.ErrorSpanCount > 0 {
-		parts = append(parts, summaryErrorStyle.Render("!"))
+		parts = append(parts, m.summaryErrorStyle().Render("!"))
 	}
 	if status, ok := m.rootHTTPStatus(); ok {
-		parts = append(parts, summaryHTTPStatusStyle(status).Render(fmt.Sprintf("%d", status)))
+		parts = append(parts, m.summaryHTTPStatusStyle(status).Render(fmt.Sprintf("%d", status)))
 	}
 	operation := strings.TrimSpace(trace.OperationName)
 	if operation == "" {
 		operation = "-"
 	}
-	parts = append(parts, summaryBrightStyle.Render(operation))
+	parts = append(parts, m.summaryBrightStyle().Render(operation))
 	parts = append(parts,
-		summaryBrightStyle.Render("(")+summaryDurationStyle(trace.Duration).Render(trace.Duration.Round(time.Millisecond).String())+summaryBrightStyle.Render(")"),
+		m.summaryBrightStyle().Render("(")+m.summaryDurationStyle(trace.Duration).Render(trace.Duration.Round(time.Millisecond).String())+m.summaryBrightStyle().Render(")"),
 	)
 	if !trace.StartTime.IsZero() {
 		start := trace.StartTime.In(m.loc).Format("2006-01-02 15:04:05.000")
 		end := trace.StartTime.Add(trace.Duration).In(m.loc).Format("2006-01-02 15:04:05.000")
 		parts = append(parts,
-			summaryBrightStyle.Render("-"),
-			summaryBrightStyle.Render("[")+summaryGrayStyle.Render(start)+summaryBrightStyle.Render(" - ")+summaryGrayStyle.Render(end)+summaryBrightStyle.Render("]"),
+			m.summaryBrightStyle().Render("-"),
+			m.summaryBrightStyle().Render("[")+m.summaryGrayStyle().Render(start)+m.summaryBrightStyle().Render(" - ")+m.summaryGrayStyle().Render(end)+m.summaryBrightStyle().Render("]"),
 		)
 	}
 	return strings.Join(parts, " ")
 }
 
-func summaryHTTPStatusStyle(status int) lipgloss.Style {
+func (m Model) summaryHTTPStatusStyle(status int) lipgloss.Style {
 	switch status / 100 {
 	case 2:
-		return summarySuccessStyle
+		return m.summarySuccessStyle()
 	case 3:
-		return summaryInfoStyle
+		return m.summaryInfoStyle()
 	case 4:
-		return summaryWarnStyle
+		return m.summaryWarnStyle()
 	case 5:
-		return summaryErrorStyle
+		return m.summaryErrorStyle()
 	default:
-		return summaryBrightStyle
+		return m.summaryBrightStyle()
 	}
 }
 
-func summaryDurationStyle(d time.Duration) lipgloss.Style {
+func (m Model) summaryDurationStyle(d time.Duration) lipgloss.Style {
 	switch {
 	case d < 100*time.Millisecond:
-		return summarySuccessStyle
+		return m.summarySuccessStyle()
 	case d < time.Second:
-		return summaryBrightStyle
+		return m.summaryBrightStyle()
 	case d < 3*time.Second:
-		return summaryWarnStyle
+		return m.summaryWarnStyle()
 	default:
-		return summaryErrorStyle
+		return m.summaryErrorStyle()
 	}
 }
 
@@ -1512,10 +1515,10 @@ func (m Model) logsHeaderDate() string {
 
 func (m Model) summaryStatsLine() string {
 	parts := []string{
-		summaryGrayStyle.Render("services") + summaryGrayStyle.Render(":") + " " + summaryBrightStyle.Render(fmt.Sprintf("%d", m.session.Trace.ServiceCount)),
-		summaryGrayStyle.Render("errors") + summaryGrayStyle.Render(":") + " " + summaryBrightStyle.Render(fmt.Sprintf("%d", m.session.Trace.ErrorSpanCount)),
-		summaryGrayStyle.Render("spans") + summaryGrayStyle.Render(":") + " " + summaryBrightStyle.Render(fmt.Sprintf("%d", m.session.Trace.SpanCount)),
-		summaryGrayStyle.Render("logs") + summaryGrayStyle.Render(":") + " " + summaryBrightStyle.Render(fmt.Sprintf("%d", len(m.filteredLogs))),
+		m.summaryGrayStyle().Render("services") + m.summaryGrayStyle().Render(":") + " " + m.summaryBrightStyle().Render(fmt.Sprintf("%d", m.session.Trace.ServiceCount)),
+		m.summaryGrayStyle().Render("errors") + m.summaryGrayStyle().Render(":") + " " + m.summaryBrightStyle().Render(fmt.Sprintf("%d", m.session.Trace.ErrorSpanCount)),
+		m.summaryGrayStyle().Render("spans") + m.summaryGrayStyle().Render(":") + " " + m.summaryBrightStyle().Render(fmt.Sprintf("%d", m.session.Trace.SpanCount)),
+		m.summaryGrayStyle().Render("logs") + m.summaryGrayStyle().Render(":") + " " + m.summaryBrightStyle().Render(fmt.Sprintf("%d", len(m.filteredLogs))),
 	}
 	return strings.Join(parts, "  ")
 }
@@ -1632,11 +1635,11 @@ func (m Model) nextPanel(step int) panel {
 }
 
 func (m Model) layout(body string) string {
-	footer := mutedStyle.Render(m.status + " | / search | n/N next/prev | gg/G top/bottom | ctrl+f/b page | ctrl+d/u half-page | y yank | V highlight | ? help | esc back")
+	footer := m.mutedStyle().Render(m.status + " | / search | n/N next/prev | gg/G top/bottom | ctrl+f/b page | ctrl+d/u half-page | y yank | V highlight | ? help | esc back")
 	if m.searchPrompt != nil {
-		footer += "\n" + mutedStyle.Render(m.searchPrompt.viewLine()) + "\n" + mutedStyle.Render(searchHint())
+		footer += "\n" + m.mutedStyle().Render(m.searchPrompt.viewLine()) + "\n" + m.mutedStyle().Render(searchHint())
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, titleStyle.Render("trace viewer"), body, footer)
+	return lipgloss.JoinVertical(lipgloss.Left, m.titleStyle().Render("trace viewer"), body, footer)
 }
 
 func (m Model) traceView(height int) string {
@@ -1700,7 +1703,7 @@ func (m Model) traceView(height int) string {
 	if end == len(m.traceLines) {
 		b.WriteString("    ")
 		b.WriteString(strings.Repeat(" ", barWidth+1))
-		b.WriteString(mutedStyle.Render("^ trace end"))
+		b.WriteString(m.mutedStyle().Render("^ trace end"))
 		b.WriteString("\n")
 	}
 
@@ -1743,7 +1746,7 @@ func (m Model) valueViewView() string {
 	var b strings.Builder
 	b.WriteString(m.valueView.title)
 	b.WriteString("\n")
-	b.WriteString(mutedStyle.Render("esc/enter back"))
+	b.WriteString(m.mutedStyle().Render("esc/enter back"))
 	b.WriteString("\n\n")
 	for i := start; i < end; i++ {
 		prefix := "  "
@@ -2149,11 +2152,11 @@ func dependencyTypeFromRules(rules []config.DependencyTypeRule, name string) str
 }
 
 func (m Model) serviceMapServiceStyle() lipgloss.Style {
-	return lipgloss.NewStyle().Foreground(lipgloss.Color(m.serviceMapColorOrDefault(m.cfg.UI.ServiceMap.ServiceColor, "68")))
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(m.serviceMapColorOrDefault(m.cfg.UI.ServiceMap.ServiceColor, m.themeColor(config.ThemeColorServiceMapService, "68"))))
 }
 
 func (m Model) serviceMapSidecarStyle() lipgloss.Style {
-	return lipgloss.NewStyle().Foreground(lipgloss.Color(m.serviceMapColorOrDefault(m.cfg.UI.ServiceMap.SidecarColor, "244")))
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(m.serviceMapColorOrDefault(m.cfg.UI.ServiceMap.SidecarColor, m.themeColor(config.ThemeColorServiceMapSidecar, "244"))))
 }
 
 func (m Model) serviceMapDependencyStyle(typeName string) lipgloss.Style {
@@ -2162,12 +2165,18 @@ func (m Model) serviceMapDependencyStyle(typeName string) lipgloss.Style {
 		if color := lookupConfigValue(m.cfg.UI.ServiceMap.TypeColors, typeName); color != "" {
 			return lipgloss.NewStyle().Foreground(lipgloss.Color(color))
 		}
+		switch typeName {
+		case "db":
+			return lipgloss.NewStyle().Foreground(lipgloss.Color(m.themeColor(config.ThemeColorServiceMapTypeDB, "39")))
+		case "third_party", "third-party", "thirdparty":
+			return lipgloss.NewStyle().Foreground(lipgloss.Color(m.themeColor(config.ThemeColorServiceMapType3rd, "178")))
+		}
 	}
-	return lipgloss.NewStyle().Foreground(lipgloss.Color(m.serviceMapColorOrDefault(m.cfg.UI.ServiceMap.ExternalColor, "214")))
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(m.serviceMapColorOrDefault(m.cfg.UI.ServiceMap.ExternalColor, m.themeColor(config.ThemeColorServiceMapExternal, "214"))))
 }
 
 func (m Model) serviceMapCostStyle() lipgloss.Style {
-	return lipgloss.NewStyle().Foreground(lipgloss.Color("250"))
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(m.themeColor(config.ThemeColorServiceMapCost, "250")))
 }
 
 func (m Model) serviceMapColorOrDefault(color string, fallback string) string {
@@ -2371,28 +2380,28 @@ func (m Model) renderLogRow(entry domain.LogEntry, cols []logColumn, widths []in
 		value := padRight(truncate(m.logFieldValue(entry, col.Field), widths[i]), widths[i])
 		cellStyle := baseStyle
 		if strings.EqualFold(strings.TrimSpace(col.Field), "level") {
-			cellStyle = lipgloss.NewStyle().Inherit(baseStyle).Foreground(logLevelColor(entry.Level))
+			cellStyle = lipgloss.NewStyle().Inherit(baseStyle).Foreground(m.logLevelColor(entry.Level))
 		}
 		b.WriteString(cellStyle.Render(value))
 	}
 	return b.String()
 }
 
-func logLevelColor(level string) lipgloss.Color {
+func (m Model) logLevelColor(level string) lipgloss.Color {
 	normalized := strings.ToLower(strings.TrimSpace(level))
 	switch normalized {
 	case "fatal", "panic", "critical", "crit", "alert", "emerg", "emergency", "error", "err":
-		return lipgloss.Color("196")
+		return lipgloss.Color(m.themeColor(config.ThemeColorLogLevelError, "196"))
 	case "warn", "warning":
-		return lipgloss.Color("214")
+		return lipgloss.Color(m.themeColor(config.ThemeColorLogLevelWarn, "214"))
 	case "info", "information", "notice":
-		return lipgloss.Color("39")
+		return lipgloss.Color(m.themeColor(config.ThemeColorLogLevelInfo, "39"))
 	case "debug":
-		return lipgloss.Color("111")
+		return lipgloss.Color(m.themeColor(config.ThemeColorLogLevelDebug, "111"))
 	case "trace":
-		return lipgloss.Color("244")
+		return lipgloss.Color(m.themeColor(config.ThemeColorLogLevelTrace, "244"))
 	default:
-		return lipgloss.Color("250")
+		return lipgloss.Color(m.themeColor(config.ThemeColorLogLevelDefault, "250"))
 	}
 }
 
@@ -2572,6 +2581,8 @@ func (m *Model) reloadConfig() {
 		return
 	}
 	m.cfg = loaded
+	m.theme = loaded.ResolveTheme()
+	applyThemeStyles(m.theme)
 	if loc, err := loaded.DisplayLocation(); err == nil {
 		m.loc = loc
 	}
@@ -2581,7 +2592,7 @@ func (m *Model) reloadConfig() {
 }
 
 func (m *Model) initServiceColors() {
-	palette := defaultServicePalette()
+	palette := m.defaultServicePalette()
 	for _, raw := range m.cfg.UI.AdditionalServiceColors {
 		color := strings.TrimSpace(raw)
 		if color != "" {
@@ -2590,7 +2601,7 @@ func (m *Model) initServiceColors() {
 	}
 
 	if len(palette) == 0 {
-		palette = []string{"244"}
+		palette = []string{m.themeColor(config.ThemeColorServiceFallback, "244")}
 	}
 
 	m.serviceColors = map[string]string{}
@@ -2985,10 +2996,10 @@ func (m *Model) disableLineHighlightMode() bool {
 func (m Model) traceRowStyle(index int) lipgloss.Style {
 	selected := m.modelSelectionIncludes(selectionScopeTrace, index, m.traceCursor, len(m.traceLines))
 	if index == m.traceCursor && selected {
-		return tableRowCursorVisualStyle
+		return m.tableRowCursorVisualStyle()
 	}
 	if selected {
-		return tableRowVisualStyle
+		return m.tableRowVisualStyle()
 	}
 	return lipgloss.NewStyle()
 }
@@ -2996,15 +3007,15 @@ func (m Model) traceRowStyle(index int) lipgloss.Style {
 func (m Model) logRowStyle(index int) lipgloss.Style {
 	selected := m.modelSelectionIncludes(selectionScopeLogs, index, m.logCursor, len(m.filteredLogs))
 	if index == m.logCursor && selected {
-		return tableRowCursorVisualStyle
+		return m.tableRowCursorVisualStyle()
 	}
 	if index == m.logCursor {
-		return tableRowCursorStyle
+		return m.tableRowCursorStyle()
 	}
 	if selected {
-		return tableRowVisualStyle
+		return m.tableRowVisualStyle()
 	}
-	return tableRowBandStyle(index)
+	return m.tableRowBandStyle(index)
 }
 
 func (m Model) valueRowStyle(index int) lipgloss.Style {
@@ -3013,10 +3024,10 @@ func (m Model) valueRowStyle(index int) lipgloss.Style {
 	}
 	selected := m.modelSelectionIncludes(selectionScopeValue, index, m.valueView.offset, len(m.valueView.lines))
 	if index == m.valueView.offset && selected {
-		return tableRowCursorVisualStyle
+		return m.tableRowCursorVisualStyle()
 	}
 	if selected {
-		return tableRowVisualStyle
+		return m.tableRowVisualStyle()
 	}
 	return lipgloss.NewStyle()
 }
@@ -3636,37 +3647,19 @@ func iconOrDefault(icons map[string]string, key, fallback string) string {
 	return fallback
 }
 
-var (
-	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
-	mutedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-
-	tableRowBandStyleA        = lipgloss.NewStyle().Background(lipgloss.Color("234"))
-	tableRowBandStyleB        = lipgloss.NewStyle().Background(lipgloss.Color("235"))
-	tableRowVisualStyle       = lipgloss.NewStyle().Background(lipgloss.Color("236"))
-	tableRowCursorStyle       = lipgloss.NewStyle().Background(lipgloss.Color("238"))
-	tableRowCursorVisualStyle = lipgloss.NewStyle().Background(lipgloss.Color("61"))
-
-	summaryBrightStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
-	summaryGrayStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	summarySuccessStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
-	summaryInfoStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("4"))
-	summaryWarnStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
-	summaryErrorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
-)
-
 var ansiEscapePattern = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
-func tableRowBandStyle(index int) lipgloss.Style {
+func (m Model) tableRowBandStyle(index int) lipgloss.Style {
 	if index%2 == 0 {
-		return tableRowBandStyleA
+		return m.tableRowBandStyleA()
 	}
-	return tableRowBandStyleB
+	return m.tableRowBandStyleB()
 }
 
-func sectionStyle(active bool, width int, height int) lipgloss.Style {
-	color := lipgloss.Color("240")
+func (m Model) sectionStyle(active bool, width int, height int) lipgloss.Style {
+	color := lipgloss.Color(m.themeColor(config.ThemeColorSectionBorder, "240"))
 	if active {
-		color = lipgloss.Color("33")
+		color = lipgloss.Color(m.themeColor(config.ThemeColorSectionBorderActive, "33"))
 	}
 	contentWidth := max(1, width-4)
 	return lipgloss.NewStyle().Width(contentWidth).Height(height).Border(lipgloss.NormalBorder()).BorderForeground(color).Padding(0, 1)
@@ -3675,16 +3668,78 @@ func sectionStyle(active bool, width int, height int) lipgloss.Style {
 func (m Model) colorForService(service string) lipgloss.Style {
 	service = strings.TrimSpace(service)
 	if service == "" {
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+		return lipgloss.NewStyle().Foreground(lipgloss.Color(m.themeColor(config.ThemeColorServiceFallback, "244")))
 	}
 	if color, ok := m.serviceColors[service]; ok {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color(color))
 	}
-	return lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(m.themeColor(config.ThemeColorServiceFallback, "244")))
 }
 
-func defaultServicePalette() []string {
+func (m Model) defaultServicePalette() []string {
+	if len(m.theme.Palette.ServicePalette) > 0 {
+		return append([]string{}, m.theme.Palette.ServicePalette...)
+	}
 	return []string{"68", "173", "71", "176", "74", "179", "109", "175", "75", "181"}
+}
+
+func (m Model) themeColor(key string, fallback string) string {
+	if color := strings.TrimSpace(m.theme.Palette.Colors[key]); color != "" {
+		return color
+	}
+	return strings.TrimSpace(fallback)
+}
+
+func (m Model) titleStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(m.themeColor(config.ThemeColorTitle, "12")))
+}
+
+func (m Model) mutedStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(m.themeColor(config.ThemeColorMuted, "241")))
+}
+
+func (m Model) tableRowBandStyleA() lipgloss.Style {
+	return lipgloss.NewStyle().Background(lipgloss.Color(m.themeColor(config.ThemeColorTableBandA, "234")))
+}
+
+func (m Model) tableRowBandStyleB() lipgloss.Style {
+	return lipgloss.NewStyle().Background(lipgloss.Color(m.themeColor(config.ThemeColorTableBandB, "235")))
+}
+
+func (m Model) tableRowVisualStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Background(lipgloss.Color(m.themeColor(config.ThemeColorTableVisual, "236")))
+}
+
+func (m Model) tableRowCursorStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Background(lipgloss.Color(m.themeColor(config.ThemeColorTableCursor, "238")))
+}
+
+func (m Model) tableRowCursorVisualStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Background(lipgloss.Color(m.themeColor(config.ThemeColorTableCursorVisual, "61")))
+}
+
+func (m Model) summaryBrightStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(m.themeColor(config.ThemeColorSummaryBright, "15")))
+}
+
+func (m Model) summaryGrayStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(m.themeColor(config.ThemeColorSummaryGray, "245")))
+}
+
+func (m Model) summarySuccessStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(m.themeColor(config.ThemeColorSummarySuccess, "2")))
+}
+
+func (m Model) summaryInfoStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(m.themeColor(config.ThemeColorSummaryInfo, "4")))
+}
+
+func (m Model) summaryWarnStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(m.themeColor(config.ThemeColorSummaryWarn, "3")))
+}
+
+func (m Model) summaryErrorStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(m.themeColor(config.ThemeColorSummaryError, "1")))
 }
 
 func shortID(id string) string {
