@@ -1,0 +1,75 @@
+{
+  "items": [
+    {"key":"ansi.duration.fast","kind":"color","description":"ANSI color for very fast trace durations (<100ms)."},
+    {"key":"ansi.duration.normal","kind":"color","description":"ANSI color for normal trace durations (<1s)."},
+    {"key":"ansi.duration.slow","kind":"color","description":"ANSI color for slow trace durations (<3s)."},
+    {"key":"ansi.duration.very_slow","kind":"color","description":"ANSI color for very slow trace durations (>=3s)."},
+    {"key":"ansi.http.client_error","kind":"color","description":"ANSI color for HTTP 4xx status codes."},
+    {"key":"ansi.http.default","kind":"color","description":"ANSI color for unknown or uncategorized HTTP status output."},
+    {"key":"ansi.http.redirect","kind":"color","description":"ANSI color for HTTP 3xx status codes."},
+    {"key":"ansi.http.server_error","kind":"color","description":"ANSI color for HTTP 5xx status codes."},
+    {"key":"ansi.http.success","kind":"color","description":"ANSI color for HTTP 2xx status codes."},
+    {"key":"ansi.summary.bright","kind":"color","description":"ANSI color for highlighted summary text segments."},
+    {"key":"ansi.summary.gray","kind":"color","description":"ANSI color for muted summary text segments."},
+    {"key":"ansi.summary.light","kind":"color","description":"ANSI color for light summary text segments."},
+    {"key":"ansi.summary.red","kind":"color","description":"ANSI color for summary error marker text."},
+
+    {"key":"pallete.border","kind":"palette","description":"Base border color for section outlines and separators."},
+    {"key":"pallete.border_active","kind":"palette","description":"Base border color for the currently focused section."},
+    {"key":"pallete.error","kind":"palette","description":"Base error color used for failures and severe states."},
+    {"key":"pallete.info","kind":"palette","description":"Base informational color used for neutral-positive signals."},
+    {"key":"pallete.service_cost","kind":"palette","description":"Base color for cost/time overlays in service map views."},
+    {"key":"pallete.service_db","kind":"palette","description":"Base color for database dependency nodes in service maps."},
+    {"key":"pallete.service_external","kind":"palette","description":"Base color for external dependency nodes in service maps."},
+    {"key":"pallete.service_primary","kind":"palette","description":"Base color for primary/internal service nodes."},
+    {"key":"pallete.service_sidecar","kind":"palette","description":"Base color for sidecar or helper service nodes."},
+    {"key":"pallete.service_third_party","kind":"palette","description":"Base color for third-party dependency nodes in service maps."},
+    {"key":"pallete.success","kind":"palette","description":"Base success color used for healthy states."},
+    {"key":"pallete.surface_a","kind":"palette","description":"Base background color for alternating row band A."},
+    {"key":"pallete.surface_b","kind":"palette","description":"Base background color for alternating row band B."},
+    {"key":"pallete.surface_cursor","kind":"palette","description":"Base background color for the active cursor row."},
+    {"key":"pallete.surface_cursor_visual","kind":"palette","description":"Base background color for cursor row while visual selection is active."},
+    {"key":"pallete.surface_visual","kind":"palette","description":"Base background color for visual/highlighted selection rows."},
+    {"key":"pallete.text_focussed","kind":"palette","description":"Base foreground color for primary focused text."},
+    {"key":"pallete.text_unfocussed","kind":"palette","description":"Base foreground color for secondary muted text."},
+    {"key":"pallete.warning","kind":"palette","description":"Base warning color used for caution states."},
+
+    {"key":"service_palette","kind":"palette","description":"Ordered fallback palette used to auto-assign colors to discovered services."},
+
+    {"key":"ui.log_level.debug","kind":"color","description":"Log level color for debug entries."},
+    {"key":"ui.log_level.default","kind":"color","description":"Fallback log level color when level is unknown."},
+    {"key":"ui.log_level.error","kind":"color","description":"Log level color for error/fatal entries."},
+    {"key":"ui.log_level.info","kind":"color","description":"Log level color for info/notice entries."},
+    {"key":"ui.log_level.trace","kind":"color","description":"Log level color for trace entries."},
+    {"key":"ui.log_level.warn","kind":"color","description":"Log level color for warning entries."},
+
+    {"key":"ui.muted","kind":"color","description":"Muted foreground used in footers, hints, and low-emphasis labels."},
+
+    {"key":"ui.section.border","kind":"color","description":"Border color for inactive panes and sections."},
+    {"key":"ui.section.border_active","kind":"color","description":"Border color for the currently active pane/section."},
+
+    {"key":"ui.service.fallback","kind":"color","description":"Fallback foreground for service names when no specific service color is assigned."},
+
+    {"key":"ui.service_map.cost","kind":"color","description":"Foreground color for x-cost/duration overlays in service map output."},
+    {"key":"ui.service_map.external","kind":"color","description":"Foreground color for external service-map dependencies."},
+    {"key":"ui.service_map.service","kind":"color","description":"Foreground color for primary service-map service names."},
+    {"key":"ui.service_map.sidecar","kind":"color","description":"Foreground color for sidecar service-map nodes."},
+    {"key":"ui.service_map.type.db","kind":"color","description":"Foreground color for dependencies classified as databases."},
+    {"key":"ui.service_map.type.third_party","kind":"color","description":"Foreground color for dependencies classified as third-party services."},
+
+    {"key":"ui.summary.bright","kind":"color","description":"High-emphasis summary text color."},
+    {"key":"ui.summary.error","kind":"color","description":"Summary text color for error states and alerts."},
+    {"key":"ui.summary.gray","kind":"color","description":"Muted summary text color."},
+    {"key":"ui.summary.info","kind":"color","description":"Summary text color for informational states."},
+    {"key":"ui.summary.success","kind":"color","description":"Summary text color for success/healthy states."},
+    {"key":"ui.summary.warn","kind":"color","description":"Summary text color for warning states."},
+
+    {"key":"ui.table.band_a","kind":"color","description":"Background color for alternating row band A."},
+    {"key":"ui.table.band_b","kind":"color","description":"Background color for alternating row band B."},
+    {"key":"ui.table.cursor","kind":"color","description":"Background color for the current cursor row."},
+    {"key":"ui.table.cursor_visual","kind":"color","description":"Background color for cursor row when visual selection mode is enabled."},
+    {"key":"ui.table.visual","kind":"color","description":"Background color for selected rows in visual selection mode."},
+
+    {"key":"ui.title","kind":"color","description":"Primary title/header foreground color."}
+  ]
+}

@@ -47,6 +47,7 @@ func main() {
 		outputView    string
 		assumeYes     bool
 		themeNameFlag string
+		themeFullMode bool
 	)
 
 	flag.BoolVar(&showVersion, "v", false, "print version information and exit")
@@ -69,6 +70,7 @@ func main() {
 	flag.BoolVar(&assumeYes, "yes", false, "assume yes for interactive prompts in supported commands")
 	flag.StringVar(&themeNameFlag, "n", "", "theme name for theme import")
 	flag.StringVar(&themeNameFlag, "name", "", "theme name for theme import")
+	flag.BoolVar(&themeFullMode, "full", false, "theme import/export full color map mode")
 	flag.StringVar(&configPath, "config", "", "config file path (defaults to platform config dir)")
 	flag.Parse()
 	args := flag.Args()
@@ -135,6 +137,9 @@ func main() {
 			os.Exit(1)
 		}
 		themeNameFlag = inlineFlags.themeName
+	}
+	if inlineFlags.themeFullMode {
+		themeFullMode = true
 	}
 
 	formatProvided := inlineFlags.outputFormat != "" || hasFlagWithValue(os.Args[1:], "--format")
@@ -234,7 +239,7 @@ func main() {
 	}
 
 	if len(args) >= 1 && args[0] == "theme" {
-		if err := handleThemeCommand(configPath, args, forceFetch, assumeYes, themeNameFlag); err != nil {
+		if err := handleThemeCommand(configPath, args, forceFetch, assumeYes, themeNameFlag, themeFullMode); err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
 			os.Exit(1)
 		}
@@ -1203,10 +1208,11 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config diff <file>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] theme\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] theme list\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--full] [--config path] theme help [key]\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] theme set <name>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] theme rm <name>\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "       %s [--config path] theme export <file>\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "       %s [-f|--force] [-y|--yes] [-n|--name <name>] [--config path] theme import <file>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--full] [--config path] theme export <file>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [-f|--force] [-y|--yes] [-n|--name <name>] [--full] [--config path] theme import <file>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] logs\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s upgrade\n", os.Args[0])
 }
@@ -1232,17 +1238,18 @@ func (f *multiStringFlag) Set(value string) error {
 }
 
 type inlineFlags struct {
-	queryClauses []string
-	timeWindow   string
-	duration     string
-	message      string
-	outputPath   string
-	outputStdout bool
-	outputFormat string
-	outputView   string
-	force        bool
-	assumeYes    bool
-	themeName    string
+	queryClauses  []string
+	timeWindow    string
+	duration      string
+	message       string
+	outputPath    string
+	outputStdout  bool
+	outputFormat  string
+	outputView    string
+	force         bool
+	assumeYes     bool
+	themeName     string
+	themeFullMode bool
 }
 
 func extractInlineFlags(args []string) (inlineFlags, []string, error) {
@@ -1367,6 +1374,8 @@ func extractInlineFlags(args []string) (inlineFlags, []string, error) {
 			flags.force = true
 		case arg == "-y" || arg == "--yes":
 			flags.assumeYes = true
+		case arg == "--full":
+			flags.themeFullMode = true
 		case arg == "-n" || arg == "--name":
 			if i+1 >= len(args) {
 				return inlineFlags{}, nil, fmt.Errorf("%s requires a value", arg)
@@ -1918,7 +1927,7 @@ func printBuildInfo() {
 
 var themeNamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
-func handleThemeCommand(configPath string, args []string, force bool, assumeYes bool, themeNameFlag string) error {
+func handleThemeCommand(configPath string, args []string, force bool, assumeYes bool, themeNameFlag string, themeFullMode bool) error {
 	if len(args) > 3 {
 		return fmt.Errorf("invalid command")
 	}
@@ -1928,13 +1937,39 @@ func handleThemeCommand(configPath string, args []string, force bool, assumeYes 
 		subcommand = strings.ToLower(strings.TrimSpace(args[1]))
 	}
 
-	if subcommand != "" && subcommand != "list" && subcommand != "set" && subcommand != "rm" && subcommand != "export" && subcommand != "import" {
+	if subcommand != "" && subcommand != "list" && subcommand != "help" && subcommand != "set" && subcommand != "rm" && subcommand != "export" && subcommand != "import" {
 		return fmt.Errorf("invalid command")
 	}
 
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
+	}
+
+	if subcommand == "help" {
+		if len(args) > 3 {
+			return fmt.Errorf("invalid command")
+		}
+		if len(args) == 3 {
+			item, ok, err := config.ThemeHelpForKey(strings.TrimSpace(args[2]))
+			if err != nil {
+				return fmt.Errorf("failed to load theme help: %w", err)
+			}
+			if !ok {
+				return fmt.Errorf("unknown theme key %q", strings.TrimSpace(args[2]))
+			}
+			fmt.Fprintf(os.Stdout, "%s (%s): %s\n", item.Key, item.Kind, item.Description)
+			return nil
+		}
+		items, err := config.ThemeHelpItems()
+		if err != nil {
+			return fmt.Errorf("failed to load theme help: %w", err)
+		}
+		if !themeFullMode {
+			items = filterThemeHelpItemsByActiveTheme(items, cfg.ResolveTheme())
+		}
+		printThemeHelpTable(items)
+		return nil
 	}
 
 	switch subcommand {
@@ -2024,7 +2059,16 @@ func handleThemeCommand(configPath string, args []string, force bool, assumeYes 
 			return fmt.Errorf("invalid export path")
 		}
 		resolved := cfg.ResolveTheme()
-		payload, err := json.MarshalIndent(resolved.Palette, "", "  ")
+		canonical, selected, ok := cfg.LookupTheme(resolved.Name)
+		if !ok {
+			canonical = resolved.Name
+			selected = resolved.Selected
+		}
+		palette := config.NormalizeThemePalette(selected)
+		if themeFullMode {
+			palette = config.FlattenThemePalette(resolved, palette)
+		}
+		payload, err := json.MarshalIndent(palette, "", "  ")
 		if err != nil {
 			return fmt.Errorf("failed to encode theme: %w", err)
 		}
@@ -2034,7 +2078,7 @@ func handleThemeCommand(configPath string, args []string, force bool, assumeYes 
 		if err := os.WriteFile(outPath, append(payload, '\n'), 0o644); err != nil {
 			return fmt.Errorf("failed to write export file: %w", err)
 		}
-		fmt.Fprintf(os.Stdout, "exported theme %s to %s\n", resolved.Name, outPath)
+		fmt.Fprintf(os.Stdout, "exported theme %s to %s\n", canonical, outPath)
 		return nil
 	case "import":
 		if len(args) != 3 {
@@ -2060,7 +2104,10 @@ func handleThemeCommand(configPath string, args []string, force bool, assumeYes 
 			return fmt.Errorf("invalid theme json: %w", err)
 		}
 		imported = config.NormalizeThemePalette(imported)
-		if len(imported.Colors) == 0 && len(imported.ServicePalette) == 0 {
+		if !themeFullMode {
+			imported = config.CompressThemePalette(imported)
+		}
+		if len(imported.Colors) == 0 && len(imported.Pallete) == 0 && len(imported.ServicePalette) == 0 {
 			return fmt.Errorf("invalid theme: empty palette")
 		}
 
@@ -2076,7 +2123,14 @@ func handleThemeCommand(configPath string, args []string, force bool, assumeYes 
 			}
 		}
 
-		cfg = cfg.SetTheme(targetName, imported)
+		if themeFullMode {
+			if cfg.Themes == nil {
+				cfg.Themes = config.ThemeMap{}
+			}
+			cfg.Themes[targetName] = imported
+		} else {
+			cfg = cfg.SetTheme(targetName, imported)
+		}
 		setTheme := assumeYes
 		if !setTheme {
 			setTheme = promptYesNo("Set imported theme as active theme? [y/N]: ")
@@ -2105,6 +2159,51 @@ func inferThemeNameFromPath(path string) string {
 	ext := filepath.Ext(base)
 	name := strings.TrimSpace(strings.TrimSuffix(base, ext))
 	return name
+}
+
+func printThemeHelpTable(items []config.ThemeHelpItem) {
+	if len(items) == 0 {
+		fmt.Fprintln(os.Stdout, "no theme help entries found")
+		return
+	}
+	maxKey := len("KEY")
+	maxKind := len("TYPE")
+	for _, item := range items {
+		if len(item.Key) > maxKey {
+			maxKey = len(item.Key)
+		}
+		if len(item.Kind) > maxKind {
+			maxKind = len(item.Kind)
+		}
+	}
+	fmt.Fprintf(os.Stdout, "%-*s  %-*s  %s\n", maxKey, "KEY", maxKind, "TYPE", "DESCRIPTION")
+	fmt.Fprintf(os.Stdout, "%s  %s  %s\n", strings.Repeat("-", maxKey), strings.Repeat("-", maxKind), strings.Repeat("-", 11))
+	for _, item := range items {
+		fmt.Fprintf(os.Stdout, "%-*s  %-*s  %s\n", maxKey, item.Key, maxKind, item.Kind, item.Description)
+	}
+}
+
+func filterThemeHelpItemsByActiveTheme(items []config.ThemeHelpItem, resolved config.ResolvedTheme) []config.ThemeHelpItem {
+	if len(items) == 0 {
+		return nil
+	}
+	allowed := map[string]struct{}{}
+	for key := range resolved.Selected.Colors {
+		allowed[strings.ToLower(strings.TrimSpace(key))] = struct{}{}
+	}
+	for key := range resolved.Selected.Pallete {
+		allowed["pallete."+strings.ToLower(strings.TrimSpace(key))] = struct{}{}
+	}
+	if len(resolved.Selected.ServicePalette) > 0 {
+		allowed["service_palette"] = struct{}{}
+	}
+	filtered := make([]config.ThemeHelpItem, 0, len(items))
+	for _, item := range items {
+		if _, ok := allowed[strings.ToLower(strings.TrimSpace(item.Key))]; ok {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
 }
 
 func promptYesNo(prompt string) bool {

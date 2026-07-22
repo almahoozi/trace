@@ -218,6 +218,7 @@ func Load(path string) (Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return Config{}, fmt.Errorf("invalid config json: %w", err)
 	}
+	cfg.Themes = cfg.ThemeCatalog()
 	cfg.Path = path
 	cfg.ConfigDir = filepath.Dir(path)
 	if err := cfg.validate(); err != nil {

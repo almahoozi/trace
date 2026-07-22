@@ -1,8 +1,6 @@
 package tui
 
 import (
-	"strings"
-
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/almahoozi/trace/internal/config"
@@ -30,12 +28,7 @@ func init() {
 }
 
 func applyThemeStyles(theme config.ResolvedTheme) {
-	color := func(key string, fallback string) string {
-		if value := strings.TrimSpace(theme.Palette.Colors[key]); value != "" {
-			return value
-		}
-		return fallback
-	}
+	color := theme.ColorFor
 
 	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(color(config.ThemeColorTitle, "12")))
 	mutedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(color(config.ThemeColorMuted, "241")))
