@@ -8,6 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/almahoozi/trace/internal/config"
+	"github.com/almahoozi/trace/internal/domain"
 )
 
 func TestYankSelectionToClipboard_TraceRangeIncludesHierarchy(t *testing.T) {
@@ -172,5 +173,38 @@ func TestTraceQueryWindowAround_UsesTenMinutesBeforeAndAfter(t *testing.T) {
 	}
 	if !start.Before(end) {
 		t.Fatalf("expected start before end: start=%s end=%s", start, end)
+	}
+}
+
+func TestTraceQueryWindow_UsesCurrentTraceTimeWhenAvailable(t *testing.T) {
+	traceStart := time.Date(2026, time.July, 14, 15, 33, 21, 1234, time.FixedZone("test", 3*3600))
+	m := Model{
+		session: &domain.Session{
+			Trace: &domain.Trace{StartTime: traceStart},
+		},
+	}
+
+	start, end := m.traceQueryWindow()
+	expectedBase := traceStart.UTC().Truncate(time.Second)
+	expectedStart := expectedBase.Add(-10 * time.Minute)
+	expectedEnd := expectedBase.Add(10 * time.Minute)
+
+	if !start.Equal(expectedStart) {
+		t.Fatalf("expected start %s, got %s", expectedStart, start)
+	}
+	if !end.Equal(expectedEnd) {
+		t.Fatalf("expected end %s, got %s", expectedEnd, end)
+	}
+}
+
+func TestBuildQueryCommandFromJSONScalar_RecentUsesSinceFlag(t *testing.T) {
+	m := Model{session: &domain.Session{Environment: "prd"}}
+	cmd := m.buildQueryCommandFromJSONScalar("ctx.user-id", "abc", true)
+
+	if !strings.Contains(cmd, " -d '30m'") {
+		t.Fatalf("expected recent query command to include -d 30m, got %q", cmd)
+	}
+	if strings.Contains(cmd, " -t '") {
+		t.Fatalf("expected recent query command not to include -t range, got %q", cmd)
 	}
 }
