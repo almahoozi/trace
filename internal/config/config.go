@@ -24,6 +24,8 @@ type Config struct {
 	Logs         LogsConfig    `json:"logs"`
 	URLs         URLConfig     `json:"urls"`
 	Output       OutputConfig  `json:"output"`
+	Theme        string        `json:"theme"`
+	Themes       ThemeMap      `json:"themes"`
 	UI           UIConfig      `json:"ui"`
 	Keymap       KeymapConfig  `json:"keymap"`
 }
@@ -397,6 +399,8 @@ func DefaultConfig() Config {
 		Output: OutputConfig{
 			TraceSummaryTemplate: DefaultTraceSummaryTemplate,
 		},
+		Theme:  "dark",
+		Themes: DefaultThemes(),
 		UI: UIConfig{
 			LogColumns:              []string{"timestamp", "service", "level", "message"},
 			LogDetailParts:          []string{"log", "labels", "raw"},
@@ -447,13 +451,13 @@ func DefaultConfig() Config {
 				"open_external": {"o"},
 			},
 			JSON: map[string][]string{
-				"up":         {"k", "up"},
-				"down":       {"j", "down"},
-				"expand":     {"l", "right"},
-				"collapse":   {"h", "left"},
-				"toggle":     {"enter"},
-				"back":       {"esc"},
-				"copy_query": {"ctrl+y"},
+				"up":                {"k", "up"},
+				"down":              {"j", "down"},
+				"expand":            {"l", "right"},
+				"collapse":          {"h", "left"},
+				"toggle":            {"enter"},
+				"back":              {"esc"},
+				"copy_query":        {"ctrl+y"},
 				"copy_query_recent": {"ctrl+shift+y"},
 			},
 		},

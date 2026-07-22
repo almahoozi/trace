@@ -20,6 +20,7 @@ type sessionOpenedFunc func(*domain.Session) error
 
 type BrowseModel struct {
 	cfg             config.Config
+	theme           config.ResolvedTheme
 	loc             *time.Location
 	environment     string
 	environments    []string
@@ -91,6 +92,7 @@ func NewBrowseModel(cfg config.Config, envName, query string, openQueryBuilder b
 	}
 	b := BrowseModel{
 		cfg:             cfg,
+		theme:           cfg.ResolveTheme(),
 		loc:             loc,
 		environment:     envName,
 		environments:    append([]string{}, environments...),
@@ -112,6 +114,7 @@ func NewBrowseModel(cfg config.Config, envName, query string, openQueryBuilder b
 		hasQueryEnd:     hasInitialEnd,
 		status:          status,
 	}
+	applyThemeStyles(b.theme)
 	b.items = filterTraceItemsByWindow(items, b.querySince, b.queryStartAt, b.queryEndAt, b.hasQueryStart, b.hasQueryEnd, time.Now())
 	b.filtered = b.items
 	if openQueryBuilder {
@@ -160,6 +163,8 @@ func (m BrowseModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.configView = nil
 				if loaded, err := config.Load(m.cfg.Path); err == nil {
 					m.cfg = loaded
+					m.theme = loaded.ResolveTheme()
+					applyThemeStyles(m.theme)
 				}
 				m.status = "closed config mode"
 				return m, nil
@@ -398,11 +403,11 @@ func (m BrowseModel) View() string {
 	)
 
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("trace browse mode"))
+	b.WriteString(m.titleStyle().Render("trace browse mode"))
 	b.WriteString("\n")
-	b.WriteString(mutedStyle.Render(fmt.Sprintf("env=%s", m.environment)))
+	b.WriteString(m.mutedStyle().Render(fmt.Sprintf("env=%s", m.environment)))
 	if strings.TrimSpace(m.query) != "" {
-		b.WriteString(mutedStyle.Render(fmt.Sprintf(" query=%q", m.query)))
+		b.WriteString(m.mutedStyle().Render(fmt.Sprintf(" query=%q", m.query)))
 	}
 	b.WriteString("\n\n")
 	b.WriteString(sliceHorizontal(head, m.hOffset, m.width))
@@ -448,12 +453,12 @@ func (m BrowseModel) View() string {
 	if m.loadingList {
 		footer = "reloading trace list..."
 	}
-	b.WriteString(mutedStyle.Render(footer))
+	b.WriteString(m.mutedStyle().Render(footer))
 	if m.search != nil {
 		b.WriteString("\n")
-		b.WriteString(mutedStyle.Render(m.search.viewLine()))
+		b.WriteString(m.mutedStyle().Render(m.search.viewLine()))
 		b.WriteString("\n")
-		b.WriteString(mutedStyle.Render(searchHint()))
+		b.WriteString(m.mutedStyle().Render(searchHint()))
 	}
 
 	return clampToHeight(b.String(), m.height)
@@ -527,17 +532,17 @@ func (m BrowseModel) visibleWindow(rows int) (int, int) {
 
 func (m BrowseModel) viewQueryBuilderOnly() string {
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("trace query builder"))
+	b.WriteString(m.titleStyle().Render("trace query builder"))
 	b.WriteString("\n")
-	b.WriteString(mutedStyle.Render(fmt.Sprintf("env=%s traces=%d", m.environment, len(m.items))))
+	b.WriteString(m.mutedStyle().Render(fmt.Sprintf("env=%s traces=%d", m.environment, len(m.items))))
 	if strings.TrimSpace(m.query) != "" {
 		b.WriteString("\n")
-		b.WriteString(mutedStyle.Render(fmt.Sprintf("active query=%q", m.query)))
+		b.WriteString(m.mutedStyle().Render(fmt.Sprintf("active query=%q", m.query)))
 	}
 	b.WriteString("\n\n")
 	b.WriteString(m.queryBuilder.View(m.width))
 	b.WriteString("\n\n")
-	b.WriteString(mutedStyle.Render(m.status))
+	b.WriteString(m.mutedStyle().Render(m.status))
 	return clampToHeight(b.String(), m.height)
 }
 
@@ -739,15 +744,15 @@ func (m *BrowseModel) yankSelectionToClipboard() {
 func (m BrowseModel) rowStyle(index int) lipgloss.Style {
 	selected := m.selectionIncludes(index)
 	if index == m.cursor && selected {
-		return tableRowCursorVisualStyle
+		return m.tableRowCursorVisualStyle()
 	}
 	if index == m.cursor {
-		return tableRowCursorStyle
+		return m.tableRowCursorStyle()
 	}
 	if selected {
-		return tableRowVisualStyle
+		return m.tableRowVisualStyle()
 	}
-	return tableRowBandStyle(index)
+	return m.tableRowBandStyle(index)
 }
 
 func (m BrowseModel) selectionIncludes(index int) bool {
@@ -981,6 +986,40 @@ func (m BrowseModel) availableQueryFields() []string {
 		}
 	}
 	return fields
+}
+
+func (m BrowseModel) themeColor(key string, fallback string) string {
+	if color := strings.TrimSpace(m.theme.Palette.Colors[key]); color != "" {
+		return color
+	}
+	return strings.TrimSpace(fallback)
+}
+
+func (m BrowseModel) titleStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(m.themeColor(config.ThemeColorTitle, "12")))
+}
+
+func (m BrowseModel) mutedStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(m.themeColor(config.ThemeColorMuted, "241")))
+}
+
+func (m BrowseModel) tableRowBandStyle(index int) lipgloss.Style {
+	if index%2 == 0 {
+		return lipgloss.NewStyle().Background(lipgloss.Color(m.themeColor(config.ThemeColorTableBandA, "234")))
+	}
+	return lipgloss.NewStyle().Background(lipgloss.Color(m.themeColor(config.ThemeColorTableBandB, "235")))
+}
+
+func (m BrowseModel) tableRowVisualStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Background(lipgloss.Color(m.themeColor(config.ThemeColorTableVisual, "236")))
+}
+
+func (m BrowseModel) tableRowCursorStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Background(lipgloss.Color(m.themeColor(config.ThemeColorTableCursor, "238")))
+}
+
+func (m BrowseModel) tableRowCursorVisualStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Background(lipgloss.Color(m.themeColor(config.ThemeColorTableCursorVisual, "61")))
 }
 
 func parseBrowseSince(raw string) time.Duration {
