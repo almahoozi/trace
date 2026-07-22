@@ -3684,10 +3684,7 @@ func (m Model) defaultServicePalette() []string {
 }
 
 func (m Model) themeColor(key string, fallback string) string {
-	if color := strings.TrimSpace(m.theme.Palette.Colors[key]); color != "" {
-		return color
-	}
-	return strings.TrimSpace(fallback)
+	return m.theme.ColorFor(key, fallback)
 }
 
 func (m Model) titleStyle() lipgloss.Style {

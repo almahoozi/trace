@@ -115,7 +115,7 @@ func traceSummaryData(cfg config.Config, session *domain.Session) map[string]any
 }
 
 func summaryTemplateFuncs(cfg config.Config, color bool) template.FuncMap {
-	theme := cfg.ResolveTheme().Palette
+	theme := cfg.ResolveTheme()
 	wrap := func(code string) func(string) string {
 		return func(v string) string {
 			if !color || v == "" {
@@ -130,16 +130,16 @@ func summaryTemplateFuncs(cfg config.Config, color bool) template.FuncMap {
 	}
 
 	return template.FuncMap{
-		"gray":              wrap(theme.Colors[config.ThemeColorANSISummaryGray]),
-		"light":             wrap(theme.Colors[config.ThemeColorANSISummaryLight]),
-		"bright":            wrap(theme.Colors[config.ThemeColorANSISummaryBright]),
-		"red":               wrap(theme.Colors[config.ThemeColorANSISummaryRed]),
+		"gray":              wrap(theme.ColorFor(config.ThemeColorANSISummaryGray, "90")),
+		"light":             wrap(theme.ColorFor(config.ThemeColorANSISummaryLight, "37")),
+		"bright":            wrap(theme.ColorFor(config.ThemeColorANSISummaryBright, "97")),
+		"red":               wrap(theme.ColorFor(config.ThemeColorANSISummaryRed, "31")),
 		"duration_color":    durationColor(theme, color),
 		"http_status_color": httpStatusColor(theme, color),
 	}
 }
 
-func durationColor(theme config.ThemePalette, color bool) func(any, string) string {
+func durationColor(theme config.ResolvedTheme, color bool) func(any, string) string {
 	paint := func(code, value string) string {
 		if !color || value == "" {
 			return value
@@ -159,18 +159,18 @@ func durationColor(theme config.ThemePalette, color bool) func(any, string) stri
 
 		switch {
 		case duration < 100*time.Millisecond:
-			return paint(theme.Colors[config.ThemeColorANSIDurationFast], rendered)
+			return paint(theme.ColorFor(config.ThemeColorANSIDurationFast, "32"), rendered)
 		case duration < time.Second:
-			return paint(theme.Colors[config.ThemeColorANSIDurationNormal], rendered)
+			return paint(theme.ColorFor(config.ThemeColorANSIDurationNormal, "97"), rendered)
 		case duration < 3*time.Second:
-			return paint(theme.Colors[config.ThemeColorANSIDurationSlow], rendered)
+			return paint(theme.ColorFor(config.ThemeColorANSIDurationSlow, "33"), rendered)
 		default:
-			return paint(theme.Colors[config.ThemeColorANSIDurationVerySlow], rendered)
+			return paint(theme.ColorFor(config.ThemeColorANSIDurationVerySlow, "31"), rendered)
 		}
 	}
 }
 
-func httpStatusColor(theme config.ThemePalette, color bool) func(any, string) string {
+func httpStatusColor(theme config.ResolvedTheme, color bool) func(any, string) string {
 	paint := func(code, value string) string {
 		if !color || value == "" {
 			return value
@@ -185,20 +185,20 @@ func httpStatusColor(theme config.ThemePalette, color bool) func(any, string) st
 	return func(rawStatus any, rendered string) string {
 		statusCode, ok := parseHTTPStatusCode(rawStatus)
 		if !ok {
-			return paint(theme.Colors[config.ThemeColorANSIHTTPDefault], rendered)
+			return paint(theme.ColorFor(config.ThemeColorANSIHTTPDefault, "97"), rendered)
 		}
 
 		switch statusCode / 100 {
 		case 2:
-			return paint(theme.Colors[config.ThemeColorANSIHTTPSuccess], rendered)
+			return paint(theme.ColorFor(config.ThemeColorANSIHTTPSuccess, "32"), rendered)
 		case 3:
-			return paint(theme.Colors[config.ThemeColorANSIHTTPRedirect], rendered)
+			return paint(theme.ColorFor(config.ThemeColorANSIHTTPRedirect, "34"), rendered)
 		case 4:
-			return paint(theme.Colors[config.ThemeColorANSIHTTPClientError], rendered)
+			return paint(theme.ColorFor(config.ThemeColorANSIHTTPClientError, "33"), rendered)
 		case 5:
-			return paint(theme.Colors[config.ThemeColorANSIHTTPServerError], rendered)
+			return paint(theme.ColorFor(config.ThemeColorANSIHTTPServerError, "31"), rendered)
 		default:
-			return paint(theme.Colors[config.ThemeColorANSIHTTPDefault], rendered)
+			return paint(theme.ColorFor(config.ThemeColorANSIHTTPDefault, "97"), rendered)
 		}
 	}
 }

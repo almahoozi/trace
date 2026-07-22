@@ -53,110 +53,181 @@ const (
 	ThemeColorANSIHTTPServerError  = "ansi.http.server_error"
 )
 
+const (
+	ThemePalleteTextFocussed     = "text_focussed"
+	ThemePalleteTextUnfocussed   = "text_unfocussed"
+	ThemePalleteBorder           = "border"
+	ThemePalleteBorderActive     = "border_active"
+	ThemePalleteSurfaceA         = "surface_a"
+	ThemePalleteSurfaceB         = "surface_b"
+	ThemePalleteSurfaceVisual    = "surface_visual"
+	ThemePalleteSurfaceCursor    = "surface_cursor"
+	ThemePalleteSurfaceCursorVis = "surface_cursor_visual"
+	ThemePalleteSuccess          = "success"
+	ThemePalleteInfo             = "info"
+	ThemePalleteWarning          = "warning"
+	ThemePalleteError            = "error"
+	ThemePalleteServicePrimary   = "service_primary"
+	ThemePalleteServiceSidecar   = "service_sidecar"
+	ThemePalleteServiceExternal  = "service_external"
+	ThemePalleteServiceCost      = "service_cost"
+	ThemePalleteServiceDB        = "service_db"
+	ThemePalleteService3rd       = "service_third_party"
+)
+
+var colorPalleteFallback = map[string]string{
+	ThemeColorTitle:                ThemePalleteTextFocussed,
+	ThemeColorMuted:                ThemePalleteTextUnfocussed,
+	ThemeColorSectionBorder:        ThemePalleteBorder,
+	ThemeColorSectionBorderActive:  ThemePalleteBorderActive,
+	ThemeColorTableBandA:           ThemePalleteSurfaceA,
+	ThemeColorTableBandB:           ThemePalleteSurfaceB,
+	ThemeColorTableVisual:          ThemePalleteSurfaceVisual,
+	ThemeColorTableCursor:          ThemePalleteSurfaceCursor,
+	ThemeColorTableCursorVisual:    ThemePalleteSurfaceCursorVis,
+	ThemeColorSummaryBright:        ThemePalleteTextFocussed,
+	ThemeColorSummaryGray:          ThemePalleteTextUnfocussed,
+	ThemeColorSummarySuccess:       ThemePalleteSuccess,
+	ThemeColorSummaryInfo:          ThemePalleteInfo,
+	ThemeColorSummaryWarn:          ThemePalleteWarning,
+	ThemeColorSummaryError:         ThemePalleteError,
+	ThemeColorServiceFallback:      ThemePalleteTextUnfocussed,
+	ThemeColorServiceMapService:    ThemePalleteServicePrimary,
+	ThemeColorServiceMapSidecar:    ThemePalleteServiceSidecar,
+	ThemeColorServiceMapExternal:   ThemePalleteServiceExternal,
+	ThemeColorServiceMapCost:       ThemePalleteServiceCost,
+	ThemeColorServiceMapTypeDB:     ThemePalleteServiceDB,
+	ThemeColorServiceMapType3rd:    ThemePalleteService3rd,
+	ThemeColorLogLevelError:        ThemePalleteError,
+	ThemeColorLogLevelWarn:         ThemePalleteWarning,
+	ThemeColorLogLevelInfo:         ThemePalleteInfo,
+	ThemeColorLogLevelDebug:        ThemePalleteTextUnfocussed,
+	ThemeColorLogLevelTrace:        ThemePalleteTextUnfocussed,
+	ThemeColorLogLevelDefault:      ThemePalleteTextFocussed,
+	ThemeColorANSISummaryGray:      ThemePalleteTextUnfocussed,
+	ThemeColorANSISummaryLight:     ThemePalleteTextFocussed,
+	ThemeColorANSISummaryBright:    ThemePalleteTextFocussed,
+	ThemeColorANSISummaryRed:       ThemePalleteError,
+	ThemeColorANSIDurationFast:     ThemePalleteSuccess,
+	ThemeColorANSIDurationNormal:   ThemePalleteTextFocussed,
+	ThemeColorANSIDurationSlow:     ThemePalleteWarning,
+	ThemeColorANSIDurationVerySlow: ThemePalleteError,
+	ThemeColorANSIHTTPDefault:      ThemePalleteTextFocussed,
+	ThemeColorANSIHTTPSuccess:      ThemePalleteSuccess,
+	ThemeColorANSIHTTPRedirect:     ThemePalleteInfo,
+	ThemeColorANSIHTTPClientError:  ThemePalleteWarning,
+	ThemeColorANSIHTTPServerError:  ThemePalleteError,
+}
+
 type ThemeMap map[string]ThemePalette
 
 type ThemePalette struct {
 	Colors         map[string]string `json:"colors"`
+	Pallete        map[string]string `json:"pallete"`
 	ServicePalette []string          `json:"service_palette"`
 }
 
+var themeColorKeys = []string{
+	ThemeColorTitle,
+	ThemeColorMuted,
+	ThemeColorSectionBorder,
+	ThemeColorSectionBorderActive,
+	ThemeColorTableBandA,
+	ThemeColorTableBandB,
+	ThemeColorTableVisual,
+	ThemeColorTableCursor,
+	ThemeColorTableCursorVisual,
+	ThemeColorSummaryBright,
+	ThemeColorSummaryGray,
+	ThemeColorSummarySuccess,
+	ThemeColorSummaryInfo,
+	ThemeColorSummaryWarn,
+	ThemeColorSummaryError,
+	ThemeColorServiceFallback,
+	ThemeColorServiceMapService,
+	ThemeColorServiceMapSidecar,
+	ThemeColorServiceMapExternal,
+	ThemeColorServiceMapCost,
+	ThemeColorServiceMapTypeDB,
+	ThemeColorServiceMapType3rd,
+	ThemeColorLogLevelError,
+	ThemeColorLogLevelWarn,
+	ThemeColorLogLevelInfo,
+	ThemeColorLogLevelDebug,
+	ThemeColorLogLevelTrace,
+	ThemeColorLogLevelDefault,
+	ThemeColorANSISummaryGray,
+	ThemeColorANSISummaryLight,
+	ThemeColorANSISummaryBright,
+	ThemeColorANSISummaryRed,
+	ThemeColorANSIDurationFast,
+	ThemeColorANSIDurationNormal,
+	ThemeColorANSIDurationSlow,
+	ThemeColorANSIDurationVerySlow,
+	ThemeColorANSIHTTPDefault,
+	ThemeColorANSIHTTPSuccess,
+	ThemeColorANSIHTTPRedirect,
+	ThemeColorANSIHTTPClientError,
+	ThemeColorANSIHTTPServerError,
+}
+
 type ResolvedTheme struct {
-	Name    string
-	Palette ThemePalette
-	FromEnv bool
+	Name     string
+	Palette  ThemePalette
+	Selected ThemePalette
+	Default  ThemePalette
+	FromEnv  bool
 }
 
 func DefaultThemes() ThemeMap {
 	dark := ThemePalette{
-		Colors: map[string]string{
-			ThemeColorTitle:                "12",
-			ThemeColorMuted:                "241",
-			ThemeColorSectionBorder:        "240",
-			ThemeColorSectionBorderActive:  "33",
-			ThemeColorTableBandA:           "234",
-			ThemeColorTableBandB:           "235",
-			ThemeColorTableVisual:          "236",
-			ThemeColorTableCursor:          "238",
-			ThemeColorTableCursorVisual:    "61",
-			ThemeColorSummaryBright:        "15",
-			ThemeColorSummaryGray:          "245",
-			ThemeColorSummarySuccess:       "2",
-			ThemeColorSummaryInfo:          "4",
-			ThemeColorSummaryWarn:          "3",
-			ThemeColorSummaryError:         "1",
-			ThemeColorServiceFallback:      "244",
-			ThemeColorServiceMapService:    "68",
-			ThemeColorServiceMapSidecar:    "244",
-			ThemeColorServiceMapExternal:   "214",
-			ThemeColorServiceMapCost:       "250",
-			ThemeColorServiceMapTypeDB:     "39",
-			ThemeColorServiceMapType3rd:    "178",
-			ThemeColorLogLevelError:        "196",
-			ThemeColorLogLevelWarn:         "214",
-			ThemeColorLogLevelInfo:         "39",
-			ThemeColorLogLevelDebug:        "111",
-			ThemeColorLogLevelTrace:        "244",
-			ThemeColorLogLevelDefault:      "250",
-			ThemeColorANSISummaryGray:      "90",
-			ThemeColorANSISummaryLight:     "37",
-			ThemeColorANSISummaryBright:    "97",
-			ThemeColorANSISummaryRed:       "31",
-			ThemeColorANSIDurationFast:     "32",
-			ThemeColorANSIDurationNormal:   "97",
-			ThemeColorANSIDurationSlow:     "33",
-			ThemeColorANSIDurationVerySlow: "31",
-			ThemeColorANSIHTTPDefault:      "97",
-			ThemeColorANSIHTTPSuccess:      "32",
-			ThemeColorANSIHTTPRedirect:     "34",
-			ThemeColorANSIHTTPClientError:  "33",
-			ThemeColorANSIHTTPServerError:  "31",
+		Colors: map[string]string{},
+		Pallete: map[string]string{
+			ThemePalleteTextFocussed:     "15",
+			ThemePalleteTextUnfocussed:   "245",
+			ThemePalleteBorder:           "240",
+			ThemePalleteBorderActive:     "33",
+			ThemePalleteSurfaceA:         "234",
+			ThemePalleteSurfaceB:         "235",
+			ThemePalleteSurfaceVisual:    "236",
+			ThemePalleteSurfaceCursor:    "238",
+			ThemePalleteSurfaceCursorVis: "61",
+			ThemePalleteSuccess:          "2",
+			ThemePalleteInfo:             "4",
+			ThemePalleteWarning:          "3",
+			ThemePalleteError:            "1",
+			ThemePalleteServicePrimary:   "68",
+			ThemePalleteServiceSidecar:   "244",
+			ThemePalleteServiceExternal:  "214",
+			ThemePalleteServiceCost:      "250",
+			ThemePalleteServiceDB:        "39",
+			ThemePalleteService3rd:       "178",
 		},
 		ServicePalette: []string{"68", "173", "71", "176", "74", "179", "109", "175", "75", "181"},
 	}
 
 	light := ThemePalette{
-		Colors: map[string]string{
-			ThemeColorTitle:                "18",
-			ThemeColorMuted:                "242",
-			ThemeColorSectionBorder:        "248",
-			ThemeColorSectionBorderActive:  "24",
-			ThemeColorTableBandA:           "255",
-			ThemeColorTableBandB:           "254",
-			ThemeColorTableVisual:          "153",
-			ThemeColorTableCursor:          "189",
-			ThemeColorTableCursorVisual:    "111",
-			ThemeColorSummaryBright:        "16",
-			ThemeColorSummaryGray:          "241",
-			ThemeColorSummarySuccess:       "28",
-			ThemeColorSummaryInfo:          "25",
-			ThemeColorSummaryWarn:          "166",
-			ThemeColorSummaryError:         "124",
-			ThemeColorServiceFallback:      "242",
-			ThemeColorServiceMapService:    "24",
-			ThemeColorServiceMapSidecar:    "244",
-			ThemeColorServiceMapExternal:   "166",
-			ThemeColorServiceMapCost:       "240",
-			ThemeColorServiceMapTypeDB:     "25",
-			ThemeColorServiceMapType3rd:    "130",
-			ThemeColorLogLevelError:        "160",
-			ThemeColorLogLevelWarn:         "166",
-			ThemeColorLogLevelInfo:         "25",
-			ThemeColorLogLevelDebug:        "62",
-			ThemeColorLogLevelTrace:        "244",
-			ThemeColorLogLevelDefault:      "238",
-			ThemeColorANSISummaryGray:      "90",
-			ThemeColorANSISummaryLight:     "30",
-			ThemeColorANSISummaryBright:    "30",
-			ThemeColorANSISummaryRed:       "31",
-			ThemeColorANSIDurationFast:     "32",
-			ThemeColorANSIDurationNormal:   "30",
-			ThemeColorANSIDurationSlow:     "33",
-			ThemeColorANSIDurationVerySlow: "31",
-			ThemeColorANSIHTTPDefault:      "30",
-			ThemeColorANSIHTTPSuccess:      "32",
-			ThemeColorANSIHTTPRedirect:     "34",
-			ThemeColorANSIHTTPClientError:  "33",
-			ThemeColorANSIHTTPServerError:  "31",
+		Colors: map[string]string{},
+		Pallete: map[string]string{
+			ThemePalleteTextFocussed:     "16",
+			ThemePalleteTextUnfocussed:   "241",
+			ThemePalleteBorder:           "248",
+			ThemePalleteBorderActive:     "24",
+			ThemePalleteSurfaceA:         "255",
+			ThemePalleteSurfaceB:         "254",
+			ThemePalleteSurfaceVisual:    "153",
+			ThemePalleteSurfaceCursor:    "189",
+			ThemePalleteSurfaceCursorVis: "111",
+			ThemePalleteSuccess:          "28",
+			ThemePalleteInfo:             "25",
+			ThemePalleteWarning:          "166",
+			ThemePalleteError:            "124",
+			ThemePalleteServicePrimary:   "24",
+			ThemePalleteServiceSidecar:   "244",
+			ThemePalleteServiceExternal:  "166",
+			ThemePalleteServiceCost:      "240",
+			ThemePalleteServiceDB:        "25",
+			ThemePalleteService3rd:       "130",
 		},
 		ServicePalette: []string{"24", "25", "26", "27", "31", "32", "33", "62", "94", "130"},
 	}
@@ -179,21 +250,48 @@ func (c Config) ResolveTheme() ResolvedTheme {
 		name = "dark"
 	}
 
-	themes := cloneThemeMap(DefaultThemes())
-	for key, value := range c.Themes {
-		themes[key] = cloneThemePalette(value)
-	}
+	themes := c.ThemeCatalog()
 
 	selected, found := lookupTheme(themes, name)
 	if !found {
 		name = "dark"
 		selected, _ = lookupTheme(themes, name)
 	}
-	base, _ := lookupTheme(themes, "default")
+	base, foundBase := lookupTheme(themes, "default")
+	if !foundBase {
+		base, _ = lookupTheme(DefaultThemes(), "default")
+	}
 	resolved := mergeThemePalette(base, selected)
 	resolved = normalizeThemePalette(resolved)
 
-	return ResolvedTheme{Name: name, Palette: resolved, FromEnv: fromEnv}
+	return ResolvedTheme{
+		Name:     name,
+		Palette:  resolved,
+		Selected: normalizeThemePalette(selected),
+		Default:  normalizeThemePalette(base),
+		FromEnv:  fromEnv,
+	}
+}
+
+func (t ResolvedTheme) ColorFor(key string, hardFallback string) string {
+	if color := strings.TrimSpace(t.Selected.Colors[key]); color != "" {
+		return color
+	}
+	paletteKey := colorPalleteFallback[key]
+	if paletteKey != "" {
+		if color := strings.TrimSpace(t.Selected.Pallete[paletteKey]); color != "" {
+			return color
+		}
+	}
+	if color := strings.TrimSpace(t.Default.Colors[key]); color != "" {
+		return color
+	}
+	if paletteKey != "" {
+		if color := strings.TrimSpace(t.Default.Pallete[paletteKey]); color != "" {
+			return color
+		}
+	}
+	return strings.TrimSpace(hardFallback)
 }
 
 func (c Config) ThemeExists(name string) bool {
@@ -204,9 +302,31 @@ func (c Config) ThemeExists(name string) bool {
 func (c Config) ThemeCatalog() ThemeMap {
 	themes := cloneThemeMap(DefaultThemes())
 	for key, value := range c.Themes {
-		themes[key] = cloneThemePalette(value)
+		trimmed := strings.TrimSpace(key)
+		if trimmed == "" {
+			continue
+		}
+		if builtInKey := canonicalBuiltInThemeName(trimmed); builtInKey != "" {
+			builtIn := themes[builtInKey]
+			themes[builtInKey] = mergeThemePalette(builtIn, value)
+			continue
+		}
+		themes[key] = normalizeThemePalette(cloneThemePalette(value))
 	}
 	return themes
+}
+
+func canonicalBuiltInThemeName(name string) string {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "default":
+		return "default"
+	case "dark":
+		return "dark"
+	case "light":
+		return "light"
+	default:
+		return ""
+	}
 }
 
 func (c Config) ThemeNames() []string {
@@ -253,6 +373,7 @@ func (c Config) SetTheme(name string, palette ThemePalette) Config {
 
 func normalizeThemePalette(palette ThemePalette) ThemePalette {
 	palette.Colors = cloneColorMap(palette.Colors)
+	palette.Pallete = cloneColorMap(palette.Pallete)
 	if palette.ServicePalette == nil {
 		palette.ServicePalette = []string{}
 	}
@@ -270,14 +391,52 @@ func NormalizeThemePalette(palette ThemePalette) ThemePalette {
 	return normalizeThemePalette(palette)
 }
 
+func CompressThemePalette(palette ThemePalette) ThemePalette {
+	compressed := normalizeThemePalette(cloneThemePalette(palette))
+	if len(compressed.Colors) == 0 {
+		return compressed
+	}
+	for key, value := range compressed.Colors {
+		paletteKey := colorPalleteFallback[key]
+		if paletteKey == "" {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(value), strings.TrimSpace(compressed.Pallete[paletteKey])) {
+			delete(compressed.Colors, key)
+		}
+	}
+	return compressed
+}
+
+func FlattenThemePalette(resolved ResolvedTheme, palette ThemePalette) ThemePalette {
+	flattened := normalizeThemePalette(cloneThemePalette(palette))
+	if flattened.Colors == nil {
+		flattened.Colors = map[string]string{}
+	}
+	for _, key := range themeColorKeys {
+		if color := strings.TrimSpace(resolved.ColorFor(key, "")); color != "" {
+			flattened.Colors[key] = color
+		}
+	}
+	return flattened
+}
+
 func mergeThemePalette(base ThemePalette, overlay ThemePalette) ThemePalette {
 	merged := normalizeThemePalette(base)
 	if merged.Colors == nil {
 		merged.Colors = map[string]string{}
 	}
+	if merged.Pallete == nil {
+		merged.Pallete = map[string]string{}
+	}
 	for key, value := range overlay.Colors {
 		if trimmed := strings.TrimSpace(value); trimmed != "" {
 			merged.Colors[key] = trimmed
+		}
+	}
+	for key, value := range overlay.Pallete {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			merged.Pallete[key] = trimmed
 		}
 	}
 	if len(overlay.ServicePalette) > 0 {
@@ -295,7 +454,7 @@ func cloneThemeMap(in ThemeMap) ThemeMap {
 }
 
 func cloneThemePalette(in ThemePalette) ThemePalette {
-	out := ThemePalette{Colors: cloneColorMap(in.Colors)}
+	out := ThemePalette{Colors: cloneColorMap(in.Colors), Pallete: cloneColorMap(in.Pallete)}
 	if len(in.ServicePalette) > 0 {
 		out.ServicePalette = append([]string{}, in.ServicePalette...)
 	} else {

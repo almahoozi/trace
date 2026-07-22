@@ -989,10 +989,7 @@ func (m BrowseModel) availableQueryFields() []string {
 }
 
 func (m BrowseModel) themeColor(key string, fallback string) string {
-	if color := strings.TrimSpace(m.theme.Palette.Colors[key]); color != "" {
-		return color
-	}
-	return strings.TrimSpace(fallback)
+	return m.theme.ColorFor(key, fallback)
 }
 
 func (m BrowseModel) titleStyle() lipgloss.Style {

@@ -13,7 +13,7 @@ func TestResolveTheme_DefaultsToDark(t *testing.T) {
 	if resolved.Name != "dark" {
 		t.Fatalf("ResolveTheme().Name = %q, want %q", resolved.Name, "dark")
 	}
-	if resolved.Palette.Colors[ThemeColorTitle] == "" {
+	if got := resolved.ColorFor(ThemeColorTitle, ""); got == "" {
 		t.Fatalf("ResolveTheme() missing %q", ThemeColorTitle)
 	}
 }
@@ -41,10 +41,10 @@ func TestResolveTheme_FallsBackToDefaultThemeValues(t *testing.T) {
 	cfg.Theme = "custom"
 
 	resolved := cfg.ResolveTheme()
-	if got := resolved.Palette.Colors[ThemeColorTitle]; got != "200" {
+	if got := resolved.ColorFor(ThemeColorTitle, ""); got != "200" {
 		t.Fatalf("title color = %q, want %q", got, "200")
 	}
-	if got := resolved.Palette.Colors[ThemeColorMuted]; got != "123" {
+	if got := resolved.ColorFor(ThemeColorMuted, ""); got != "123" {
 		t.Fatalf("muted color = %q, want %q", got, "123")
 	}
 }
@@ -100,5 +100,83 @@ func TestIsBuiltInTheme(t *testing.T) {
 	}
 	if IsBuiltInTheme("my-custom") {
 		t.Fatal("expected my-custom to be non built-in")
+	}
+}
+
+func TestResolvedThemeColorFor_Order(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+	cfg.Themes["default"] = ThemePalette{
+		Colors:  map[string]string{ThemeColorMuted: "100"},
+		Pallete: map[string]string{ThemePalleteTextUnfocussed: "101"},
+	}
+	cfg.Themes["custom"] = ThemePalette{
+		Pallete: map[string]string{ThemePalleteTextUnfocussed: "200"},
+	}
+	cfg.Theme = "custom"
+
+	resolved := cfg.ResolveTheme()
+	if got := resolved.ColorFor(ThemeColorMuted, "241"); got != "200" {
+		t.Fatalf("ColorFor() = %q, want %q", got, "200")
+	}
+
+	cfg.Themes["custom"] = ThemePalette{}
+	resolved = cfg.ResolveTheme()
+	if got := resolved.ColorFor(ThemeColorMuted, "241"); got != "100" {
+		t.Fatalf("ColorFor() default color fallback = %q, want %q", got, "100")
+	}
+}
+
+func TestResolvedThemeColorFor_DefaultPalleteFallback(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+	cfg.Themes["default"] = ThemePalette{Pallete: map[string]string{ThemePalleteTextUnfocussed: "222"}}
+	cfg.Themes["custom"] = ThemePalette{}
+	cfg.Theme = "custom"
+
+	resolved := cfg.ResolveTheme()
+	if got := resolved.ColorFor(ThemeColorMuted, ""); got != "222" {
+		t.Fatalf("ColorFor() = %q, want %q", got, "222")
+	}
+}
+
+func TestCompressThemePalette_RemovesMappedDuplicates(t *testing.T) {
+	t.Parallel()
+
+	palette := ThemePalette{
+		Pallete: map[string]string{ThemePalleteTextUnfocussed: "245"},
+		Colors:  map[string]string{ThemeColorMuted: "245", ThemeColorTitle: "15"},
+	}
+	compressed := CompressThemePalette(palette)
+	if _, ok := compressed.Colors[ThemeColorMuted]; ok {
+		t.Fatalf("expected %q to be compressed away", ThemeColorMuted)
+	}
+	if got := compressed.Colors[ThemeColorTitle]; got != "15" {
+		t.Fatalf("expected title override retained, got %q", got)
+	}
+}
+
+func TestThemeCatalog_MergesBuiltInOverridesWithBuiltInPallete(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultConfig()
+	cfg.Themes = ThemeMap{
+		"dark": {
+			Colors: map[string]string{ThemeColorMuted: "250"},
+		},
+	}
+
+	catalog := cfg.ThemeCatalog()
+	dark, ok := catalog["dark"]
+	if !ok {
+		t.Fatal("expected dark theme in catalog")
+	}
+	if got := dark.Colors[ThemeColorMuted]; got != "250" {
+		t.Fatalf("dark muted override = %q, want %q", got, "250")
+	}
+	if got := dark.Pallete[ThemePalleteTextUnfocussed]; got == "" {
+		t.Fatalf("expected dark pallete %q to be preserved", ThemePalleteTextUnfocussed)
 	}
 }
