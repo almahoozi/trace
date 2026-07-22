@@ -419,6 +419,11 @@ func (m Model) updateJSON(key string) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	}
+	if m.isAction("json", "copy_query_recent", key) {
+		if m.copyCurrentJSONScalarAsRecentQuery() {
+			return m, nil
+		}
+	}
 	return m, nil
 }
 
@@ -2370,6 +2375,7 @@ func (m Model) helpView() string {
 		"level_up":          "Increase min level",
 		"level_down":        "Decrease min level",
 		"copy_query":        "Copy query command from value",
+		"copy_query_recent": "Copy query command (last 30m)",
 	}
 
 	var b strings.Builder
@@ -2520,6 +2526,14 @@ func (m Model) currentLog() (domain.LogEntry, bool) {
 }
 
 func (m *Model) copyCurrentJSONScalarAsQuery() bool {
+	return m.copyCurrentJSONScalarAsQueryWithWindowMode(false)
+}
+
+func (m *Model) copyCurrentJSONScalarAsRecentQuery() bool {
+	return m.copyCurrentJSONScalarAsQueryWithWindowMode(true)
+}
+
+func (m *Model) copyCurrentJSONScalarAsQueryWithWindowMode(useRecentSince bool) bool {
 	if m == nil {
 		return false
 	}
@@ -2537,7 +2551,7 @@ func (m *Model) copyCurrentJSONScalarAsQuery() bool {
 		m.status = "query copy requires an attribute-like key"
 		return false
 	}
-	command := m.buildQueryCommandFromJSONScalar(field, line.Value)
+	command := m.buildQueryCommandFromJSONScalar(field, line.Value, useRecentSince)
 	if strings.TrimSpace(command) == "" {
 		m.status = "failed to build query command"
 		return false
@@ -2573,25 +2587,33 @@ func lastPathToken(path string) string {
 	return trimmed
 }
 
-func (m Model) buildQueryCommandFromJSONScalar(field string, value any) string {
+func (m Model) buildQueryCommandFromJSONScalar(field string, value any, useRecentSince bool) string {
 	field = strings.TrimSpace(field)
 	if field == "" {
 		return ""
 	}
 	clause := field + "=" + formatTraceQLValue(value)
-	start, end := m.traceQueryWindow()
-	window := start.UTC().Format(time.RFC3339) + "/" + end.UTC().Format(time.RFC3339)
 	parts := []string{"t"}
 	if env := strings.TrimSpace(m.session.Environment); env != "" {
 		parts = append(parts, shellSingleQuote(env))
 	}
-	parts = append(parts, "-q", shellSingleQuote(clause), "-t", shellSingleQuote(window))
+	parts = append(parts, "-q", shellSingleQuote(clause))
+	if useRecentSince {
+		parts = append(parts, "-d", shellSingleQuote("30m"))
+		return strings.Join(parts, " ")
+	}
+	start, end := m.traceQueryWindow()
+	window := start.UTC().Format(time.RFC3339) + "/" + end.UTC().Format(time.RFC3339)
+	parts = append(parts, "-t", shellSingleQuote(window))
 	return strings.Join(parts, " ")
 }
 
 func (m Model) traceQueryWindow() (time.Time, time.Time) {
-	now := time.Now().UTC().Truncate(time.Second)
-	start, end := traceQueryWindowAround(now)
+	base := time.Now().UTC().Truncate(time.Second)
+	if m.session != nil && m.session.Trace != nil && !m.session.Trace.StartTime.IsZero() {
+		base = m.session.Trace.StartTime.UTC().Truncate(time.Second)
+	}
+	start, end := traceQueryWindowAround(base)
 	return start, end
 }
 

@@ -454,6 +454,7 @@ func DefaultConfig() Config {
 				"toggle":     {"enter"},
 				"back":       {"esc"},
 				"copy_query": {"ctrl+y"},
+				"copy_query_recent": {"ctrl+shift+y"},
 			},
 		},
 	}
