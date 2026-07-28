@@ -836,7 +836,16 @@ func main() {
 			cancel()
 			status.Stop()
 
-			program := tea.NewProgram(tui.NewModelWithDeferredLogs(cfg, session, platform.OpenURL, defaultSnapshotSaver, logsLoader, logsReady), tea.WithAltScreen())
+			program := tea.NewProgram(tui.NewModelWithDeferredLogsAndLinkedTraceOpener(cfg, session, platform.OpenURL, defaultSnapshotSaver, logsLoader, logsReady, func(ctx context.Context, environment, linkedTraceID string) (*domain.Session, error) {
+				env := strings.TrimSpace(environment)
+				if env == "" {
+					env = strings.TrimSpace(session.Environment)
+				}
+				if env == "" {
+					return fetcher.FetchTraceSession(ctx, cfg, linkedTraceID)
+				}
+				return fetcher.FetchTraceSessionInEnvironment(ctx, cfg, env, linkedTraceID)
+			}), tea.WithAltScreen())
 			if _, err := program.Run(); err != nil {
 				runlog.Error("trace tui failed", "error", err)
 				fmt.Fprintf(os.Stderr, "tui failed: %v\n", err)
@@ -920,7 +929,16 @@ func main() {
 		}
 	}
 
-	program := tea.NewProgram(tui.NewModelWithDeferredLogs(cfg, session, platform.OpenURL, defaultSnapshotSaver, logsLoader, logsReady), tea.WithAltScreen())
+	program := tea.NewProgram(tui.NewModelWithDeferredLogsAndLinkedTraceOpener(cfg, session, platform.OpenURL, defaultSnapshotSaver, logsLoader, logsReady, func(ctx context.Context, environment, linkedTraceID string) (*domain.Session, error) {
+		env := strings.TrimSpace(environment)
+		if env == "" {
+			env = strings.TrimSpace(session.Environment)
+		}
+		if env == "" {
+			return fetcher.FetchTraceSession(ctx, cfg, linkedTraceID)
+		}
+		return fetcher.FetchTraceSessionInEnvironment(ctx, cfg, env, linkedTraceID)
+	}), tea.WithAltScreen())
 	if _, err := program.Run(); err != nil {
 		runlog.Error("trace tui failed", "error", err)
 		fmt.Fprintf(os.Stderr, "tui failed: %v\n", err)

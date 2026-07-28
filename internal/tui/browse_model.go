@@ -243,7 +243,16 @@ func (m BrowseModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
-		viewer := NewModel(m.cfg, msg.session, m.openURL, defaultSnapshotSaver)
+		viewer := NewModelWithLinkedTraceOpener(m.cfg, msg.session, m.openURL, defaultSnapshotSaver, func(ctx context.Context, environment, traceID string) (*domain.Session, error) {
+			if m.fetchSession == nil {
+				return nil, fmt.Errorf("trace fetcher not configured")
+			}
+			env := strings.TrimSpace(environment)
+			if env == "" {
+				env = m.environment
+			}
+			return m.fetchSession(ctx, env, traceID)
+		})
 		if m.width > 0 && m.height > 0 {
 			updated, _ := viewer.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
 			if next, ok := updated.(Model); ok {

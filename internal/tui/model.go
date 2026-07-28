@@ -56,6 +56,7 @@ type Model struct {
 	session      *domain.Session
 	openURL      func(string) error
 	saveSnapshot func(*domain.Session) (string, error)
+	loadLinked   func(context.Context, string, string) (*domain.Session, error)
 	loc          *time.Location
 
 	width  int
@@ -89,6 +90,7 @@ type Model struct {
 	pendingGG        bool
 
 	searchPrompt *searchPrompt
+	detailSpanID string
 
 	visualMode   bool
 	visualScope  selectionScope
@@ -101,6 +103,7 @@ type Model struct {
 	loadLogs          func(context.Context) ([]domain.LogEntry, error)
 	onLogsReady       func(*domain.Session)
 	logsLoadErr       string
+	loadingLinked     bool
 }
 
 type selectionScope int
@@ -117,6 +120,12 @@ type logsLoadedMsg struct {
 	err     error
 }
 
+type linkedTraceLoadedMsg struct {
+	traceID string
+	session *domain.Session
+	err     error
+}
+
 type valueView struct {
 	title  string
 	lines  []string
@@ -124,20 +133,29 @@ type valueView struct {
 }
 
 func NewModel(cfg config.Config, session *domain.Session, openURL func(string) error, saveSnapshot func(*domain.Session) (string, error)) Model {
-	return newModel(cfg, session, openURL, saveSnapshot, nil, nil)
+	return newModel(cfg, session, openURL, saveSnapshot, nil, nil, nil)
+}
+
+func NewModelWithLinkedTraceOpener(cfg config.Config, session *domain.Session, openURL func(string) error, saveSnapshot func(*domain.Session) (string, error), loadLinked func(context.Context, string, string) (*domain.Session, error)) Model {
+	return newModel(cfg, session, openURL, saveSnapshot, nil, nil, loadLinked)
 }
 
 func NewModelWithDeferredLogs(cfg config.Config, session *domain.Session, openURL func(string) error, saveSnapshot func(*domain.Session) (string, error), loadLogs func(context.Context) ([]domain.LogEntry, error), onLogsReady func(*domain.Session)) Model {
-	return newModel(cfg, session, openURL, saveSnapshot, loadLogs, onLogsReady)
+	return newModel(cfg, session, openURL, saveSnapshot, loadLogs, onLogsReady, nil)
 }
 
-func newModel(cfg config.Config, session *domain.Session, openURL func(string) error, saveSnapshot func(*domain.Session) (string, error), loadLogs func(context.Context) ([]domain.LogEntry, error), onLogsReady func(*domain.Session)) Model {
+func NewModelWithDeferredLogsAndLinkedTraceOpener(cfg config.Config, session *domain.Session, openURL func(string) error, saveSnapshot func(*domain.Session) (string, error), loadLogs func(context.Context) ([]domain.LogEntry, error), onLogsReady func(*domain.Session), loadLinked func(context.Context, string, string) (*domain.Session, error)) Model {
+	return newModel(cfg, session, openURL, saveSnapshot, loadLogs, onLogsReady, loadLinked)
+}
+
+func newModel(cfg config.Config, session *domain.Session, openURL func(string) error, saveSnapshot func(*domain.Session) (string, error), loadLogs func(context.Context) ([]domain.LogEntry, error), onLogsReady func(*domain.Session), loadLinked func(context.Context, string, string) (*domain.Session, error)) Model {
 	m := Model{
 		cfg:              cfg,
 		theme:            cfg.ResolveTheme(),
 		session:          session,
 		openURL:          openURL,
 		saveSnapshot:     saveSnapshot,
+		loadLinked:       loadLinked,
 		loc:              time.Local,
 		programCreatedAt: time.Now(),
 		expanded:         map[string]bool{},
@@ -238,6 +256,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.onLogsReady(m.session)
 		}
 		return m, nil
+	case linkedTraceLoadedMsg:
+		m.loadingLinked = false
+		if msg.err != nil {
+			m.status = fmt.Sprintf("failed to open linked trace %s: %v", msg.traceID, msg.err)
+			return m, nil
+		}
+		if msg.session == nil || msg.session.Trace == nil {
+			m.status = fmt.Sprintf("failed to open linked trace %s: empty session", msg.traceID)
+			return m, nil
+		}
+		next := newModel(m.cfg, msg.session, m.openURL, m.saveSnapshot, nil, nil, m.loadLinked)
+		next.width = m.width
+		next.height = m.height
+		next.status = fmt.Sprintf("opened linked trace %s", msg.traceID)
+		return next, nil
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -374,8 +407,13 @@ func (m Model) updateJSON(key string) (tea.Model, tea.Cmd) {
 	if m.valueView != nil {
 		return m.updateValueView(key)
 	}
+	if key == "@" {
+		cmd := m.openLinkedTraceFromSpanDetails()
+		return m, cmd
+	}
 	if m.isAction("json", "back", key) || m.isAction("global", "back", key) {
 		m.jsonTree = nil
+		m.detailSpanID = ""
 		return m, nil
 	}
 	if m.isAction("json", "up", key) {
@@ -695,11 +733,13 @@ func (m Model) updateTrace(key string) (tea.Model, tea.Cmd) {
 	}
 	if m.isAction("trace", "details", key) {
 		if span := m.currentSpan(); span != nil {
-			m.jsonTree = NewJSONTreeExpandedAll(
-				fmt.Sprintf("span %s (%s)", span.Name, shortID(span.ID)),
-				m.traceDetailRoot(span),
-			)
+			m.openSpanDetails(span, false)
 		}
+	}
+	if key == "@" {
+		cmd := m.openLinkedTraceFromTrace()
+		m.ensureTraceCursorVisible(moveDir)
+		return m, cmd
 	}
 	if m.isAction("trace", "open_external", key) {
 		if m.session.GrafanaURL != "" {
@@ -818,6 +858,7 @@ func (m Model) updateLogs(key string) (tea.Model, tea.Cmd) {
 	if m.isAction("logs", "details", key) {
 		if entry, ok := m.currentLog(); ok {
 			m.jsonTree = NewJSONTreeExpandedAll("log line json", m.logDetailRoot(entry))
+			m.detailSpanID = ""
 		}
 	}
 	if m.isAction("logs", "open_external", key) {
@@ -1635,7 +1676,7 @@ func (m Model) nextPanel(step int) panel {
 }
 
 func (m Model) layout(body string) string {
-	footer := m.mutedStyle().Render(m.status + " | / search | n/N next/prev | gg/G top/bottom | ctrl+f/b page | ctrl+d/u half-page | y yank | V highlight | ? help | esc back")
+	footer := m.mutedStyle().Render(m.status + " | / search | n/N next/prev | gg/G top/bottom | ctrl+f/b page | ctrl+d/u half-page | y yank | @ linked trace | V highlight | ? help | esc back")
 	if m.searchPrompt != nil {
 		footer += "\n" + m.mutedStyle().Render(m.searchPrompt.viewLine()) + "\n" + m.mutedStyle().Render(searchHint())
 	}
@@ -2551,7 +2592,7 @@ func (m Model) helpView() string {
 		}
 		b.WriteString("\n")
 	}
-	b.WriteString("Shortcuts are config-driven (config.json). esc/? close help; tab/shift+tab move sections; gg/G top/bottom; n/N next/prev search; ctrl+f/b page; ctrl+d/u half-page; / search; y yank; shift+v line highlight.")
+	b.WriteString("Shortcuts are config-driven (config.json). esc/? close help; tab/shift+tab move sections; gg/G top/bottom; n/N next/prev search; ctrl+f/b page; ctrl+d/u half-page; / search; y yank; @ open linked trace; shift+v line highlight.")
 	b.WriteString(" Press F2 (or Cmd+, when terminal supports it) for config mode.")
 
 	return m.layout(b.String())
@@ -2672,6 +2713,136 @@ func (m Model) currentSpan() *domain.Span {
 		return nil
 	}
 	return m.session.Trace.SpansByID[line.SpanID]
+}
+
+func (m Model) currentDetailSpan() *domain.Span {
+	if m.detailSpanID == "" || m.session == nil || m.session.Trace == nil {
+		return nil
+	}
+	return m.session.Trace.SpansByID[m.detailSpanID]
+}
+
+func (m *Model) openSpanDetails(span *domain.Span, focusLinks bool) {
+	if span == nil {
+		return
+	}
+	m.jsonTree = NewJSONTreeExpandedAll(
+		fmt.Sprintf("span %s (%s)", span.Name, shortID(span.ID)),
+		m.traceDetailRoot(span),
+	)
+	m.detailSpanID = span.ID
+	if focusLinks {
+		m.focusSpanLinksSection()
+	}
+}
+
+func (m *Model) focusSpanLinksSection() bool {
+	if m.jsonTree == nil {
+		return false
+	}
+	for i, line := range m.jsonTree.lines {
+		if line.Path == "$.links" {
+			m.jsonTree.cursor = i
+			m.jsonTree.ensureCursorVisible(0, m.jsonTree.visibleRows())
+			return true
+		}
+	}
+	return false
+}
+
+func (m Model) selectedSpanLink(span *domain.Span) (*domain.SpanLink, bool) {
+	if m.jsonTree == nil || span == nil || len(span.Links) == 0 {
+		return nil, false
+	}
+	line, ok := m.jsonTree.CurrentLine()
+	if !ok {
+		return nil, false
+	}
+	path := line.Path
+	if !strings.HasPrefix(path, "$.links.") {
+		return nil, false
+	}
+	keyPart := strings.TrimPrefix(path, "$.links.")
+	if keyPart == "" {
+		return nil, false
+	}
+	if dot := strings.Index(keyPart, "."); dot >= 0 {
+		keyPart = keyPart[:dot]
+	}
+	fields := strings.Fields(keyPart)
+	if len(fields) == 0 {
+		return nil, false
+	}
+	ord, err := strconv.Atoi(fields[0])
+	if err != nil || ord < 1 || ord > len(span.Links) {
+		return nil, false
+	}
+	return &span.Links[ord-1], true
+}
+
+func (m *Model) openLinkedTraceFromTrace() tea.Cmd {
+	span := m.currentSpan()
+	if span == nil {
+		m.status = "no span selected"
+		return nil
+	}
+	if len(span.Links) == 0 {
+		m.status = "selected span has no links"
+		return nil
+	}
+	if len(span.Links) == 1 {
+		return m.openLinkedTraceByID(span.Links[0].TraceID)
+	}
+	m.openSpanDetails(span, true)
+	m.status = fmt.Sprintf("span has %d links; select one and press @", len(span.Links))
+	return nil
+}
+
+func (m *Model) openLinkedTraceFromSpanDetails() tea.Cmd {
+	span := m.currentDetailSpan()
+	if span == nil {
+		return nil
+	}
+	if len(span.Links) == 0 {
+		m.status = "selected span has no links"
+		return nil
+	}
+	if len(span.Links) == 1 {
+		return m.openLinkedTraceByID(span.Links[0].TraceID)
+	}
+	if link, ok := m.selectedSpanLink(span); ok {
+		return m.openLinkedTraceByID(link.TraceID)
+	}
+	m.focusSpanLinksSection()
+	m.status = "select a link row and press @"
+	return nil
+}
+
+func (m *Model) openLinkedTraceByID(traceID string) tea.Cmd {
+	traceID = strings.TrimSpace(traceID)
+	if traceID == "" {
+		m.status = "linked trace id is empty"
+		return nil
+	}
+	if m.loadingLinked {
+		m.status = "linked trace load already in progress"
+		return nil
+	}
+	if m.loadLinked == nil {
+		m.status = "linked trace open unavailable"
+		return nil
+	}
+	environment := ""
+	if m.session != nil {
+		environment = strings.TrimSpace(m.session.Environment)
+	}
+	m.loadingLinked = true
+	m.status = fmt.Sprintf("opening linked trace %s...", traceID)
+	loader := m.loadLinked
+	return func() tea.Msg {
+		session, err := loader(context.Background(), environment, traceID)
+		return linkedTraceLoadedMsg{traceID: traceID, session: session, err: err}
+	}
 }
 
 func (m Model) currentLog() (domain.LogEntry, bool) {
