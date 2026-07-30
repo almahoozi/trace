@@ -333,51 +333,6 @@ func (j *JSONTree) ensureCursorVisible(moveDir int, rows int) {
 	clampCursorAndScroll(len(j.lines), rows, &j.cursor, &j.scrollTop, moveDir)
 }
 
-func clampCursorAndScroll(total, rows int, cursor *int, scrollTop *int, moveDir int) {
-	if rows <= 0 {
-		rows = 1
-	}
-	if total <= 0 {
-		*cursor = 0
-		*scrollTop = 0
-		return
-	}
-	if *cursor < 0 {
-		*cursor = 0
-	}
-	if *cursor >= total {
-		*cursor = total - 1
-	}
-	maxTop := max(0, total-rows)
-	if *scrollTop < 0 {
-		*scrollTop = 0
-	}
-	if *scrollTop > maxTop {
-		*scrollTop = maxTop
-	}
-
-	bottom := *scrollTop + rows - 1
-	if moveDir > 0 {
-		if *cursor > bottom {
-			*scrollTop = min(maxTop, *cursor-rows+1)
-		}
-		return
-	}
-	if moveDir < 0 {
-		threshold := *scrollTop + 1
-		if *cursor < threshold {
-			*scrollTop = max(0, *cursor-1)
-		}
-		return
-	}
-	if *cursor < *scrollTop {
-		*scrollTop = *cursor
-	}
-	if *cursor > bottom {
-		*scrollTop = min(maxTop, *cursor-rows+1)
-	}
-}
-
 func treeWindowFromTop(total, scrollTop, visible int) (int, int) {
 	if visible < 1 {
 		visible = 1
