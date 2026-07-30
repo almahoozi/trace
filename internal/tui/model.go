@@ -2961,6 +2961,10 @@ var (
 	tableRowBandStyleA  = lipgloss.NewStyle().Background(lipgloss.Color("234"))
 	tableRowBandStyleB  = lipgloss.NewStyle().Background(lipgloss.Color("235"))
 	tableRowCursorStyle = lipgloss.NewStyle().Background(lipgloss.Color("238"))
+	tableRowVisualStyle = lipgloss.NewStyle().Background(lipgloss.Color("236"))
+	tableRowCursorVisualStyle = lipgloss.NewStyle().
+		Background(lipgloss.Color("31")).
+		Foreground(lipgloss.Color("230"))
 
 	summaryBrightStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
 	summaryGrayStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
