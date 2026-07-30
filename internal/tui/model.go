@@ -98,6 +98,8 @@ type Model struct {
 
 	status string
 
+	openedSessions []*domain.Session
+
 	programCreatedAt  time.Time
 	firstVisualLogged bool
 	loadLogs          func(context.Context) ([]domain.LogEntry, error)
@@ -166,6 +168,9 @@ func newModel(cfg config.Config, session *domain.Session, openURL func(string) e
 		status:           fmt.Sprintf("env=%s spans=%d logs=%d", session.Environment, len(session.Trace.Spans), len(session.Logs)),
 		loadLogs:         loadLogs,
 		onLogsReady:      onLogsReady,
+	}
+	if session != nil {
+		m.openedSessions = []*domain.Session{session}
 	}
 	applyThemeStyles(m.theme)
 	if loc, err := cfg.DisplayLocation(); err == nil {
@@ -266,10 +271,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = fmt.Sprintf("failed to open linked trace %s: empty session", msg.traceID)
 			return m, nil
 		}
+		snapshotErr := error(nil)
+		if m.saveSnapshot != nil {
+			_, snapshotErr = m.saveSnapshot(msg.session)
+			if snapshotErr != nil {
+				runlog.Warn("snapshot save after linked trace open failed", "error", snapshotErr, "trace_id", msg.traceID)
+			}
+		}
 		next := newModel(m.cfg, msg.session, m.openURL, m.saveSnapshot, nil, nil, m.loadLinked)
+		next.openedSessions = append(m.OpenedSessions(), msg.session)
 		next.width = m.width
 		next.height = m.height
-		next.status = fmt.Sprintf("opened linked trace %s", msg.traceID)
+		if snapshotErr != nil {
+			next.status = fmt.Sprintf("opened linked trace %s (cache warning: %v)", msg.traceID, snapshotErr)
+		} else {
+			next.status = fmt.Sprintf("opened linked trace %s", msg.traceID)
+		}
 		return next, nil
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -2850,6 +2867,23 @@ func (m Model) currentLog() (domain.LogEntry, bool) {
 		return domain.LogEntry{}, false
 	}
 	return m.filteredLogs[m.logCursor], true
+}
+
+func (m Model) Session() *domain.Session {
+	return m.session
+}
+
+func (m Model) OpenedSessions() []*domain.Session {
+	if len(m.openedSessions) == 0 {
+		return nil
+	}
+	out := make([]*domain.Session, 0, len(m.openedSessions))
+	for _, session := range m.openedSessions {
+		if session != nil {
+			out = append(out, session)
+		}
+	}
+	return out
 }
 
 func (m *Model) copyCurrentJSONScalarAsQuery() bool {
