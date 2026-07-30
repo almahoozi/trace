@@ -46,6 +46,7 @@ func main() {
 	flag.StringVar(&configPath, "config", "", "config file path (defaults to platform config dir)")
 	flag.Parse()
 	args := flag.Args()
+	exportMessage := ""
 
 	if len(args) >= 1 && args[0] == "logs" {
 		if len(args) > 1 {
@@ -189,7 +190,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 				os.Exit(1)
 			}
-			payload, err := config.ExportNonDefault(cfg)
+			payload, err := config.ExportNonDefaultWithMessage(cfg, exportMessage)
 			if err != nil {
 				runlog.Error("failed to export config", "error", err, "config_path", cfg.Path)
 				fmt.Fprintf(os.Stderr, "failed to export config: %v\n", err)
@@ -239,8 +240,16 @@ func main() {
 				fmt.Fprintf(os.Stderr, "failed to diff config patch: %v\n", err)
 				os.Exit(1)
 			}
+			message, err := config.ImportMessage(data)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to parse import metadata: %v\n", err)
+				os.Exit(1)
+			}
 			if len(changes) == 0 {
 				fmt.Fprintf(os.Stdout, "no config changes in %s\n", inPath)
+				if message != "" {
+					fmt.Fprintln(os.Stdout, message)
+				}
 				return
 			}
 			if !forceFetch {
@@ -265,6 +274,9 @@ func main() {
 			}
 			runlog.Info("imported config patch", "config_path", updated.Path, "import_path", inPath, "bytes", len(data))
 			fmt.Fprintf(os.Stdout, "imported config patch from %s\n", inPath)
+			if message != "" {
+				fmt.Fprintln(os.Stdout, message)
+			}
 			return
 		}
 		if len(args) >= 2 && args[1] == "diff" {
@@ -771,7 +783,7 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "       %s [--config path] caches clear\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config edit\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "       %s [--config path] config export [file]\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--config path] config export [-m|--message <text>] [file]\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config import <file>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config diff <file>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] logs\n", os.Args[0])
