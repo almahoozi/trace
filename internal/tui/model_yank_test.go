@@ -208,3 +208,19 @@ func TestBuildQueryCommandFromJSONScalar_RecentUsesSinceFlag(t *testing.T) {
 		t.Fatalf("expected recent query command not to include -t range, got %q", cmd)
 	}
 }
+
+func TestQualifyQueryFieldForScalar_SpanAttributesGetSpanPrefix(t *testing.T) {
+	line := jsonLine{Path: "$.attributes.ctx.ip", Key: "ctx.ip"}
+	got := qualifyQueryFieldForScalar(line, "ctx.ip")
+	if got != "span.ctx.ip" {
+		t.Fatalf("expected span-prefixed field, got %q", got)
+	}
+}
+
+func TestQualifyQueryFieldForScalar_KeepsExistingSpanPrefix(t *testing.T) {
+	line := jsonLine{Path: "$.attributes.http.method", Key: "http.method"}
+	got := qualifyQueryFieldForScalar(line, "span.http.method")
+	if got != "span.http.method" {
+		t.Fatalf("expected existing span prefix to be preserved, got %q", got)
+	}
+}

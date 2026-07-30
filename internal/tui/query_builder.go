@@ -58,6 +58,7 @@ type queryBuilder struct {
 	rowForm          *huh.Form
 	rowField         string
 	rowOp            string
+	rowType          string
 	rowValue         string
 	rowCustom        string
 	rowFiltering     bool
@@ -82,6 +83,16 @@ type queryBuilder struct {
 }
 
 const customFieldOptionValue = "__custom_field__"
+
+var queryValueTypes = []string{
+	string(traceql.ValueTypeAuto),
+	string(traceql.ValueTypeString),
+	string(traceql.ValueTypeInt),
+	string(traceql.ValueTypeFloat),
+	string(traceql.ValueTypeBool),
+	string(traceql.ValueTypeDuration),
+	string(traceql.ValueTypeEnum),
+}
 
 const (
 	timeModeSince = "since"
@@ -109,10 +120,10 @@ func newQueryBuilder(query string, fields, environments []string, activeEnv stri
 	for _, clause := range clauses {
 		field, op, value, ok := parseClause(clause)
 		if !ok {
-			rows = append(rows, queryRow{Field: "name", Operator: "=", Value: strings.TrimSpace(clause)})
+			rows = append(rows, queryRow{Field: "name", Operator: "=", Value: strings.TrimSpace(clause), Type: string(traceql.ValueTypeAuto)})
 			continue
 		}
-		rows = append(rows, queryRow{Field: field, Operator: op, Value: strings.TrimSpace(value)})
+		rows = append(rows, queryRow{Field: field, Operator: op, Value: strings.TrimSpace(value), Type: string(traceql.ValueTypeAuto)})
 	}
 
 	availableFields := append([]string{}, defaultQueryFields...)
@@ -651,14 +662,14 @@ func (b *queryBuilder) View(width int) string {
 		mutedStyle.Render("end"), titleStyle.Render(defaultText(b.endRaw, "-")),
 	))
 	lines = append(lines, "")
-	lines = append(lines, "idx | field                  | op  | value")
-	lines = append(lines, "----+------------------------+-----+-------------------------")
+	lines = append(lines, "idx | field                  | op  | type     | value")
+	lines = append(lines, "----+------------------------+-----+----------+-------------------")
 	for i, row := range b.rows {
 		prefix := " "
 		if !b.tableDisabled && b.row == i {
 			prefix = ">"
 		}
-		line := fmt.Sprintf("%s%3d | %-22s | %-3s | %s", prefix, i+1, truncate(defaultText(strings.TrimSpace(row.Field), "name"), 22), truncate(defaultText(strings.TrimSpace(row.Operator), "="), 3), truncate(row.Value, max(20, width-40)))
+		line := fmt.Sprintf("%s%3d | %-22s | %-3s | %-8s | %s", prefix, i+1, truncate(defaultText(strings.TrimSpace(row.Field), "name"), 22), truncate(defaultText(strings.TrimSpace(row.Operator), "="), 3), truncate(normalizeQueryValueType(row.Type), 8), truncate(row.Value, max(16, width-50)))
 		if b.tableDisabled {
 			line = mutedStyle.Render(line)
 		}
@@ -668,7 +679,7 @@ func (b *queryBuilder) View(width int) string {
 	if !b.tableDisabled && b.row == len(b.rows) {
 		newPrefix = ">"
 	}
-	newRowLine := fmt.Sprintf("%s -- | %-22s | %-3s | %s", newPrefix, "(new row)", "=", "press e or enter")
+	newRowLine := fmt.Sprintf("%s -- | %-22s | %-3s | %-8s | %s", newPrefix, "(new row)", "=", "auto", "press e or enter")
 	if b.tableDisabled {
 		newRowLine = mutedStyle.Render(newRowLine)
 	}
@@ -721,6 +732,7 @@ func (b *queryBuilder) startRowForm() {
 	}
 	b.rowField = defaultText(strings.TrimSpace(current.Field), "name")
 	b.rowOp = defaultText(strings.TrimSpace(current.Operator), "=")
+	b.rowType = normalizeQueryValueType(current.Type)
 	b.rowValue = strings.TrimSpace(current.Value)
 	b.rowCustom = ""
 
@@ -819,6 +831,12 @@ func (b *queryBuilder) buildRowForm(fieldOptions []huh.Option[string], opOptions
 				}
 			}
 			return fmt.Errorf("unsupported operator")
+		}),
+		huh.NewSelect[string]().Title("Value type").Description("auto keeps current behavior; enum keeps value unquoted").Filtering(false).Options(queryValueTypeOptions()...).Value(&b.rowType).Validate(func(v string) error {
+			if !isSupportedQueryValueType(v) {
+				return fmt.Errorf("unsupported value type")
+			}
+			return nil
 		}),
 		huh.NewInput().Title("Value").Value(&b.rowValue),
 	)
@@ -932,6 +950,7 @@ func (b *queryBuilder) applyRowFormValues() {
 		resolvedField = strings.TrimSpace(b.rowCustom)
 	}
 	row := queryRow{Field: resolvedField, Operator: strings.TrimSpace(b.rowOp), Value: strings.TrimSpace(b.rowValue)}
+	row.Type = normalizeQueryValueType(b.rowType)
 	if row.Field == "" {
 		row.Field = "name"
 	}
@@ -997,8 +1016,8 @@ func (b *queryBuilder) startGlobalRangeForm() {
 	b.globalFiltering = false
 }
 
-func (b *queryBuilder) toClauses() []string {
-	clauses := make([]string, 0, len(b.rows))
+func (b *queryBuilder) toClauses() []traceql.TypedClause {
+	clauses := make([]traceql.TypedClause, 0, len(b.rows))
 	for _, row := range b.rows {
 		field := strings.TrimSpace(row.Field)
 		op := strings.TrimSpace(row.Operator)
@@ -1009,7 +1028,7 @@ func (b *queryBuilder) toClauses() []string {
 		if value == "" {
 			value = `""`
 		}
-		clauses = append(clauses, field+op+value)
+		clauses = append(clauses, traceql.TypedClause{Field: field, Op: op, Value: value, Type: traceql.ValueType(normalizeQueryValueType(row.Type))})
 	}
 	return clauses
 }
@@ -1017,7 +1036,7 @@ func (b *queryBuilder) toClauses() []string {
 func (b *queryBuilder) snapshotResult() queryBuilderResult {
 	query := strings.TrimSpace(b.queryText)
 	if query == "" {
-		query = traceql.CompileClauses(b.toClauses())
+		query = traceql.CompileTypedClauses(b.toClauses())
 	}
 	res := queryBuilderResult{
 		Query:       query,
@@ -1212,7 +1231,7 @@ func parsePositiveIntOrFallback(raw string, fallback int) int {
 }
 
 func (b *queryBuilder) syncQueryTextFromRows() {
-	b.queryText = traceql.CompileClauses(b.toClauses())
+	b.queryText = traceql.CompileTypedClauses(b.toClauses())
 	b.queryCursor = len([]rune(b.queryText))
 }
 
@@ -1222,10 +1241,10 @@ func (b *queryBuilder) syncRowsFromQueryText() {
 	for _, clause := range clauses {
 		field, op, value, ok := parseClause(clause)
 		if !ok {
-			rows = append(rows, queryRow{Field: "name", Operator: "=", Value: strings.TrimSpace(clause)})
+			rows = append(rows, queryRow{Field: "name", Operator: "=", Value: strings.TrimSpace(clause), Type: string(traceql.ValueTypeAuto)})
 			continue
 		}
-		rows = append(rows, queryRow{Field: field, Operator: op, Value: strings.TrimSpace(value)})
+		rows = append(rows, queryRow{Field: field, Operator: op, Value: strings.TrimSpace(value), Type: string(traceql.ValueTypeAuto)})
 	}
 	b.rows = rows
 	if b.row > len(b.rows)+2 {
@@ -1978,7 +1997,49 @@ func (b *queryBuilder) moveRow(direction int) {
 type queryRow struct {
 	Field    string
 	Operator string
+	Type     string
 	Value    string
+}
+
+func queryValueTypeOptions() []huh.Option[string] {
+	options := make([]huh.Option[string], 0, len(queryValueTypes))
+	for _, valueType := range queryValueTypes {
+		description := ""
+		switch valueType {
+		case string(traceql.ValueTypeAuto):
+			description = "existing smart quoting"
+		case string(traceql.ValueTypeString):
+			description = "always quoted"
+		case string(traceql.ValueTypeEnum):
+			description = "left unquoted"
+		}
+		label := valueType
+		if description != "" {
+			label = fmt.Sprintf("%s - %s", valueType, description)
+		}
+		options = append(options, huh.NewOption(label, valueType))
+	}
+	return options
+}
+
+func isSupportedQueryValueType(raw string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(raw))
+	for _, valueType := range queryValueTypes {
+		if normalized == valueType {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeQueryValueType(raw string) string {
+	trimmed := strings.ToLower(strings.TrimSpace(raw))
+	for _, valueType := range queryValueTypes {
+		if trimmed == valueType {
+			return valueType
+		}
+	}
+	return string(traceql.ValueTypeAuto)
 }
 
 type timeframeOption struct {

@@ -2908,6 +2908,7 @@ func (m *Model) copyCurrentJSONScalarAsQueryWithWindowMode(useRecentSince bool) 
 		return false
 	}
 	field := sanitizeQueryField(line)
+	field = qualifyQueryFieldForScalar(line, field)
 	if field == "" {
 		m.status = "query copy requires an attribute-like key"
 		return false
@@ -2935,6 +2936,22 @@ func sanitizeQueryField(line jsonLine) string {
 		return ""
 	}
 	return field
+}
+
+func qualifyQueryFieldForScalar(line jsonLine, field string) string {
+	trimmed := strings.TrimSpace(field)
+	if trimmed == "" {
+		return ""
+	}
+	if isSpanAttributePath(line.Path) && !strings.HasPrefix(trimmed, "span.") {
+		return "span." + trimmed
+	}
+	return trimmed
+}
+
+func isSpanAttributePath(path string) bool {
+	trimmed := strings.TrimSpace(path)
+	return strings.HasPrefix(trimmed, "$.attributes.")
 }
 
 func lastPathToken(path string) string {
