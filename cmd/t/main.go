@@ -473,20 +473,15 @@ func main() {
 			}
 			return
 		}
-		program := tea.NewProgram(tui.NewModel(cfg, session, platform.OpenURL, defaultSnapshotSaver), tea.WithAltScreen())
-		if _, err := program.Run(); err != nil {
+		linkedLoader := makeLinkedTraceLoader(cfg, nil, session.Environment, !forceFetch)
+		program := tea.NewProgram(tui.NewModelWithLinkedTraceOpener(cfg, session, platform.OpenURL, defaultSnapshotSaver, linkedLoader), tea.WithAltScreen())
+		finalModel, err := program.Run()
+		if err != nil {
 			runlog.Error("trace tui failed for snapshot", "error", err)
 			fmt.Fprintf(os.Stderr, "tui failed: %v\n", err)
 			os.Exit(1)
 		}
-		summary, err := app.RenderTraceSummaryWithColor(cfg, session, shouldColorizeStdout())
-		if err != nil {
-			runlog.Warn("trace summary render warning", "error", err)
-			fmt.Fprintf(os.Stderr, "trace summary warning: %v\n", err)
-		}
-		if strings.TrimSpace(summary) != "" {
-			fmt.Fprintln(os.Stdout, summary)
-		}
+		renderSummariesForTUIModel(cfg, finalModel, session)
 		return
 	}
 	if len(args) == 0 {
@@ -537,20 +532,15 @@ func main() {
 				}
 				return
 			}
-			program := tea.NewProgram(tui.NewModel(cfg, session, platform.OpenURL, defaultSnapshotSaver), tea.WithAltScreen())
-			if _, err := program.Run(); err != nil {
+			linkedLoader := makeLinkedTraceLoader(cfg, nil, session.Environment, !forceFetch)
+			program := tea.NewProgram(tui.NewModelWithLinkedTraceOpener(cfg, session, platform.OpenURL, defaultSnapshotSaver, linkedLoader), tea.WithAltScreen())
+			finalModel, err := program.Run()
+			if err != nil {
 				runlog.Error("trace tui failed", "error", err)
 				fmt.Fprintf(os.Stderr, "tui failed: %v\n", err)
 				os.Exit(1)
 			}
-			summary, err := app.RenderTraceSummaryWithColor(cfg, session, shouldColorizeStdout())
-			if err != nil {
-				runlog.Warn("trace summary render warning", "error", err)
-				fmt.Fprintf(os.Stderr, "trace summary warning: %v\n", err)
-			}
-			if strings.TrimSpace(summary) != "" {
-				fmt.Fprintln(os.Stdout, summary)
-			}
+			renderSummariesForTUIModel(cfg, finalModel, session)
 			return
 		}
 	}
@@ -836,30 +826,15 @@ func main() {
 			cancel()
 			status.Stop()
 
-			program := tea.NewProgram(tui.NewModelWithDeferredLogsAndLinkedTraceOpener(cfg, session, platform.OpenURL, defaultSnapshotSaver, logsLoader, logsReady, func(ctx context.Context, environment, linkedTraceID string) (*domain.Session, error) {
-				env := strings.TrimSpace(environment)
-				if env == "" {
-					env = strings.TrimSpace(session.Environment)
-				}
-				if env == "" {
-					return fetcher.FetchTraceSession(ctx, cfg, linkedTraceID)
-				}
-				return fetcher.FetchTraceSessionInEnvironment(ctx, cfg, env, linkedTraceID)
-			}), tea.WithAltScreen())
-			if _, err := program.Run(); err != nil {
+			linkedLoader := makeLinkedTraceLoader(cfg, fetcher, session.Environment, !forceFetch)
+			program := tea.NewProgram(tui.NewModelWithDeferredLogsAndLinkedTraceOpener(cfg, session, platform.OpenURL, defaultSnapshotSaver, logsLoader, logsReady, linkedLoader), tea.WithAltScreen())
+			finalModel, err := program.Run()
+			if err != nil {
 				runlog.Error("trace tui failed", "error", err)
 				fmt.Fprintf(os.Stderr, "tui failed: %v\n", err)
 				os.Exit(1)
 			}
-
-			summary, err := app.RenderTraceSummaryWithColor(cfg, session, shouldColorizeStdout())
-			if err != nil {
-				runlog.Warn("trace summary render warning", "error", err)
-				fmt.Fprintf(os.Stderr, "trace summary warning: %v\n", err)
-			}
-			if strings.TrimSpace(summary) != "" {
-				fmt.Fprintln(os.Stdout, summary)
-			}
+			renderSummariesForTUIModel(cfg, finalModel, session)
 			return
 		}
 	} else {
@@ -929,30 +904,99 @@ func main() {
 		}
 	}
 
-	program := tea.NewProgram(tui.NewModelWithDeferredLogsAndLinkedTraceOpener(cfg, session, platform.OpenURL, defaultSnapshotSaver, logsLoader, logsReady, func(ctx context.Context, environment, linkedTraceID string) (*domain.Session, error) {
-		env := strings.TrimSpace(environment)
-		if env == "" {
-			env = strings.TrimSpace(session.Environment)
-		}
-		if env == "" {
-			return fetcher.FetchTraceSession(ctx, cfg, linkedTraceID)
-		}
-		return fetcher.FetchTraceSessionInEnvironment(ctx, cfg, env, linkedTraceID)
-	}), tea.WithAltScreen())
-	if _, err := program.Run(); err != nil {
+	linkedLoader := makeLinkedTraceLoader(cfg, fetcher, session.Environment, !forceFetch)
+	program := tea.NewProgram(tui.NewModelWithDeferredLogsAndLinkedTraceOpener(cfg, session, platform.OpenURL, defaultSnapshotSaver, logsLoader, logsReady, linkedLoader), tea.WithAltScreen())
+	finalModel, err := program.Run()
+	if err != nil {
 		runlog.Error("trace tui failed", "error", err)
 		fmt.Fprintf(os.Stderr, "tui failed: %v\n", err)
 		os.Exit(1)
 	}
+	renderSummariesForTUIModel(cfg, finalModel, session)
+}
 
-	summary, err := app.RenderTraceSummaryWithColor(cfg, session, shouldColorizeStdout())
-	if err != nil {
-		runlog.Warn("trace summary render warning", "error", err)
-		fmt.Fprintf(os.Stderr, "trace summary warning: %v\n", err)
+func makeLinkedTraceLoader(cfg config.Config, fetcher *app.Fetcher, defaultEnvironment string, allowCache bool) func(context.Context, string, string) (*domain.Session, error) {
+	defaultEnvironment = strings.TrimSpace(defaultEnvironment)
+	var (
+		once    sync.Once
+		lazy    *app.Fetcher
+		lazyErr error
+	)
+	return func(ctx context.Context, environment, traceID string) (*domain.Session, error) {
+		traceID = strings.TrimSpace(traceID)
+		if traceID == "" {
+			return nil, fmt.Errorf("linked trace id is empty")
+		}
+
+		env := strings.TrimSpace(environment)
+		if env == "" {
+			env = defaultEnvironment
+		}
+		if allowCache {
+			if cached, snapshotPath, ok := loadSnapshotSession(traceID, env, env != ""); ok {
+				runlog.Info("loaded linked trace session from snapshot cache", "trace_id", traceID, "environment", env, "snapshot_path", snapshotPath)
+				return cached, nil
+			}
+		}
+
+		resolver := fetcher
+		if resolver == nil {
+			once.Do(func() {
+				if strings.TrimSpace(cfg.Grafana.BaseURL) == "" {
+					lazyErr = fmt.Errorf("grafana base_url is not configured")
+					return
+				}
+				token, err := secrets.NewStore(cfg).LoadToken(cfg)
+				if err != nil {
+					lazyErr = fmt.Errorf("grafana token is not configured: %w", err)
+					return
+				}
+				httpClient := grafana.NewHTTPClient(cfg.Grafana.Timeout())
+				lazy = app.NewFetcher(grafana.NewClient(cfg.Grafana.BaseURL, token, httpClient))
+			})
+			if lazyErr != nil {
+				return nil, lazyErr
+			}
+			resolver = lazy
+		}
+
+		timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.Grafana.TimeoutSeconds+10)*time.Second)
+		defer cancel()
+		if env == "" {
+			return resolver.FetchTraceSession(timeoutCtx, cfg, traceID)
+		}
+		return resolver.FetchTraceSessionInEnvironment(timeoutCtx, cfg, env, traceID)
 	}
-	if strings.TrimSpace(summary) != "" {
-		fmt.Fprintln(os.Stdout, summary)
+}
+
+func renderSummariesForTUIModel(cfg config.Config, finalModel tea.Model, fallback *domain.Session) {
+	sessions := sessionsForSummary(finalModel, fallback)
+	for _, session := range sessions {
+		summary, err := app.RenderTraceSummaryWithColor(cfg, session, shouldColorizeStdout())
+		if err != nil {
+			runlog.Warn("trace summary render warning", "error", err)
+			fmt.Fprintf(os.Stderr, "trace summary warning: %v\n", err)
+		}
+		if strings.TrimSpace(summary) != "" {
+			fmt.Fprintln(os.Stdout, summary)
+		}
 	}
+}
+
+func sessionsForSummary(finalModel tea.Model, fallback *domain.Session) []*domain.Session {
+	if model, ok := finalModel.(tui.Model); ok {
+		sessions := model.OpenedSessions()
+		if len(sessions) > 0 {
+			return sessions
+		}
+		if session := model.Session(); session != nil {
+			return []*domain.Session{session}
+		}
+	}
+	if fallback != nil {
+		return []*domain.Session{fallback}
+	}
+	return nil
 }
 
 type cliMode struct {

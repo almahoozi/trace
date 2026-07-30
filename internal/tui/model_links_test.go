@@ -63,6 +63,16 @@ func TestAtKeyFromTraceOpensSingleLinkedTrace(t *testing.T) {
 	if opened.session.Trace.TraceID != span.Links[0].TraceID {
 		t.Fatalf("expected opened trace id %q, got %q", span.Links[0].TraceID, opened.session.Trace.TraceID)
 	}
+	sessions := opened.OpenedSessions()
+	if len(sessions) != 2 {
+		t.Fatalf("expected 2 opened sessions, got %d", len(sessions))
+	}
+	if sessions[0] == nil || sessions[0].Trace == nil || sessions[0].Trace.TraceID != session.Trace.TraceID {
+		t.Fatalf("expected first opened session to be original trace %q", session.Trace.TraceID)
+	}
+	if sessions[1] == nil || sessions[1].Trace == nil || sessions[1].Trace.TraceID != span.Links[0].TraceID {
+		t.Fatalf("expected second opened session to be linked trace %q", span.Links[0].TraceID)
+	}
 }
 
 func TestAtKeyFromTraceWithMultipleLinksOpensDetailsAtLinks(t *testing.T) {
@@ -146,6 +156,53 @@ func TestAtKeyFromSpanDetailsOpensSelectedLink(t *testing.T) {
 	_ = cmd()
 	if gotTraceID != span.Links[1].TraceID {
 		t.Fatalf("expected selected link trace id %q, got %q", span.Links[1].TraceID, gotTraceID)
+	}
+}
+
+func TestLinkedTraceLoadSavesSnapshot(t *testing.T) {
+	span := &domain.Span{
+		ID:       "span-a",
+		Service:  "svc-a",
+		Name:     "op-a",
+		Kind:     "server",
+		Duration: time.Millisecond,
+		Links: []domain.SpanLink{
+			{TraceID: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", SpanID: "span-b"},
+		},
+	}
+	base := testSessionWithSpan("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "prod", span)
+	linked := testSessionWithSpan(span.Links[0].TraceID, "prod", &domain.Span{ID: "linked-root", Service: "svc-b", Name: "op-b", Kind: "server", Duration: time.Millisecond})
+
+	saveCalls := 0
+	saveSnapshot := func(session *domain.Session) (string, error) {
+		saveCalls++
+		if session == nil || session.Trace == nil {
+			t.Fatalf("expected non-nil session for snapshot save")
+		}
+		return "/tmp/trace.json", nil
+	}
+	loader := func(ctx context.Context, environment, traceID string) (*domain.Session, error) {
+		return linked, nil
+	}
+
+	m := NewModelWithLinkedTraceOpener(config.DefaultConfig(), base, nil, saveSnapshot, loader)
+	updated, cmd := m.updateTrace("@")
+	next := updated.(Model)
+	if cmd == nil {
+		t.Fatalf("expected linked trace loader command")
+	}
+	msg := cmd()
+	loaded, ok := msg.(linkedTraceLoadedMsg)
+	if !ok {
+		t.Fatalf("expected linkedTraceLoadedMsg, got %T", msg)
+	}
+	updated, _ = next.Update(loaded)
+	opened := updated.(Model)
+	if opened.session == nil || opened.session.Trace == nil {
+		t.Fatalf("expected opened session")
+	}
+	if saveCalls != 1 {
+		t.Fatalf("expected snapshot saver to be called once, got %d", saveCalls)
 	}
 }
 
