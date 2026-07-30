@@ -30,7 +30,7 @@ func RenderTraceSummaryWithColor(cfg config.Config, session *domain.Session, col
 	}
 
 	data := traceSummaryData(cfg, session)
-	summary, err := renderSummaryTemplate(templateText, data, color)
+	summary, err := renderSummaryTemplate(cfg, templateText, data, color)
 	if err == nil {
 		return strings.TrimSpace(summary), nil
 	}
@@ -40,15 +40,15 @@ func RenderTraceSummaryWithColor(cfg config.Config, session *domain.Session, col
 		return "", fmt.Errorf("render default summary template: %w", err)
 	}
 
-	fallbackSummary, fallbackErr := renderSummaryTemplate(defaultTemplate, data, color)
+	fallbackSummary, fallbackErr := renderSummaryTemplate(cfg, defaultTemplate, data, color)
 	if fallbackErr != nil {
 		return "", fmt.Errorf("render configured summary template: %w; fallback template failed: %v", err, fallbackErr)
 	}
 	return strings.TrimSpace(fallbackSummary), fmt.Errorf("render configured summary template: %w; printed default summary instead", err)
 }
 
-func renderSummaryTemplate(templateText string, data map[string]any, color bool) (string, error) {
-	tmpl, err := template.New("trace-summary").Funcs(summaryTemplateFuncs(color)).Option("missingkey=error").Parse(templateText)
+func renderSummaryTemplate(cfg config.Config, templateText string, data map[string]any, color bool) (string, error) {
+	tmpl, err := template.New("trace-summary").Funcs(summaryTemplateFuncs(cfg, color)).Option("missingkey=error").Parse(templateText)
 	if err != nil {
 		return "", err
 	}
@@ -114,32 +114,41 @@ func traceSummaryData(cfg config.Config, session *domain.Session) map[string]any
 	}
 }
 
-func summaryTemplateFuncs(color bool) template.FuncMap {
+func summaryTemplateFuncs(cfg config.Config, color bool) template.FuncMap {
+	theme := cfg.ResolveTheme()
 	wrap := func(code string) func(string) string {
 		return func(v string) string {
 			if !color || v == "" {
 				return v
 			}
-			return "\x1b[" + code + "m" + v + "\x1b[0m"
+			ansiCode := config.ANSIColorCode(code, "")
+			if ansiCode == "" {
+				return v
+			}
+			return "\x1b[" + ansiCode + "m" + v + "\x1b[0m"
 		}
 	}
 
 	return template.FuncMap{
-		"gray":              wrap("90"),
-		"light":             wrap("37"),
-		"bright":            wrap("97"),
-		"red":               wrap("31"),
-		"duration_color":    durationColor(color),
-		"http_status_color": httpStatusColor(color),
+		"gray":              wrap(theme.ColorFor(config.ThemeColorANSISummaryGray, "90")),
+		"light":             wrap(theme.ColorFor(config.ThemeColorANSISummaryLight, "37")),
+		"bright":            wrap(theme.ColorFor(config.ThemeColorANSISummaryBright, "97")),
+		"red":               wrap(theme.ColorFor(config.ThemeColorANSISummaryRed, "31")),
+		"duration_color":    durationColor(theme, color),
+		"http_status_color": httpStatusColor(theme, color),
 	}
 }
 
-func durationColor(color bool) func(any, string) string {
+func durationColor(theme config.ResolvedTheme, color bool) func(any, string) string {
 	paint := func(code, value string) string {
 		if !color || value == "" {
 			return value
 		}
-		return "\x1b[" + code + "m" + value + "\x1b[0m"
+		ansiCode := config.ANSIColorCode(code, "")
+		if ansiCode == "" {
+			return value
+		}
+		return "\x1b[" + ansiCode + "m" + value + "\x1b[0m"
 	}
 
 	return func(rawDuration any, rendered string) string {
@@ -150,42 +159,46 @@ func durationColor(color bool) func(any, string) string {
 
 		switch {
 		case duration < 100*time.Millisecond:
-			return paint("32", rendered)
+			return paint(theme.ColorFor(config.ThemeColorANSIDurationFast, "32"), rendered)
 		case duration < time.Second:
-			return paint("97", rendered)
+			return paint(theme.ColorFor(config.ThemeColorANSIDurationNormal, "97"), rendered)
 		case duration < 3*time.Second:
-			return paint("33", rendered)
+			return paint(theme.ColorFor(config.ThemeColorANSIDurationSlow, "33"), rendered)
 		default:
-			return paint("31", rendered)
+			return paint(theme.ColorFor(config.ThemeColorANSIDurationVerySlow, "31"), rendered)
 		}
 	}
 }
 
-func httpStatusColor(color bool) func(any, string) string {
+func httpStatusColor(theme config.ResolvedTheme, color bool) func(any, string) string {
 	paint := func(code, value string) string {
 		if !color || value == "" {
 			return value
 		}
-		return "\x1b[" + code + "m" + value + "\x1b[0m"
+		ansiCode := config.ANSIColorCode(code, "")
+		if ansiCode == "" {
+			return value
+		}
+		return "\x1b[" + ansiCode + "m" + value + "\x1b[0m"
 	}
 
 	return func(rawStatus any, rendered string) string {
 		statusCode, ok := parseHTTPStatusCode(rawStatus)
 		if !ok {
-			return paint("97", rendered)
+			return paint(theme.ColorFor(config.ThemeColorANSIHTTPDefault, "97"), rendered)
 		}
 
 		switch statusCode / 100 {
 		case 2:
-			return paint("32", rendered)
+			return paint(theme.ColorFor(config.ThemeColorANSIHTTPSuccess, "32"), rendered)
 		case 3:
-			return paint("34", rendered)
+			return paint(theme.ColorFor(config.ThemeColorANSIHTTPRedirect, "34"), rendered)
 		case 4:
-			return paint("33", rendered)
+			return paint(theme.ColorFor(config.ThemeColorANSIHTTPClientError, "33"), rendered)
 		case 5:
-			return paint("31", rendered)
+			return paint(theme.ColorFor(config.ThemeColorANSIHTTPServerError, "31"), rendered)
 		default:
-			return paint("97", rendered)
+			return paint(theme.ColorFor(config.ThemeColorANSIHTTPDefault, "97"), rendered)
 		}
 	}
 }

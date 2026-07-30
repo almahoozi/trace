@@ -16,6 +16,11 @@ type ImportChange struct {
 
 const importMessageKey = "message"
 
+var configOverlayExcludedKeys = map[string]struct{}{
+	"theme":  {},
+	"themes": {},
+}
+
 func ExportNonDefault(cfg Config) ([]byte, error) {
 	return ExportNonDefaultWithMessage(cfg, "")
 }
@@ -25,10 +30,12 @@ func ExportNonDefaultWithMessage(cfg Config, message string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	removeExcludedConfigOverlayKeys(current)
 	defaults, err := configToJSONMap(DefaultConfig())
 	if err != nil {
 		return nil, err
 	}
+	removeExcludedConfigOverlayKeys(defaults)
 
 	patchAny, ok := diffAny(defaults, current)
 	patch := map[string]any{}
@@ -64,6 +71,7 @@ func ApplyImport(cfg Config, data []byte) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	removeExcludedConfigOverlayKeys(current)
 	merged := mergeMaps(current, overlay)
 
 	buf, err := json.Marshal(merged)
@@ -90,6 +98,7 @@ func DiffImport(cfg Config, data []byte) ([]ImportChange, error) {
 	if err != nil {
 		return nil, err
 	}
+	removeExcludedConfigOverlayKeys(current)
 	merged := mergeMaps(current, overlay)
 	changes := make([]ImportChange, 0)
 	collectChanges("", current, merged, &changes)
@@ -124,7 +133,17 @@ func parseOverlay(data []byte) (map[string]any, string, error) {
 		}
 		delete(overlay, importMessageKey)
 	}
+	removeExcludedConfigOverlayKeys(overlay)
 	return overlay, message, nil
+}
+
+func removeExcludedConfigOverlayKeys(m map[string]any) {
+	if m == nil {
+		return
+	}
+	for key := range configOverlayExcludedKeys {
+		delete(m, key)
+	}
 }
 
 func configToJSONMap(cfg Config) (map[string]any, error) {
