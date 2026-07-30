@@ -90,7 +90,7 @@ func NewBrowseModel(cfg config.Config, envName, query string, openQueryBuilder b
 	b.items = filterTraceItemsByWindow(items, b.querySince, b.queryStartAt, b.queryEndAt, b.hasQueryStart, b.hasQueryEnd, time.Now())
 	b.filtered = b.items
 	if openQueryBuilder {
-		b.queryBuilder = newQueryBuilder(query, b.availableQueryFields(), b.environments, b.environment, b.querySince, b.queryStartAt, b.queryEndAt, b.hasQueryStart, b.hasQueryEnd)
+		b.queryBuilder = newQueryBuilder(query, b.availableQueryFields(), b.environments, b.environment, 0, 0, b.querySince, b.queryStartAt, b.queryEndAt, b.hasQueryStart, b.hasQueryEnd, "")
 		b.queryBuilder.SetSize(b.width, b.height)
 		b.status = "query builder: edit clauses and press enter"
 	}
@@ -210,7 +210,7 @@ func (m BrowseModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if key == ":" {
-			m.queryBuilder = newQueryBuilder(m.query, m.availableQueryFields(), m.environments, m.environment, m.querySince, m.queryStartAt, m.queryEndAt, m.hasQueryStart, m.hasQueryEnd)
+			m.queryBuilder = newQueryBuilder(m.query, m.availableQueryFields(), m.environments, m.environment, 0, 0, m.querySince, m.queryStartAt, m.queryEndAt, m.hasQueryStart, m.hasQueryEnd, "")
 			m.queryBuilder.SetSize(m.width, m.height)
 			m.status = "query builder: edit clauses and press enter"
 			return m, nil
