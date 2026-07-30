@@ -8,7 +8,7 @@
 
 ## Repo shape that matters
 - Canonical CLI entrypoint is `cmd/t/main.go` (Make targets build/run/install this path).
-- `main.go` at repo root is a duplicate of `cmd/t/main.go`; keep behavior aligned if touching startup flow.
+- `main.go` at repo root must be a symlink to `cmd/t/main.go`; never copy content between them.
 - Core wiring: `cmd/t/main.go` -> `internal/config` + `internal/secrets` -> `internal/grafana` + `internal/app/fetcher` -> `internal/tui`.
 - Domain structs shared across layers live in `internal/domain/types.go`.
 
