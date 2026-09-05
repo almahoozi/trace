@@ -6,6 +6,22 @@ import (
 	"testing"
 )
 
+func TestHistoryIgnorePagerDefaultsToFalse(t *testing.T) {
+	if DefaultConfig().History.IgnorePager {
+		t.Fatal("History.IgnorePager defaults to true, want false")
+	}
+}
+
+func TestApplyImport_SetsHistoryIgnorePager(t *testing.T) {
+	updated, err := ApplyImport(DefaultConfig(), []byte(`{"history":{"ignore_pager":true}}`))
+	if err != nil {
+		t.Fatalf("ApplyImport() error = %v", err)
+	}
+	if !updated.History.IgnorePager {
+		t.Fatal("History.IgnorePager = false, want true")
+	}
+}
+
 func TestExportNonDefaultWithMessage_AddsMessageWhenSet(t *testing.T) {
 	cfg := DefaultConfig()
 	payload, err := ExportNonDefaultWithMessage(cfg, "Congratulations, request credentials in #infrastructure-requests")

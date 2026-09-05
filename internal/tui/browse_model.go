@@ -33,6 +33,7 @@ type BrowseModel struct {
 	loadQueryFields fetchQueryFieldsFunc
 	onSessionOpened sessionOpenedFunc
 	openURL         func(string) error
+	history         bool
 
 	width          int
 	height         int
@@ -122,6 +123,13 @@ func NewBrowseModel(cfg config.Config, envName, query string, openQueryBuilder b
 		b.queryBuilder.SetSize(b.width, b.height)
 		b.status = "query builder: edit clauses and press enter"
 	}
+	return b
+}
+
+func NewHistoryBrowseModel(cfg config.Config, items []domain.TraceListItem, fetchSession fetchSessionFunc, openURL func(string) error) BrowseModel {
+	b := NewBrowseModel(cfg, "history", "", false, 1, 1, 0, time.Time{}, time.Time{}, false, false, nil, nil, items, fetchSession, nil, nil, nil, openURL)
+	b.history = true
+	b.status = fmt.Sprintf("cached traces=%d (newest first)", len(items))
 	return b
 }
 
@@ -292,7 +300,7 @@ func (m BrowseModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = "search: type query and press enter"
 			return m, nil
 		}
-		if key == ":" {
+		if key == ":" && !m.history {
 			m.queryBuilder = newQueryBuilder(m.query, m.availableQueryFields(), m.environments, m.environment, m.queryLimit, m.querySPSS, m.querySince, m.queryStartAt, m.queryEndAt, m.hasQueryStart, m.hasQueryEnd, m.lastQueryError)
 			m.queryBuilder.SetSize(m.width, m.height)
 			m.status = "query builder: edit clauses and press enter"
@@ -331,7 +339,7 @@ func (m BrowseModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = "opened config mode"
 			return m, nil
 		}
-		if !m.loadingList && (strings.EqualFold(key, "r") || strings.EqualFold(key, "ctrl+r")) {
+		if !m.history && !m.loadingList && (strings.EqualFold(key, "r") || strings.EqualFold(key, "ctrl+r")) {
 			m.loadingList = true
 			m.status = "reloading trace list"
 			return m, m.reloadListCmd(m.environment, m.query)
@@ -412,9 +420,15 @@ func (m BrowseModel) View() string {
 	)
 
 	var b strings.Builder
-	b.WriteString(m.titleStyle().Render("trace browse mode"))
+	title := "trace browse mode"
+	metadata := fmt.Sprintf("env=%s", m.environment)
+	if m.history {
+		title = "trace history"
+		metadata = "cached traces, newest first"
+	}
+	b.WriteString(m.titleStyle().Render(title))
 	b.WriteString("\n")
-	b.WriteString(m.mutedStyle().Render(fmt.Sprintf("env=%s", m.environment)))
+	b.WriteString(m.mutedStyle().Render(metadata))
 	if strings.TrimSpace(m.query) != "" {
 		b.WriteString(m.mutedStyle().Render(fmt.Sprintf(" query=%q", m.query)))
 	}
@@ -456,6 +470,9 @@ func (m BrowseModel) View() string {
 	}
 
 	footer := m.status + " | : query builder | / search | n/N next/prev | gg/G top/bottom | <-/-> or h/l scroll | enter open | y yank | shift+v line highlight | F2 config | esc back from trace | ctrl+f/b page | ctrl+d/u half page | r reload | q quit"
+	if m.history {
+		footer = m.status + " | / search | n/N next/prev | gg/G top/bottom | <-/-> or h/l scroll | enter open | y yank | shift+v line highlight | F2 config | esc back from trace | ctrl+f/b page | ctrl+d/u half page | q quit"
+	}
 	if m.loadingTrace {
 		footer = "loading trace..."
 	}

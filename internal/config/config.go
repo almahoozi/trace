@@ -20,6 +20,7 @@ type Config struct {
 	Grafana      GrafanaConfig `json:"grafana"`
 	Auth         AuthConfig    `json:"auth"`
 	Cache        CacheConfig   `json:"cache"`
+	History      HistoryConfig `json:"history"`
 	Environments []Environment `json:"environments"`
 	Logs         LogsConfig    `json:"logs"`
 	URLs         URLConfig     `json:"urls"`
@@ -51,6 +52,10 @@ type CacheConfig struct {
 	AutoExportOnOpen  bool `json:"auto_export_on_open"`
 	MaxSizeMB         int  `json:"max_size_mb"`
 	CleanupTargetSize int  `json:"cleanup_target_size_mb"`
+}
+
+type HistoryConfig struct {
+	IgnorePager bool `json:"ignore_pager"`
 }
 
 func (c CacheConfig) MaxSizeBytes() int64 {
@@ -371,6 +376,9 @@ func DefaultConfig() Config {
 			AutoExportOnOpen:  true,
 			MaxSizeMB:         100,
 			CleanupTargetSize: 10,
+		},
+		History: HistoryConfig{
+			IgnorePager: false,
 		},
 		Environments: []Environment{
 			{
