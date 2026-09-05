@@ -484,6 +484,23 @@ func main() {
 		renderSummariesForTUIModel(cfg, finalModel, session)
 		return
 	}
+	if len(args) >= 1 && args[0] == "history" {
+		if len(args) != 1 {
+			fmt.Fprintf(os.Stderr, "invalid command\n")
+			printUsage()
+			os.Exit(1)
+		}
+		cfg, err := loadConfigForOffline(configPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
+			os.Exit(1)
+		}
+		if err := runHistory(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to show history: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if len(args) == 0 {
 		printUsage()
 		os.Exit(1)
@@ -1261,6 +1278,7 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "       %s [--config path] <env> [query]\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] export <trace-id> [file]\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] open <file>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "       %s [--config path] history   (uses $PAGER unless history.ignore_pager is true)\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] caches\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] caches clear\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "       %s [--config path] config\n", os.Args[0])
@@ -1527,6 +1545,88 @@ func runUpgrade(ctx context.Context) error {
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
 	return cmd.Run()
+}
+
+func runHistory(cfg config.Config) error {
+	cached, err := app.ListCachedSessions()
+	if err != nil {
+		return err
+	}
+
+	pager := strings.TrimSpace(os.Getenv("PAGER"))
+	if !cfg.History.IgnorePager && pager != "" {
+		lines := make([]string, 0, len(cached))
+		for _, entry := range cached {
+			summary, summaryErr := app.RenderTraceSummaryWithColor(cfg, entry.Session, false)
+			if summaryErr != nil {
+				runlog.Warn("trace history summary render warning", "error", summaryErr, "snapshot_path", entry.Path)
+				fmt.Fprintf(os.Stderr, "trace summary warning: %v\n", summaryErr)
+			}
+			if strings.TrimSpace(summary) != "" {
+				lines = append(lines, summary)
+			}
+		}
+		cmd := exec.Command("sh", "-c", pager)
+		cmd.Stdin = strings.NewReader(strings.Join(lines, "\n") + "\n")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return cmd.Run()
+	}
+
+	items := make([]domain.TraceListItem, 0, len(cached))
+	sessions := make(map[string]*domain.Session, len(cached))
+	for _, entry := range cached {
+		item := historyTraceListItem(entry.Session)
+		items = append(items, item)
+		sessions[item.TraceID] = entry.Session
+	}
+	program := tea.NewProgram(tui.NewHistoryBrowseModel(
+		cfg, items,
+		func(_ context.Context, _ string, traceID string) (*domain.Session, error) {
+			session, ok := sessions[traceID]
+			if !ok {
+				return nil, fmt.Errorf("cached trace not found: %s", traceID)
+			}
+			return session, nil
+		},
+		platform.OpenURL,
+	), tea.WithAltScreen())
+	finalModel, err := program.Run()
+	if err != nil {
+		return err
+	}
+	if browseModel, ok := finalModel.(tui.BrowseModel); ok {
+		for _, session := range browseModel.OpenedSessions() {
+			summary, summaryErr := app.RenderTraceSummaryWithColor(cfg, session, shouldColorizeStdout())
+			if summaryErr != nil {
+				fmt.Fprintf(os.Stderr, "trace summary warning: %v\n", summaryErr)
+			}
+			if strings.TrimSpace(summary) != "" {
+				fmt.Fprintln(os.Stdout, summary)
+			}
+		}
+	}
+	return nil
+}
+
+func historyTraceListItem(session *domain.Session) domain.TraceListItem {
+	trace := session.Trace
+	service := ""
+	for _, span := range trace.Spans {
+		if span != nil && strings.TrimSpace(span.ParentID) == "" {
+			service = span.Service
+			break
+		}
+	}
+	return domain.TraceListItem{
+		TraceID:        trace.TraceID,
+		OperationName:  trace.OperationName,
+		Service:        service,
+		ErrorSpanCount: trace.ErrorSpanCount,
+		SpanCount:      trace.SpanCount,
+		Duration:       trace.Duration,
+		StartTime:      trace.StartTime,
+	}
 }
 
 func loadConfigForOffline(configPath string) (config.Config, error) {

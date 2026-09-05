@@ -22,6 +22,13 @@ type Snapshot struct {
 	ServiceMap snapshotServiceMap `json:"service_map"`
 }
 
+// CachedSession is a trace session with its snapshot cache metadata.
+type CachedSession struct {
+	Session   *domain.Session
+	Path      string
+	CreatedAt time.Time
+}
+
 type snapshotSession struct {
 	Environment    string            `json:"environment"`
 	GrafanaURL     string            `json:"grafana_url"`
@@ -129,6 +136,45 @@ func DefaultSnapshotPath(traceID string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, traceID+".json"), nil
+}
+
+func ListCachedSessions() ([]CachedSession, error) {
+	dir, err := SnapshotCacheDir()
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return []CachedSession{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	cached := make([]CachedSession, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		session, err := LoadSessionSnapshot(path)
+		if err != nil || session == nil || session.Trace == nil {
+			continue
+		}
+		cached = append(cached, CachedSession{
+			Session:   session,
+			Path:      path,
+			CreatedAt: info.ModTime(),
+		})
+	}
+	sort.SliceStable(cached, func(i, j int) bool {
+		return cached[i].CreatedAt.After(cached[j].CreatedAt)
+	})
+	return cached, nil
 }
 
 func ResolveSnapshotOpenPath(input string) (string, error) {
